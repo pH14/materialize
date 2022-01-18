@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail};
 use aws_arn::ARN;
 use globset::GlobBuilder;
-use interchange::protobuf::NormalizedProtobufMessageName;
+use interchange::protobuf::{EncodedDescriptors, NormalizedProtobufMessageName};
 use itertools::Itertools;
 use regex::Regex;
 use reqwest::Url;
@@ -1158,19 +1158,23 @@ fn get_encoding_inner<T: sql_parser::ast::AstInfo>(
                     )?;
 
                     let value = DataEncoding::Protobuf(ProtobufEncoding {
-                        descriptors: strconv::parse_bytes(&value.schema)?,
-                        message_name: NormalizedProtobufMessageName::new(
-                            value.message_name.clone(),
-                        ),
+                        descriptors: EncodedDescriptors {
+                            file_descriptor_set: strconv::parse_bytes(&value.schema)?,
+                            message_name: NormalizedProtobufMessageName::new(
+                                value.message_name.clone(),
+                            ),
+                        },
                         schema_registry_config: Some(ccsr_config.clone()),
                     });
                     if let Some(key) = key {
                         return Ok(SourceDataEncoding::KeyValue {
                             key: DataEncoding::Protobuf(ProtobufEncoding {
-                                descriptors: strconv::parse_bytes(&key.schema)?,
-                                message_name: NormalizedProtobufMessageName::new(
-                                    key.message_name.clone(),
-                                ),
+                                descriptors: EncodedDescriptors {
+                                    file_descriptor_set: strconv::parse_bytes(&key.schema)?,
+                                    message_name: NormalizedProtobufMessageName::new(
+                                        key.message_name.clone(),
+                                    ),
+                                },
                                 schema_registry_config: Some(ccsr_config),
                             }),
                             value,
@@ -1185,7 +1189,7 @@ fn get_encoding_inner<T: sql_parser::ast::AstInfo>(
                 message_name,
                 schema,
             } => {
-                let descriptors = match schema {
+                let file_descriptor_set = match schema {
                     sql_parser::ast::Schema::Inline(bytes) => strconv::parse_bytes(&bytes)?,
                     sql_parser::ast::Schema::File(_) => {
                         unreachable!("File schema should already have been inlined")
@@ -1193,8 +1197,10 @@ fn get_encoding_inner<T: sql_parser::ast::AstInfo>(
                 };
 
                 DataEncoding::Protobuf(ProtobufEncoding {
-                    descriptors,
-                    message_name: NormalizedProtobufMessageName::new(message_name.to_owned()),
+                    descriptors: EncodedDescriptors {
+                        file_descriptor_set,
+                        message_name: NormalizedProtobufMessageName::new(message_name.to_owned()),
+                    },
                     schema_registry_config: None,
                 })
             }

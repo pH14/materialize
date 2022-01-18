@@ -8,14 +8,21 @@
 // by the Apache License, Version 2.0.
 
 use std::iter;
-use std::path;
+use std::path::{self, Path};
 
 use async_trait::async_trait;
-use protobuf::Message;
+use include_dir::{include_dir, Dir};
+use itertools::Itertools;
+use protobuf_native::compiler::{
+    DiskSourceTree, SimpleErrorCollector, SourceTreeDescriptorDatabase,
+};
+use protobuf_native::MessageLite;
 use tokio::fs;
 
 use crate::action::{Action, State};
 use crate::parser::BuiltinCommand;
+
+const WELL_KNOWN_PROTOS: Dir = include_dir!("$DEP_PROTOBUF_SRC_ROOT/include/google/protobuf");
 
 pub struct CompileDescriptorsAction {
     inputs: Vec<String>,
@@ -50,19 +57,49 @@ impl Action for CompileDescriptorsAction {
     }
 
     async fn redo(&self, state: &mut State) -> Result<(), String> {
-        let mut protoc = mz_protoc::Protoc::new();
-        protoc.include(&state.temp_path);
-        for input in &self.inputs {
-            protoc.input(state.temp_path.join(input));
-        }
-        let fds = protoc
-            .parse()
-            .map_err(|e| format!("compiling protobuf descriptors: {}", e))?
-            .write_to_bytes()
-            .map_err(|e| format!("compiling protobuf descriptors: {}", e))?;
-        fs::write(state.temp_path.join(&self.output), fds)
+        let out = {
+            let wkt_dir = tempfile::tempdir()
+                .map_err(|e| format!("creating well-known protos temp dir: {}", e))?;
+            for file in WELL_KNOWN_PROTOS.files() {
+                fs::write(wkt_dir.path().join(file.path()), file.contents())
+                    .await
+                    .map_err(|e| format!("writing well-known proto: {}", e))?;
+            }
+
+            let mut source_tree = DiskSourceTree::new();
+            source_tree
+                .as_mut()
+                .map_path(Path::new(""), &state.temp_path);
+            source_tree
+                .as_mut()
+                .map_path(Path::new("google/protobuf"), wkt_dir.path());
+
+            let mut error_collector = SimpleErrorCollector::new();
+            let mut db = SourceTreeDescriptorDatabase::new(source_tree.as_mut());
+            db.as_mut().record_errors_to(error_collector.as_mut());
+            let mut fds = match db.as_mut().build_file_descriptor_set(&self.inputs) {
+                Ok(fds) => fds,
+                Err(_) => {
+                    drop(db);
+                    return Err(format!(
+                        "compiling protobuf descriptors:\n{}",
+                        error_collector
+                            .as_mut()
+                            .into_iter()
+                            .map(|e| e.to_string())
+                            .join("\n")
+                    ));
+                }
+            };
+            fds.as_mut()
+                .serialize()
+                .map_err(|_| format!("failed serializing protobuf descriptors"))?
+        };
+
+        fs::write(state.temp_path.join(&self.output), out)
             .await
             .map_err(|e| format!("writing protobuf descriptors: {}", e))?;
+
         Ok(())
     }
 }

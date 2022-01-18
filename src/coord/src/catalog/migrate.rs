@@ -7,19 +7,17 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::fs;
+use std::iter;
+use std::path::Path;
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use futures::executor::block_on;
 use lazy_static::lazy_static;
-use protobuf::Message;
-use regex::Regex;
 use repr::strconv;
 use semver::Version;
-use tempfile;
 use tokio::fs::File;
 
-use mz_protoc::Protoc;
+use interchange::protobuf::VirtualProtoFile;
 use ore::collections::CollectionExt;
 use sql::ast::display::AstDisplay;
 use sql::ast::visit_mut::{self, VisitMut};
@@ -32,7 +30,6 @@ use sql::ast::{
     Value, ViewDefinition, WithOption, WithOptionValue,
 };
 use sql::plan::resolve_names_stmt;
-use uuid::Uuid;
 
 use crate::catalog::storage::Transaction;
 use crate::catalog::{Catalog, ConnCatalog, SerializedCatalogItem};
@@ -143,52 +140,18 @@ fn ast_rewrite_kafka_protobuf_source_text_to_compiled_0_9_13(
     stmt: &mut sql::ast::Statement<Raw>,
 ) -> Result<(), anyhow::Error> {
     fn compile_proto(schema: &str) -> Result<CsrSeedCompiledEncoding, anyhow::Error> {
-        let temp_schema_name: String = Uuid::new_v4().to_simple().to_string();
-        let include_dir = tempfile::tempdir()?;
-        let schema_path = include_dir.path().join(&temp_schema_name);
-        let schema_bytes = strconv::parse_bytes(schema)?;
-        fs::write(&schema_path, &schema_bytes)?;
-
-        match Protoc::new()
-            .include(include_dir.path())
-            .input(schema_path)
-            .parse()
-        {
-            Ok(fds) => {
-                let message_name = fds
-                    .file
-                    .iter()
-                    .find(|f| f.get_name() == temp_schema_name)
-                    .map(|file| file.message_type.first())
-                    .flatten()
-                    .map(|message| format!(".{}", message.get_name()))
-                    .ok_or_else(|| anyhow!("unable to compile temporary schema"))?;
-                let mut schema = String::new();
-                strconv::format_bytes(&mut schema, &fds.write_to_bytes()?);
-                Ok(CsrSeedCompiledEncoding {
-                    schema,
-                    message_name,
-                })
-            }
-            Err(e) => {
-                lazy_static! {
-                    static ref MISSING_IMPORT_ERROR: Regex = Regex::new(
-                        r#"protobuf path \\"(?P<reference>.*)\\" is not found in import path"#
-                    )
-                    .unwrap();
-                }
-
-                // Make protobuf import errors more user-friendly.
-                if let Some(captures) = MISSING_IMPORT_ERROR.captures(&e.to_string()) {
-                    bail!(
-                        "unsupported protobuf schema reference {}",
-                        &captures["reference"]
-                    )
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        let primary = VirtualProtoFile {
+            path: Path::new("migration.proto"),
+            contents: schema.as_bytes(),
+        };
+        let dependencies = iter::empty();
+        let descriptors = interchange::protobuf::compile_proto(primary, dependencies)?;
+        let mut schema = String::new();
+        strconv::format_bytes(&mut schema, &descriptors.file_descriptor_set);
+        Ok(CsrSeedCompiledEncoding {
+            schema,
+            message_name: descriptors.message_name.into_string(),
+        })
     }
 
     fn do_upgrade(seed: &mut CsrSeedCompiledOrLegacy) -> Result<(), anyhow::Error> {

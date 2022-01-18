@@ -307,7 +307,7 @@ pub mod sources {
         use serde::{Deserialize, Serialize};
 
         use interchange::avro::{self};
-        use interchange::protobuf::{self, NormalizedProtobufMessageName};
+        use interchange::protobuf::{self, EncodedDescriptors};
         use repr::{ColumnType, RelationDesc, ScalarType};
 
         /// A description of how to interpret data from various sources
@@ -401,11 +401,10 @@ pub mod sources {
                     }
                     DataEncoding::Protobuf(ProtobufEncoding {
                         descriptors,
-                        message_name,
                         schema_registry_config: _,
                     }) => protobuf::DecodedDescriptors::from_bytes(
-                        descriptors,
-                        message_name.to_owned(),
+                        &descriptors.file_descriptor_set,
+                        descriptors.message_name.clone(),
                     )?
                     .columns()
                     .iter()
@@ -489,8 +488,7 @@ pub mod sources {
         /// Encoding in Protobuf format.
         #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
         pub struct ProtobufEncoding {
-            pub descriptors: Vec<u8>,
-            pub message_name: NormalizedProtobufMessageName,
+            pub descriptors: EncodedDescriptors,
             pub schema_registry_config: Option<ccsr::ClientConfig>,
         }
 

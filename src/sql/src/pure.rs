@@ -28,7 +28,6 @@ use uuid::Uuid;
 
 use dataflow_types::sources::AwsConfig;
 use dataflow_types::sources::{ExternalSourceConnector, PostgresSourceConnector, SourceConnector};
-use interchange::protobuf::compile_proto_from_subjects;
 use repr::strconv;
 use sql_parser::parser::parse_columns;
 
@@ -789,7 +788,13 @@ async fn compile_proto(
 ) -> Result<CsrSeedCompiledEncoding, anyhow::Error> {
     let (primary_subject, dependency_subjects) =
         ccsr_client.get_subject_and_references(subject_name).await?;
-    compile_proto_from_subjects(primary_subject, dependency_subjects).await
+    let descriptors = interchange::protobuf::compile_proto(&primary_subject, &dependency_subjects)?;
+    let mut schema = String::new();
+    strconv::format_bytes(&mut schema, &descriptors.file_descriptor_set);
+    Ok(CsrSeedCompiledEncoding {
+        schema,
+        message_name: descriptors.message_name.into_string(),
+    })
 }
 
 /// Makes an always-valid AWS API call to perform a basic sanity check of

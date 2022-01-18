@@ -24,6 +24,7 @@ coord = { path = "../coord" }
 flate2 = "1.0.22"
 futures = "0.3.19"
 http = "0.2.6"
+include_dir = "0.7.2"
 interchange = { path = "../interchange" }
 itertools = "0.10.3"
 kafka-util = { path = "../kafka-util" }
@@ -37,6 +38,8 @@ mz-protoc = { path = "../protoc" }
 ore = { path = "../ore" }
 pgrepr = { path = "../pgrepr" }
 postgres_array = { git = "https://github.com/MaterializeInc/rust-postgres-array", branch = "mz-0.7.2" }
+protobuf-native = "0.2.1"
+protobuf-src = "1.0.1"
 protobuf = { git = "https://github.com/MaterializeInc/rust-protobuf.git" }
 rand = "0.8.4"
 rdkafka = { git = "https://github.com/fede1024/rust-rdkafka.git", features = ["cmake-build", "libz-static"] }

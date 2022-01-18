@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0.
 
 use dataflow_types::{sources::encoding::ProtobufEncoding, DecodeError};
-use interchange::protobuf::{DecodedDescriptors, Decoder};
+use interchange::protobuf::{DecodedDescriptors, Decoder, EncodedDescriptors};
 use repr::Row;
 
 #[derive(Debug)]
@@ -21,12 +21,15 @@ pub struct ProtobufDecoderState {
 impl ProtobufDecoderState {
     pub fn new(
         ProtobufEncoding {
-            descriptors,
-            message_name,
+            descriptors:
+                EncodedDescriptors {
+                    file_descriptor_set,
+                    message_name,
+                },
             schema_registry_config,
         }: ProtobufEncoding,
     ) -> Result<Self, anyhow::Error> {
-        let descriptors = DecodedDescriptors::from_bytes(&descriptors, message_name)
+        let descriptors = DecodedDescriptors::from_bytes(&file_descriptor_set, message_name)
             .expect("descriptors provided to protobuf source are pre-validated");
         Ok(ProtobufDecoderState {
             decoder: Decoder::new(descriptors, schema_registry_config)?,

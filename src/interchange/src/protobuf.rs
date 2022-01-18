@@ -9,12 +9,9 @@
 
 use std::collections::HashSet;
 use std::iter;
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context};
-use itertools::Itertools;
-use lazy_static::lazy_static;
-use regex::Regex;
 
 use protobuf::descriptor::field_descriptor_proto::Label;
 use protobuf::descriptor::FileDescriptorSet;
@@ -23,13 +20,13 @@ use protobuf::reflect::{
     RuntimeFieldType, RuntimeTypeBox,
 };
 use protobuf::{CodedInputStream, Message, MessageDyn};
+use protobuf_native::compiler::{SourceTreeDescriptorDatabase, VirtualSourceTree};
+use protobuf_native::MessageLite;
 use serde::{Deserialize, Serialize};
 
 use ccsr::Subject;
-use mz_protoc::Protoc;
 use ore::str::StrExt;
-use repr::{strconv, ColumnName, ColumnType, Datum, Row, ScalarType};
-use sql_parser::ast::CsrSeedCompiledEncoding;
+use repr::{ColumnName, ColumnType, Datum, Row, ScalarType};
 
 /// Wrapper type that ensures a protobuf message name is properly normalized.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -44,6 +41,19 @@ impl NormalizedProtobufMessageName {
         }
         NormalizedProtobufMessageName(message_name)
     }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// An encoded description of the schema of a Protobuf message.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EncodedDescriptors {
+    /// The bytes of the encoded file descriptor set.
+    pub file_descriptor_set: Vec<u8>,
+    /// The name of a message within the descriptor set.
+    pub message_name: NormalizedProtobufMessageName,
 }
 
 /// A decoded description of the schema of a Protobuf message.
@@ -137,9 +147,9 @@ impl Decoder {
                     );
                 }
             } else {
-                let compiled = compile_proto(schema_id, client).await?;
+                let compiled = compile_proto_from_registry(schema_id, client).await?;
                 let schema_to_compare = DecodedDescriptors::from_bytes(
-                    &strconv::parse_bytes(&compiled.schema)?,
+                    &compiled.file_descriptor_set,
                     // Needs to match the name exactly
                     self.descriptors.message_name.clone(),
                 )?;
@@ -311,81 +321,66 @@ fn pack_value(
 /// This reaches out to the Confluent Schema Registry to search for the correct schema
 /// for the provided subject (generally a Kafka topic with the `-value` or `-key` suffix)
 /// and recursively constructs the encoding.
-async fn compile_proto(
+pub async fn compile_proto_from_registry(
     id: i32,
     ccsr_client: &ccsr::Client,
-) -> Result<CsrSeedCompiledEncoding, anyhow::Error> {
+) -> Result<EncodedDescriptors, anyhow::Error> {
     let (primary_subject, dependency_subjects) =
         ccsr_client.get_subject_and_references_by_id(id).await?;
-    compile_proto_from_subjects(primary_subject, dependency_subjects).await
+    compile_proto(&primary_subject, &dependency_subjects)
 }
 
-/// Given a primary subject and subjects for references (obtained using a ccsr client),
-/// compile the message descriptor
-pub async fn compile_proto_from_subjects(
-    primary_subject: Subject,
-    dependency_subjects: Vec<Subject>,
-) -> Result<CsrSeedCompiledEncoding, anyhow::Error> {
-    lazy_static! {
-        static ref WELL_KNOWN_REGEX: Regex = Regex::new(r#"(\.)?google\.protobuf\.\w+"#).unwrap();
-        static ref MISSING_IMPORT_ERROR: Regex =
-            Regex::new(r#"protobuf path \\"(?P<reference>.*)\\" is not found in import path"#)
-                .unwrap();
-    }
+/// An in-memory representation of a `.proto` file.
+#[derive(Debug, Clone, Copy)]
+pub struct VirtualProtoFile<'a> {
+    /// The virtual path to the file.
+    pub path: &'a Path,
+    /// The contents of the file.
+    pub contents: &'a [u8],
+}
 
-    let primary_proto_name = primary_subject.name.clone();
-    let include_dir = tempfile::tempdir()?;
-    let primary_proto_path = include_dir.path().join(&primary_proto_name);
-
-    for subject in iter::once(primary_subject).chain(dependency_subjects.into_iter()) {
-        if WELL_KNOWN_REGEX.is_match(&subject.name) {
-            continue;
-        }
-        let subject_pb = PathBuf::from(subject.name);
-        if let Some(parent) = subject_pb.parent() {
-            tokio::fs::create_dir_all(include_dir.path().join(parent)).await?;
-        }
-        let path = include_dir.path().join(subject_pb);
-        let bytes = strconv::parse_bytes(&subject.schema.raw)?;
-        tokio::fs::write(&path, &bytes).await?;
-    }
-
-    match Protoc::new()
-        .include(include_dir.path())
-        .input(primary_proto_path)
-        .parse()
-    {
-        Ok(fds) => {
-            let message_name = fds
-                .file
-                .iter()
-                .find(|f| f.get_name() == primary_proto_name)
-                .map(|file| file.message_type.iter().at_most_one())
-                .transpose()
-                .map_err(|_| anyhow!("proto files with multiple `message`'s are not yet supported"))
-                .map(|found| found.flatten())
-                .and_then(|message| {
-                    message
-                        .map(|message| format!(".{}", message.get_name()))
-                        .ok_or_else(|| anyhow!("unable to compile temporary schema"))
-                })?;
-            let mut schema = String::new();
-            strconv::format_bytes(&mut schema, &fds.write_to_bytes()?);
-            Ok(CsrSeedCompiledEncoding {
-                schema,
-                message_name,
-            })
-        }
-        Err(e) => {
-            // Make protobuf import errors more user-friendly.
-            if let Some(captures) = MISSING_IMPORT_ERROR.captures(&e.to_string()) {
-                bail!(
-                    "unsupported protobuf schema reference {}",
-                    &captures["reference"]
-                )
-            } else {
-                Err(e)
-            }
+impl<'a> From<&'a Subject> for VirtualProtoFile<'a> {
+    fn from(subject: &'a Subject) -> VirtualProtoFile<'a> {
+        VirtualProtoFile {
+            path: Path::new(&subject.name),
+            contents: subject.schema.raw.as_bytes(),
         }
     }
+}
+
+/// Compiles a `.proto` file and its dependencies into an encoded descriptor
+/// set.
+pub fn compile_proto<'a, F, I>(
+    primary: F,
+    dependencies: I,
+) -> Result<EncodedDescriptors, anyhow::Error>
+where
+    F: Into<VirtualProtoFile<'a>>,
+    I: IntoIterator<Item = F>,
+{
+    let primary = primary.into();
+    let dependencies = dependencies.into_iter().map(|f| f.into());
+
+    // Compile .proto files into a file descriptor set.
+    let mut source_tree = VirtualSourceTree::new();
+    for file in iter::once(primary).chain(dependencies) {
+        source_tree
+            .as_mut()
+            .add_file(file.path, file.contents.to_vec());
+    }
+    let mut db = SourceTreeDescriptorDatabase::new(source_tree.as_mut());
+    let fds = db.as_mut().build_file_descriptor_set(&[primary.path])?;
+
+    // Ensure there is exactly one message in the file.
+    let primary_fd = fds.file(0);
+    let message_name = match primary_fd.message_type_size() {
+        1 => String::from_utf8_lossy(primary_fd.message_type(0).name()).into_owned(),
+        0 => bail!("proto files with no messages are not supported"),
+        _ => bail!("proto files with multiple messages are not yet supported"),
+    };
+
+    Ok(EncodedDescriptors {
+        file_descriptor_set: fds.serialize()?,
+        message_name: NormalizedProtobufMessageName::new(message_name),
+    })
 }
