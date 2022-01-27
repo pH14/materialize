@@ -535,7 +535,7 @@ pub fn encode_copy_row_text(
 // This is equivalent to a backslash followed by a dot, i.e "\."
 static END_OF_COPY_MARKER: [u8; 2] = [92, 46];
 
-struct CopyTextFormatParser<'a> {
+pub struct CopyTextFormatParser<'a> {
     data: &'a [u8],
     position: usize,
     column_delimiter: &'a str,
@@ -544,7 +544,7 @@ struct CopyTextFormatParser<'a> {
 }
 
 impl<'a> CopyTextFormatParser<'a> {
-    fn new(data: &'a [u8], column_delimiter: &'a str, null_string: &'a str) -> Self {
+    pub fn new(data: &'a [u8], column_delimiter: &'a str, null_string: &'a str) -> Self {
         Self {
             data,
             position: 0,
@@ -566,7 +566,7 @@ impl<'a> CopyTextFormatParser<'a> {
         self.position = std::cmp::min(self.position + n, self.data.len());
     }
 
-    fn is_eof(&self) -> bool {
+    pub fn is_eof(&self) -> bool {
         self.peek().is_none() || self.is_end_of_copy_marker()
     }
 
@@ -574,7 +574,7 @@ impl<'a> CopyTextFormatParser<'a> {
         &END_OF_COPY_MARKER
     }
 
-    fn is_end_of_copy_marker(&self) -> bool {
+    pub fn is_end_of_copy_marker(&self) -> bool {
         self.check_bytes(Self::end_of_copy_marker())
     }
 
@@ -585,7 +585,7 @@ impl<'a> CopyTextFormatParser<'a> {
         }
     }
 
-    fn expect_end_of_line(&mut self) -> Result<(), io::Error> {
+    pub fn expect_end_of_line(&mut self) -> Result<(), io::Error> {
         if self.is_end_of_line() {
             self.consume_n(1);
             Ok(())
@@ -601,7 +601,7 @@ impl<'a> CopyTextFormatParser<'a> {
         self.check_bytes(self.column_delimiter.as_bytes())
     }
 
-    fn expect_column_delimiter(&mut self) -> Result<(), io::Error> {
+    pub fn expect_column_delimiter(&mut self) -> Result<(), io::Error> {
         if self.consume_bytes(self.column_delimiter.as_bytes()) {
             Ok(())
         } else {
@@ -643,7 +643,7 @@ impl<'a> CopyTextFormatParser<'a> {
         }
     }
 
-    fn consume_raw_value(&mut self) -> Result<Option<&[u8]>, io::Error> {
+    pub fn consume_raw_value(&mut self) -> Result<Option<&[u8]>, io::Error> {
         if self.consume_null_string() {
             return Ok(None);
         }
