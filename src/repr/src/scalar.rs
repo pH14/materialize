@@ -1374,6 +1374,21 @@ impl<'a> ScalarType {
         }
     }
 
+    /// TODO(phemberger): update comment if this works
+    /// Returns the [`ScalarType`] of elements in a [`ScalarType::List`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on anything other than a [`ScalarType::List`].
+    pub fn unwrap_record_element_type(&self) -> Vec<&ScalarType> {
+        match self {
+            ScalarType::Record { fields, .. } => {
+                fields.iter().map(|(_, t)| &t.scalar_type).collect_vec()
+            },
+            _ => panic!("ScalarType::unwrap_record_element_type called on {:?}", self),
+        }
+    }
+
     /// Returns number of dimensions/axes (also known as "rank") on a
     /// [`ScalarType::List`].
     ///

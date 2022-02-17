@@ -2089,6 +2089,7 @@ pub fn plan_create_type(
     stmt: CreateTypeStatement<Raw>,
 ) -> Result<Plan, anyhow::Error> {
     let create_sql = normalize::create_statement(scx, Statement::CreateType(stmt.clone()))?;
+    println!("Normalized create_sql: {}", create_sql);
     let CreateTypeStatement {
         name,
         as_type,

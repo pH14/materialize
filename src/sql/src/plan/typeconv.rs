@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use itertools::Itertools;
 
 use lazy_static::lazy_static;
 
@@ -392,6 +393,15 @@ lazy_static! {
                 let ty = from_type.clone();
                 Some(|e: HirScalarExpr| e.call_unary(CastRecordToString { ty }))
             }),
+            (Record, Record) => Assignment: CastTemplate::new(|ecx, ccx, from_type, to_type| {
+                println!("Record to record cast");
+                let mut cast_exprs = vec![];
+                for (f, t) in from_type.unwrap_record_element_type().iter().zip_eq(to_type.unwrap_record_element_type()) {
+                    cast_exprs.push(plan_hypothetical_cast(ecx, ccx, f, t)?);
+                }
+                let to = to_type.clone();
+                Some(|e: HirScalarExpr| e.call_unary(CastRecordToRecord{ return_ty: to, cast_expr: cast_exprs }))
+            }),
 
             // ARRAY
             (Array, String) => Assignment: CastTemplate::new(|_ecx, _ccx, from_type, _to_type| {
@@ -546,6 +556,7 @@ fn get_cast(
                     fields: fields_r, ..
                 },
             ) => {
+                println!("Trying to compare types {:?} to {:?}", fields_l, fields_r);
                 fields_l.len() == fields_r.len()
                     && fields_l
                         .into_iter()
@@ -736,6 +747,7 @@ pub fn plan_coerce<'a>(
         }
 
         LiteralRecord(exprs) => {
+            println!("Coercible scalar expr {:?} --> coerce_to {:?}", exprs, coerce_to);
             let arity = exprs.len();
             let coercions = match coerce_to {
                 ScalarType::Record { fields, .. } if fields.len() == arity => fields
