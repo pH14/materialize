@@ -3601,6 +3601,7 @@ dependencies = [
  "differential-dataflow",
  "fail",
  "futures-util",
+ "hex",
  "md-5",
  "mz-ore",
  "mz-persist-types",

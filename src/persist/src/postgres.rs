@@ -18,19 +18,23 @@ use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
 use postgres_openssl::MakeTlsConnector;
 use tokio::task::JoinHandle;
 use tokio_postgres::config::SslMode;
+
 use tokio_postgres::types::{to_sql_checked, FromSql, IsNull, ToSql, Type};
-use tokio_postgres::Client as PostgresClient;
+use tokio_postgres::{Client as PostgresClient, SimpleQueryMessage};
 
 use mz_ore::task;
 
 use crate::error::Error;
 use crate::location::{Consensus, ExternalError, SeqNo, VersionedData};
 
+// WIP: figure out if we can round-trip the `data` as bytea
+//      through the Simple protocol directly, rather than
+//      hex-encoding into text
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS consensus (
     shard text NOT NULL,
     sequence_number bigint NOT NULL,
-    data bytea NOT NULL,
+    data text NOT NULL,
     PRIMARY KEY(shard, sequence_number)
 );
 ";
@@ -252,10 +256,10 @@ impl Consensus for PostgresConsensus {
 
         let seqno: SeqNo = row.try_get("sequence_number")?;
 
-        let data: Vec<u8> = row.try_get("data")?;
+        let data: &str = row.try_get("data")?;
         Ok(Some(VersionedData {
             seqno,
-            data: Bytes::from(data),
+            data: Bytes::from(hex::decode(data).expect("TODO")),
         }))
     }
 
@@ -276,27 +280,111 @@ impl Consensus for PostgresConsensus {
             }
         }
 
-        let result = if let Some(expected) = expected {
+        let rows_upserted = if let Some(expected) = expected {
             // Only insert the new row if:
-            // - sequence number expected is already present
-            // - expected corresponds to the most recent sequence number
-            //   i.e. there is no other sequence number > expected already
-            //   present.
+            // - the expected sequence number is currently the greatest sequence number in `consensus`
+            // Otherwise:
+            // - return the greatest sequence number and its data
             //
-            // This query has also been written to execute within a single
-            // network round-trip (instead of a slightly simpler implementation
-            // that would call `BEGIN` and have multiple `SELECT` queries).
-            let q = "INSERT INTO consensus SELECT $1, $2, $3 WHERE
-                     EXISTS (
-                        SELECT * FROM consensus WHERE shard = $1 AND sequence_number = $4
-                     )
-                     AND NOT EXISTS (
-                         SELECT * FROM consensus WHERE shard = $1 AND sequence_number > $4
-                     )
-                     ON CONFLICT DO NOTHING";
-            self.client
-                .execute(&*q, &[&key, &new.seqno, &new.data.as_ref(), &expected])
-                .await?
+            // This query has several subtle tricks to both execute within a single network
+            // round-trip and avoid serializability conflict retries.
+            // - It selects the greatest sequence number with a FOR UPDATE locking clause. This
+            //   causes the statement to block until the transaction has exclusive access to the
+            //   greatest sequence number for a given shard, and will always see the most recent
+            //   write when it is granted the lock.
+            //
+            //   Note: this behavior only applies to Cockroach[0] and not Postgres! Postgres under
+            //         serializable isolation will throw a serialized access error when its
+            //         FOR UPDATE statement is unblocked if the greatest sequence number has
+            //         changed (which is almost always true if it was initially blocked).
+            //
+            // - It conditionally INSERTs a new row into consensus iff the greatest sequence
+            //   number is of the expected value, and then uses INSERT ... RETURNING to indicate
+            //   whether the insert succeeded
+            //
+            // - The SELECT statement with the greatest sequence number (and its data) is unioned
+            //   with the results of the conditional INSERT, allowing the client to read both
+            //   the latest persisted value and whether its write succeeded.
+            //
+            // - The whole statement is executed inside of a single-batch transaction, using the
+            //   Postgres Simple Query protocol [1]. This avoids round-trips for `BEGIN` and
+            //   `COMMIT` statements, at the cost of losing prepared statements and needing to
+            //   to use string interpolation to build the query. This is means the query is
+            //   NOT injection safe were it ever to include data controlled by the user.
+            //
+            //   [0]: https://www.cockroachlabs.com/docs/v21.2/select-for-update
+            //   [1]: https://www.cockroachlabs.com/docs/v21.2/transactions#batched-statements
+            let conditional_insertion = format!(
+                r#"
+                    WITH
+                      greatest_seqno AS (
+                        SELECT sequence_number, data FROM consensus WHERE shard = '{shard}' ORDER BY sequence_number DESC LIMIT 1 FOR UPDATE
+                      ),
+                      inserted AS (
+                        INSERT INTO consensus (shard, sequence_number, data)
+                        SELECT '{shard}', {new_seqno}, '{data}'
+                        WHERE EXISTS (SELECT 1 FROM greatest_seqno WHERE sequence_number = '{expected_seqno}')
+                        ON CONFLICT DO NOTHING
+                        RETURNING sequence_number
+                      )
+                    SELECT true as was_inserted, sequence_number, NULL as data FROM inserted
+                    UNION ALL
+                    SELECT false as was_inserted, sequence_number, data FROM greatest_seqno
+            "#,
+                shard = &key,
+                expected_seqno = expected.0,
+                new_seqno = new.seqno.0,
+                data = hex::encode(&new.data),
+            );
+
+            let insert = self
+                .client
+                .simple_query(&format!("BEGIN; {}; COMMIT", conditional_insertion))
+                .await;
+
+            let mut any_inserted = false;
+            match insert {
+                Ok(query_messages) => {
+                    for (i, message) in (&query_messages).iter().enumerate() {
+                        if i == 1 {
+                            match message {
+                                SimpleQueryMessage::Row(r) => {
+                                    let was_inserted = r.get("was_inserted").expect(
+                                        "non-erroring query must have returned was_inserted column",
+                                    ) == "t";
+
+                                    if was_inserted {
+                                        any_inserted = true;
+                                        break;
+                                    }
+
+                                    let seqno : u64 = r.get("sequence_number").expect("non-erroring query must have returned greatest known sequence number").parse().expect("sequence number must be u64");
+                                    let data = r.get("data").expect("non-erroring query must have returned data if was_inserted is false");
+
+                                    return Ok(Err(Some(VersionedData {
+                                        seqno: SeqNo(seqno),
+                                        data: Bytes::from(hex::decode(data).expect("TODO")),
+                                    })));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    //  WIP: A failed transaction could cause other queries from this client to fail
+                    //       until the transaction is aborted. Use a connection pool so we can isolate
+                    //       the transaction from other queries.
+                    self.client.batch_execute(&"ABORT").await?;
+                    return Err(e.into());
+                }
+            }
+
+            if any_inserted {
+                1
+            } else {
+                0
+            }
         } else {
             // Insert the new row as long as no other row exists for the same shard.
             let q = "INSERT INTO consensus SELECT $1, $2, $3 WHERE
@@ -305,11 +393,11 @@ impl Consensus for PostgresConsensus {
                      )
                      ON CONFLICT DO NOTHING";
             self.client
-                .execute(&*q, &[&key, &new.seqno, &new.data.as_ref()])
+                .execute(&*q, &[&key, &new.seqno, &hex::encode(&new.data)])
                 .await?
         };
 
-        if result == 1 {
+        if rows_upserted == 1 {
             Ok(Ok(()))
         } else {
             // It's safe to call head in a subsequent transaction rather than doing
