@@ -228,6 +228,19 @@ impl From<tokio_postgres::Error> for ExternalError {
     }
 }
 
+impl From<deadpool_postgres::PoolError> for ExternalError {
+    fn from(x: deadpool_postgres::PoolError) -> Self {
+        match x {
+            // We have logic for turning a postgres Error into an ExternalError,
+            // so use it.
+            deadpool_postgres::PoolError::Backend(x) => ExternalError::from(x),
+            x => ExternalError::Indeterminate(Indeterminate {
+                inner: anyhow::Error::new(x),
+            }),
+        }
+    }
+}
+
 impl From<tokio::task::JoinError> for ExternalError {
     fn from(x: tokio::task::JoinError) -> Self {
         ExternalError::Indeterminate(Indeterminate {
