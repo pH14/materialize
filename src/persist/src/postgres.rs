@@ -15,13 +15,15 @@ use bytes::Bytes;
 use deadpool_postgres::tokio_postgres::config::SslMode;
 use deadpool_postgres::tokio_postgres::types::{to_sql_checked, FromSql, IsNull, ToSql, Type};
 use deadpool_postgres::tokio_postgres::Config;
-use deadpool_postgres::{Hook, HookError, HookErrorCause, ManagerConfig, RecyclingMethod};
+use deadpool_postgres::Runtime::Tokio1;
+use deadpool_postgres::{Hook, HookError, HookErrorCause, ManagerConfig, RecyclingMethod, Runtime};
 use deadpool_postgres::{Manager, Pool};
 use openssl::pkey::PKey;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
 use postgres_openssl::MakeTlsConnector;
-use tracing::debug;
+use timely::dataflow::operators::feedback::Handle;
+use tracing::{debug, info};
 
 use mz_ore::task;
 
@@ -129,6 +131,7 @@ impl PostgresConsensus {
     /// Open a Postgres [Consensus] instance with `config`, for the collection
     /// named `shard`.
     pub async fn open(config: PostgresConsensusConfig) -> Result<Self, ExternalError> {
+        info!("OPENING NEW CONSENSUS");
         let pg_config: Config = config.url.parse()?;
         let tls = make_tls(&pg_config)?;
 
@@ -141,42 +144,55 @@ impl PostgresConsensus {
         );
 
         let pool = Pool::builder(manager)
-            .max_size(1)
-            .post_create(Hook::async_fn(|client, _| {
+            .max_size(5)
+            // .runtime(Runtime::Tokio1)
+            .post_create(Hook::async_fn(|client, m| {
                 Box::pin(async move {
                     debug!("opened new consensus postgres connection");
-                    client.batch_execute(
+                    info!("CREATING NEW CONNECTION {:?}", m.created);
+                    let x = client.batch_execute(
                         "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-                    ).await.map_err(|e| HookError::Abort(HookErrorCause::Backend(e)))
+                    ).await.map_err(|e| HookError::Abort(HookErrorCause::Backend(e)));
+                    info!("CREATED NEW CONNECTION {:?}", m.created);
+                    x
                 })
+            }))
+            .pre_recycle(Hook::sync_fn(|c, m| {
+                info!("Pre-recycling conn {:?}", m.created);
+                Ok(())
             }))
             .build()
             .expect("postgres connection pool built with incorrect parameters");
 
-        let mut client = pool.get().await?;
-        let tx = client.transaction().await?;
-        tx.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        {
+            let mut client = pool.get().await?;
+            let tx = client.transaction().await?;
+            tx.batch_execute(
+                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            )
             .await?;
-        let version: String = tx.query_one("SELECT version()", &[]).await?.get(0);
-        // Only get the advisory lock on Postgres (but not Cockroach which doesn't
-        // support this function and (we suspect) doesn't have this bug anyway). Use
-        // this construction (not cockroach instead of yes postgres) to avoid
-        // accidentally not executing in Postgres.
-        if !version.starts_with("CockroachDB") {
-            // Obtain an advisory lock before attempting to create the schema. This is
-            // necessary to work around concurrency bugs in `CREATE TABLE IF NOT EXISTS`
-            // in PostgreSQL.
-            //
-            // See: https://github.com/MaterializeInc/materialize/issues/12560
-            // See: https://www.postgresql.org/message-id/CA%2BTgmoZAdYVtwBfp1FL2sMZbiHCWT4UPrzRLNnX1Nb30Ku3-gg%40mail.gmail.com
-            // See: https://stackoverflow.com/a/29908840
-            //
-            // The lock ID was randomly generated.
-            tx.batch_execute("SELECT pg_advisory_xact_lock(135664303235462630);")
-                .await?;
+            let version: String = tx.query_one("SELECT version()", &[]).await?.get(0);
+            // Only get the advisory lock on Postgres (but not Cockroach which doesn't
+            // support this function and (we suspect) doesn't have this bug anyway). Use
+            // this construction (not cockroach instead of yes postgres) to avoid
+            // accidentally not executing in Postgres.
+            if !version.starts_with("CockroachDB") {
+                // Obtain an advisory lock before attempting to create the schema. This is
+                // necessary to work around concurrency bugs in `CREATE TABLE IF NOT EXISTS`
+                // in PostgreSQL.
+                //
+                // See: https://github.com/MaterializeInc/materialize/issues/12560
+                // See: https://www.postgresql.org/message-id/CA%2BTgmoZAdYVtwBfp1FL2sMZbiHCWT4UPrzRLNnX1Nb30Ku3-gg%40mail.gmail.com
+                // See: https://stackoverflow.com/a/29908840
+                //
+                // The lock ID was randomly generated.
+                tx.batch_execute("SELECT pg_advisory_xact_lock(135664303235462630);")
+                    .await?;
+            }
+            tx.batch_execute(SCHEMA).await?;
+            tx.commit().await?;
         }
-        tx.batch_execute(SCHEMA).await?;
-        tx.commit().await?;
+        info!("DONE OPENING NEW CONSENSUS");
         Ok(PostgresConsensus { pool })
     }
 
@@ -185,9 +201,11 @@ impl PostgresConsensus {
     /// ONLY FOR TESTING
     pub async fn drop_and_recreate(&self) -> Result<(), ExternalError> {
         // this could be a TRUNCATE if we're confident the db won't reuse any state
-        let client = self.pool.get().await?;
-        client.execute("DROP TABLE consensus", &[]).await?;
-        client.execute(SCHEMA, &[]).await?;
+        {
+            let client = self.pool.get().await?;
+            client.execute("DROP TABLE consensus", &[]).await?;
+            client.execute(SCHEMA, &[]).await?;
+        }
         Ok(())
     }
 }
@@ -306,10 +324,12 @@ impl Consensus for PostgresConsensus {
                          SELECT * FROM consensus WHERE shard = $1 AND sequence_number > $4
                      )
                      ON CONFLICT DO NOTHING";
-            let client = self.pool.get().await?;
-            client
-                .execute(&*q, &[&key, &new.seqno, &new.data.as_ref(), &expected])
-                .await?
+            {
+                let client = self.pool.get().await?;
+                client
+                    .execute(&*q, &[&key, &new.seqno, &new.data.as_ref(), &expected])
+                    .await?
+            }
         } else {
             // Insert the new row as long as no other row exists for the same shard.
             let q = "INSERT INTO consensus SELECT $1, $2, $3 WHERE
@@ -317,10 +337,12 @@ impl Consensus for PostgresConsensus {
                          SELECT * FROM consensus WHERE shard = $1
                      )
                      ON CONFLICT DO NOTHING";
-            let client = self.pool.get().await?;
-            client
-                .execute(&*q, &[&key, &new.seqno, &new.data.as_ref()])
-                .await?
+            {
+                let client = self.pool.get().await?;
+                client
+                    .execute(&*q, &[&key, &new.seqno, &new.data.as_ref()])
+                    .await?
+            }
         };
 
         if result == 1 {
