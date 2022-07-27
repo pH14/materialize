@@ -56,6 +56,7 @@ pub(crate) mod r#impl {
     pub mod encoding;
     pub mod gc;
     pub mod machine;
+    pub mod maintenance;
     pub mod metrics;
     pub mod paths;
     pub mod state;
@@ -359,7 +360,6 @@ impl PersistClient {
             shard_id,
             Arc::clone(&self.consensus),
             Arc::clone(&self.metrics),
-            gc,
         )
         .await?;
 
@@ -370,6 +370,7 @@ impl PersistClient {
             metrics: Arc::clone(&self.metrics),
             reader_id,
             machine,
+            gc,
             blob: Arc::clone(&self.blob),
             since: read_cap.since,
             last_heartbeat: Instant::now(),
@@ -405,7 +406,6 @@ impl PersistClient {
             shard_id,
             Arc::clone(&self.consensus),
             Arc::clone(&self.metrics),
-            gc,
         )
         .await?;
         let writer_id = WriterId::new();
@@ -423,6 +423,7 @@ impl PersistClient {
             metrics: Arc::clone(&self.metrics),
             writer_id,
             machine,
+            gc,
             compact,
             blob: Arc::clone(&self.blob),
             upper: shard_upper.0,
