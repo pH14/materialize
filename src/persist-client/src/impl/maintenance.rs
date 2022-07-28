@@ -110,7 +110,7 @@ impl RoutineMaintenance {
                 join_handles.push(mz_ore::task::spawn(
                     || "persist::automatic_write_expiration",
                     async move {
-                        let _ = machine.expire_writer(&expired).await;
+                        machine.expire_writer(&expired).await;
                     },
                 ));
             }

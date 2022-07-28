@@ -217,7 +217,6 @@ where
                 state.apply_merge_res(&res)
             })
             .await;
-        // WIP: think more about how/whether compaction should apply routine maintenance
         applied
     }
 
@@ -248,24 +247,24 @@ where
         (seqno, maintenance)
     }
 
-    pub async fn expire_reader(&mut self, reader_id: &ReaderId) -> (SeqNo, RoutineMaintenance) {
+    pub async fn expire_reader(&mut self, reader_id: &ReaderId) -> SeqNo {
         let metrics = Arc::clone(&self.metrics);
-        let (seqno, _existed, maintenance) = self
+        let (seqno, _existed, _maintenance) = self
             .apply_unbatched_idempotent_cmd(&metrics.cmds.expire_reader, |_, state| {
                 state.expire_reader(reader_id)
             })
             .await;
-        (seqno, maintenance)
+        seqno
     }
 
-    pub async fn expire_writer(&mut self, writer_id: &WriterId) -> (SeqNo, RoutineMaintenance) {
+    pub async fn expire_writer(&mut self, writer_id: &WriterId) -> SeqNo {
         let metrics = Arc::clone(&self.metrics);
-        let (seqno, _existed, maintenance) = self
+        let (seqno, _existed, _maintenance) = self
             .apply_unbatched_idempotent_cmd(&metrics.cmds.expire_writer, |_, state| {
                 state.expire_writer(writer_id)
             })
             .await;
-        (seqno, maintenance)
+        seqno
     }
 
     pub async fn snapshot(
