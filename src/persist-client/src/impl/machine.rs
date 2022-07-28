@@ -985,6 +985,7 @@ mod tests {
         // Write a bunch of batches. This should result in a bounded number of
         // live entries in consensus.
         const NUM_BATCHES: u64 = 100;
+        let mut ms = vec![];
         for idx in 0..NUM_BATCHES {
             let batch = write
                 .expect_batch(&[((idx.to_string(), ()), idx, 1)], idx, idx + 1)
@@ -996,9 +997,31 @@ mod tests {
                 .expect("external durability failed")
                 .expect("invalid usage")
                 .expect("unexpected upper");
-            writer_maintenance
-                .perform_awaitable(&write.machine, &write.gc, write.compact.as_ref())
+            ms.push(writer_maintenance);
+            // if writer_maintenance.routine.garbage_collection.is_some() {
+            //     last_maintenance = Some(writer_maintenance);
+            //     println!("last with some gc is {}: {:?}", idx, last_maintenance);
+            // }
+        }
+
+        for m in ms {
+            let key = write.machine.shard_id().to_string();
+            let consensus_entries = consensus
+                .scan(&key, SeqNo::minimum())
+                .await
+                .expect("scan failed");
+            m.perform_awaitable(&write.machine, &write.gc, write.compact.as_ref())
                 .await;
+            let consensus_entries_after = consensus
+                .scan(&key, SeqNo::minimum())
+                .await
+                .expect("scan failed");
+            println!(
+                "Had {} now {:?}. seq {:?}",
+                consensus_entries.len(),
+                consensus_entries_after.len(),
+                write.machine.state.seqno,
+            );
         }
         let key = write.machine.shard_id().to_string();
         let consensus_entries = consensus

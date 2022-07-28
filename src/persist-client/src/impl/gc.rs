@@ -110,8 +110,10 @@ impl GarbageCollector {
             req.new_seqno_since.0 / gc_threshold != req.old_seqno_since.0 / gc_threshold;
         if !should_gc {
             self.metrics.gc.skipped.inc();
+            println!("skipping gc");
             return None;
         }
+        println!("doing gc on {:?}", req.new_seqno_since);
 
         // Spawn GC in a background task, so the state change that triggered it
         // isn't blocked on it.
