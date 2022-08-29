@@ -439,7 +439,7 @@ impl Transactor {
 
     async fn advance_since(&mut self) {
         // To keep things interesting, advance the since.
-        const SINCE_LAG: u64 = 10;
+        const SINCE_LAG: u64 = 100;
         let new_since = self.read_ts.saturating_sub(SINCE_LAG);
         debug!("downgrading since to {}", new_since);
         self.read
@@ -478,15 +478,14 @@ impl Service for TransactorService {
         // It doesn't particularly matter what we set should_happen to, so we do
         // this to have a convenient single tunable param.
         let should_happen = 1.0 - args.unreliability;
-        // For consensus, set should_timeout to `args.unreliability` so that once we split
-        // ExternalErrors into determinate vs indeterminate, then
-        // `args.unreliability` will also be the fraction of txns that it's
-        // not save for Maelstrom to retry (b/c indeterminate error in
-        // Consensus CaS).
-        let should_timeout = args.unreliability;
         // It doesn't particularly matter what we set should_happen and
         // should_timeout to for blobs, so use the same handle for both.
-        let unreliable = UnreliableHandle::new(seed, should_happen, should_timeout);
+        let unreliable = UnreliableHandle::new(
+            seed,
+            should_happen,
+            args.unreliability,
+            args.unreliability / 2.0,
+        );
 
         // Construct requested Blob.
         let blob = match &args.blob_uri {

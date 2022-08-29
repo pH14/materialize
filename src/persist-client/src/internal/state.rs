@@ -407,7 +407,7 @@ where
             seqno_since.0.saturating_sub(self.collections.last_gc_req.0) >= gc_threshold;
         // Assign GC traffic preferentially to writers, falling back to anyone
         // generating new state versions if there are no writers.
-        let should_gc = should_gc && (is_write || self.collections.writers.is_empty());
+        let should_gc = is_write; //should_gc && (is_write || self.collections.writers.is_empty());
         if should_gc {
             let req = (self.collections.last_gc_req, seqno_since);
             self.collections.last_gc_req = seqno_since;

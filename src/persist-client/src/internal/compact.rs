@@ -22,7 +22,7 @@ use mz_persist_types::{Codec, Codec64};
 use timely::progress::Timestamp;
 use timely::PartialOrder;
 use tokio::task::JoinHandle;
-use tracing::{debug_span, warn, Instrument, Span};
+use tracing::{debug_span, info, warn, Instrument, Span};
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::batch::BatchParts;
@@ -104,9 +104,9 @@ impl Compactor {
         // were just written, but it does result in non-trivial blob traffic
         // (especially in aggregate). This heuristic is something we'll need to
         // tune over time.
-        let should_compact = req.inputs.len() >= self.cfg.compaction_heuristic_min_inputs
-            || req.inputs.iter().map(|x| x.len).sum::<usize>()
-                >= self.cfg.compaction_heuristic_min_updates;
+        let should_compact = true; //req.inputs.len() >= self.cfg.compaction_heuristic_min_inputs
+                                   // || req.inputs.iter().map(|x| x.len).sum::<usize>()
+                                   //     >= self.cfg.compaction_heuristic_min_updates;
         if !should_compact {
             self.metrics.compaction.skipped.inc();
             return None;
@@ -149,6 +149,7 @@ impl Compactor {
                     Err(err) => {
                         metrics.compaction.failed.inc();
                         warn!("compaction for {} failed: {:#}", machine.shard_id(), err);
+                        panic!("oh no");
                         return;
                     }
                 };

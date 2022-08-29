@@ -192,8 +192,7 @@ async fn persist_client(args: Args) -> Result<PersistClient, ExternalError> {
     let (blob, consensus) = location.open_locations(&config, &metrics).await?;
     let unreliable = UnreliableHandle::default();
     let should_happen = 1.0 - args.unreliability;
-    let should_timeout = args.unreliability;
-    unreliable.partially_available(should_happen, should_timeout);
+    unreliable.partially_available(should_happen, args.unreliability, args.unreliability);
     let blob =
         Arc::new(UnreliableBlob::new(blob, unreliable.clone())) as Arc<dyn Blob + Send + Sync>;
     let consensus = Arc::new(UnreliableConsensus::new(consensus, unreliable))

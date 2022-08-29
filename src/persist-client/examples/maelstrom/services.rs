@@ -189,12 +189,15 @@ impl Blob for MaelstromBlob {
             Some(x) => x,
             None => return Ok(None),
         };
-        let value = value
-            .as_str()
-            .ok_or_else(|| anyhow!("invalid blob at {}: {:?}", key, value))?;
-        let value = serde_json::from_str(value)
-            .map_err(|err| anyhow!("invalid blob at {}: {}", key, err))?;
-        Ok(Some(value))
+
+        match value.as_str() {
+            None => Ok(None),
+            Some(value) => {
+                let value = serde_json::from_str(value)
+                    .map_err(|err| anyhow!("invalid blob at {}: {}", key, err))?;
+                Ok(Some(value))
+            }
+        }
     }
 
     async fn list_keys_and_metadata(
@@ -288,7 +291,8 @@ impl Blob for CachingBlob {
     }
 
     async fn delete(&self, key: &str) -> Result<Option<usize>, ExternalError> {
-        self.cache.lock().await.remove(key);
+        let mut cache = self.cache.lock().await;
+        cache.remove(key);
         self.blob.delete(key).await
     }
 }

@@ -11,7 +11,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ struct UnreliableCore {
     rng: SmallRng,
     should_happen: f64,
     should_timeout: f64,
-    // TODO: Delays, what else?
+    should_delay: f64,
 }
 
 /// A handle for controlling the behavior of an unreliable delegate.
@@ -43,21 +43,24 @@ impl Default for UnreliableHandle {
         let seed = UNIX_EPOCH
             .elapsed()
             .map_or(0, |x| u64::from(x.subsec_nanos()));
-        Self::new(seed, 0.95, 0.05)
+        Self::new(seed, 0.95, 0.05, 0.05)
     }
 }
 
 impl UnreliableHandle {
     /// Returns a new [UnreliableHandle].
-    pub fn new(seed: u64, should_happen: f64, should_timeout: f64) -> Self {
+    pub fn new(seed: u64, should_happen: f64, should_timeout: f64, should_delay: f64) -> Self {
         assert!(should_happen >= 0.0);
         assert!(should_happen <= 1.0);
         assert!(should_timeout >= 0.0);
         assert!(should_timeout <= 1.0);
+        assert!(should_delay >= 0.0);
+        assert!(should_delay <= 1.0);
         let core = UnreliableCore {
             rng: SmallRng::seed_from_u64(seed),
             should_happen,
             should_timeout,
+            should_delay,
         };
         UnreliableHandle {
             core: Arc::new(Mutex::new(core)),
@@ -65,24 +68,27 @@ impl UnreliableHandle {
     }
 
     /// Cause all later calls to sometimes return an error.
-    pub fn partially_available(&self, should_happen: f64, should_timeout: f64) {
+    pub fn partially_available(&self, should_happen: f64, should_timeout: f64, should_delay: f64) {
         assert!(should_happen >= 0.0);
         assert!(should_happen <= 1.0);
         assert!(should_timeout >= 0.0);
         assert!(should_timeout <= 1.0);
+        assert!(should_delay >= 0.0);
+        assert!(should_delay <= 1.0);
         let mut core = self.core.lock().expect("mutex poisoned");
         core.should_happen = should_happen;
         core.should_timeout = should_timeout;
+        core.should_delay = should_delay;
     }
 
     /// Cause all later calls to return an error.
     pub fn totally_unavailable(&self) {
-        self.partially_available(0.0, 1.0);
+        self.partially_available(0.0, 1.0, 0.0);
     }
 
     /// Cause all later calls to succeed.
     pub fn totally_available(&self) {
-        self.partially_available(1.0, 0.0);
+        self.partially_available(1.0, 0.0, 0.0);
     }
 
     fn should_happen(&self) -> bool {
@@ -97,18 +103,44 @@ impl UnreliableHandle {
         core.rng.gen_bool(should_timeout)
     }
 
+    fn should_delay(&self) -> bool {
+        let mut core = self.core.lock().expect("mutex poisoned");
+        let should_delay = core.should_delay;
+        core.rng.gen_bool(should_delay)
+    }
+
     async fn run_op<R, F, WorkFn>(&self, name: &str, work_fn: WorkFn) -> Result<R, ExternalError>
     where
         F: Future<Output = Result<R, ExternalError>>,
         WorkFn: FnOnce() -> F,
     {
-        let (should_happen, should_timeout) = (self.should_happen(), self.should_timeout());
+        let (should_happen, should_timeout, should_delay) = (
+            self.should_happen(),
+            self.should_timeout(),
+            self.should_delay(),
+        );
         trace!(
-            "unreliable {} should_happen={} should_timeout={}",
+            "unreliable {} should_happen={} should_timeout={} should_delay={}",
             name,
             should_happen,
             should_timeout,
+            should_delay,
         );
+
+        if should_delay {
+            let delay_ms = {
+                let mut core = self.core.lock().expect("mutex poisoned");
+                let short_delay = core.rng.gen_bool(0.90);
+
+                if short_delay {
+                    core.rng.gen_range(0..50)
+                } else {
+                    core.rng.gen_range(5000..10000)
+                }
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
         match (should_happen, should_timeout) {
             (true, true) => {
                 let _res = work_fn().await;
