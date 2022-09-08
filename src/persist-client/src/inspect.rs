@@ -9,13 +9,18 @@
 
 //! CLI introspection tools for persist
 
-use crate::internal::state::ProtoStateRollup;
-use crate::{Metrics, ShardId};
+use crate::internal::state::{ProtoStateDiff, ProtoStateRollup};
+use crate::internal::state_diff::StateFieldDiff;
+use crate::{Metrics, PersistConfig, ShardId, StateVersions};
 use anyhow::anyhow;
+use mz_build_info::{BuildInfo, DUMMY_BUILD_INFO};
 use mz_ore::metrics::MetricsRegistry;
-use mz_persist::cfg::ConsensusConfig;
+use mz_ore::now::SYSTEM_TIME;
+use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::SeqNo;
+use mz_proto::RustType;
 use prost::Message;
+use std::sync::Arc;
 
 /// Fetches the current state of a given shard
 pub async fn fetch_current_state(
@@ -39,18 +44,32 @@ pub async fn fetch_current_state(
 pub async fn fetch_state_diffs(
     shard_id: ShardId,
     consensus_uri: &str,
+    blob_uri: &str,
 ) -> Result<Vec<impl serde::Serialize>, anyhow::Error> {
-    let metrics = Metrics::new(&MetricsRegistry::new());
+    let metrics = Arc::new(Metrics::new(&MetricsRegistry::new()));
     let consensus =
-        ConsensusConfig::try_from(&consensus_uri, 1, metrics.postgres_consensus).await?;
+        ConsensusConfig::try_from(&consensus_uri, 1, metrics.postgres_consensus.clone()).await?;
     let consensus = consensus.clone().open().await?;
+    let blob = BlobConfig::try_from(blob_uri)
+        .await
+        .expect("blob should exist")
+        .open()
+        .await?;
+
+    let versions = StateVersions::new(
+        PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone()),
+        consensus,
+        blob,
+        metrics,
+    );
+
+    let mut states_iter = versions
+        .fetch_live_states::<(), (), u64, i64>(&shard_id)
+        .await?;
 
     let mut states = vec![];
-    for state in consensus
-        .scan(&shard_id.to_string(), SeqNo::minimum())
-        .await?
-    {
-        states.push(ProtoStateRollup::decode(state.data).expect("invalid encoded state"));
+    while let Some(state) = states_iter.next() {
+        states.push(state.into_proto());
     }
 
     Ok(states)

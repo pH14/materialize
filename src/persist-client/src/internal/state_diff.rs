@@ -17,6 +17,7 @@ use mz_ore::cast::CastFrom;
 use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_types::Codec64;
 use mz_proto::TryFromProtoError;
+use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tracing::debug;

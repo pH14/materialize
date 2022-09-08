@@ -73,10 +73,9 @@ pub(crate) fn parse_id(id_prefix: char, id_type: &str, encoded: &str) -> Result<
 // references, too.
 fn check_applier_version(build_version: &Version, applier_version: &Version) {
     if build_version < applier_version {
-        panic!(
-            "{} received persist state from the future {}",
-            build_version, applier_version
-        );
+        // panic!( "{} received persist state from the future {}",
+        //     build_version, applier_version
+        // );
     }
 }
 
@@ -483,21 +482,21 @@ where
     D: Codec64,
 {
     fn try_from(x: ProtoStateRollup) -> Result<Result<Self, CodecMismatch>, TryFromProtoError> {
-        if K::codec_name() != x.key_codec
-            || V::codec_name() != x.val_codec
-            || T::codec_name() != x.ts_codec
-            || D::codec_name() != x.diff_codec
-        {
-            return Ok(Err(CodecMismatch {
-                requested: (
-                    K::codec_name(),
-                    V::codec_name(),
-                    T::codec_name(),
-                    D::codec_name(),
-                ),
-                actual: (x.key_codec, x.val_codec, x.ts_codec, x.diff_codec),
-            }));
-        }
+        // if K::codec_name() != x.key_codec
+        //     || V::codec_name() != x.val_codec
+        //     || T::codec_name() != x.ts_codec
+        //     || D::codec_name() != x.diff_codec
+        // {
+        //     return Ok(Err(CodecMismatch {
+        //         requested: (
+        //             K::codec_name(),
+        //             V::codec_name(),
+        //             T::codec_name(),
+        //             D::codec_name(),
+        //         ),
+        //         actual: (x.key_codec, x.val_codec, x.ts_codec, x.diff_codec),
+        //     }));
+        // }
 
         let applier_version = if x.applier_version.is_empty() {
             // Backward compatibility with versions of ProtoState before we set

@@ -64,13 +64,24 @@ pub struct StateArgs {
     ///
     /// When connecting to Cockroach Cloud, use the following format:
     ///
+    /// ```text
     ///   postgresql://<user>:$COCKROACH_PW@<hostname>:<port>/environment_<environment-id>
     ///     ?sslmode=verify-full
     ///     &sslrootcert=/path/to/cockroach-cloud/certs/cluster-ca.crt
     ///     &options=--search_path=consensus
+    /// ```
     ///
     #[clap(long, verbatim_doc_comment)]
     consensus_uri: String,
+
+    /// Blob to use.
+    ///
+    /// ```text
+    ///     export AWS_PROFILE=<>
+    /// ```
+    ///
+    #[clap(long)]
+    blob_uri: String,
 }
 
 pub async fn run(command: InspectArgs) -> Result<(), anyhow::Error> {
@@ -87,9 +98,12 @@ pub async fn run(command: InspectArgs) -> Result<(), anyhow::Error> {
         }
         Command::StateDiff(args) => {
             let shard_id = ShardId::from_str(&args.shard_id).expect("invalid shard id");
-            let states =
-                mz_persist_client::inspect::fetch_state_diffs(shard_id, &args.consensus_uri)
-                    .await?;
+            let states = mz_persist_client::inspect::fetch_state_diffs(
+                shard_id,
+                &args.consensus_uri,
+                &args.blob_uri,
+            )
+            .await?;
             for window in states.windows(2) {
                 println!(
                     "{}",
