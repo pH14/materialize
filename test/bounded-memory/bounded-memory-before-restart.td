@@ -7,351 +7,313 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-#
-# Create a large snapshot and follow-up transactions
-#
 
-> CREATE SECRET pgpass AS 'postgres'
-> CREATE CONNECTION pg FOR POSTGRES
-  HOST postgres,
-  DATABASE postgres,
-  USER postgres,
-  PASSWORD SECRET pgpass
+$ set key-schema={
+    "type": "string"
+  }
 
-# Insert data pre-snapshot
-$ postgres-execute connection=postgres://postgres:postgres@postgres
-ALTER USER postgres WITH replication;
-DROP SCHEMA IF EXISTS public CASCADE;
-DROP PUBLICATION IF EXISTS mz_source;
+$ set value-schema={
+        "type" : "record",
+        "name" : "test",
+        "fields" : [
+            {"name":"f1", "type":"string"}
+        ]
+    }
 
-CREATE SCHEMA public;
+$ kafka-create-topic topic=bounded-memory
 
-CREATE TABLE t1 (f1 SERIAL PRIMARY KEY, f2 INTEGER DEFAULT 0, f3 TEXT);
-ALTER TABLE t1 REPLICA IDENTITY FULL;
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "A1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
 
-INSERT INTO t1 (f3) SELECT REPEAT('a', 1024 * 1024) FROM generate_series(1, 16);
+> CREATE CONNECTION IF NOT EXISTS csr_conn
+  FOR CONFLUENT SCHEMA REGISTRY
+  URL '${testdrive.schema-registry-url}';
 
-CREATE PUBLICATION mz_source FOR ALL TABLES;
+> CREATE CONNECTION kafka_conn
+  FOR KAFKA BROKER '${testdrive.kafka-addr}';
 
-> CREATE SOURCE mz_source
-  FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
+> CREATE SOURCE bounded_memory_source
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-bounded-memory-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
+  ENVELOPE UPSERT
 
-> SELECT mz_internal.mz_sleep(10);
-<null>
+> CREATE MATERIALIZED VIEW bounded_memory_view AS SELECT COUNT(*) FROM bounded_memory_source;
 
-> SELECT COUNT(*) > 0 FROM mz_source;
-true
+> SELECT * FROM bounded_memory_view;
+1000000
 
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
 
-> CREATE VIEWS FROM SOURCE mz_source;
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
 
-# > CREATE MATERIALIZED VIEW v1 AS SELECT f1 + 1, f2 FROM t1;
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
 
-> CREATE MATERIALIZED VIEW v2 AS SELECT COUNT(*) FROM t1;
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
 
-# Update data post-snapshot
-$ postgres-execute connection=postgres://postgres:postgres@postgres
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-UPDATE t1 SET f2 = f2 + 1;
-INSERT INTO t1 (f3) VALUES ('eof');
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
 
-> SELECT * FROM v2;
-17
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "B1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "C1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "D1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "E1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "F1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "G1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "H1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "I1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"${kafka-ingest.iteration}" {"f1": "J1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}
+
+$ kafka-ingest format=avro key-format=avro topic=bounded-memory schema=${value-schema} key-schema=${key-schema} repeat=1000000
+"A" {"f1": "EOF"}
+
+> SELECT * FROM bounded_memory_view;
+1000001
