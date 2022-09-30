@@ -39,6 +39,7 @@ pub fn render<G>(
     G: Scope<Timestamp = Timestamp>,
 {
     let operator_name = format!("persist_sink({})", metadata.data_shard);
+    tracing::info!("persist_sink {src_id} {}", metadata.data_shard);
     let mut persist_op = OperatorBuilder::new(operator_name, scope.clone());
 
     // We want exactly one worker (in the cluster) to send all the data to persist. It's fine

@@ -150,6 +150,7 @@ where
     let shard_id = target.data_shard;
 
     let operator_name = format!("persist_sink {}", sink_id);
+    tracing::info!("persist_sink {sink_id} {}", target.data_shard);
 
     if sink_id.is_user() {
         trace!(

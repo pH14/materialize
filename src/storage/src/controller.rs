@@ -1716,6 +1716,9 @@ mod persist_read_handles {
                                         }
                                         PersistWorkerCmd::Downgrade(since_frontiers) => {
                                             for (id, frontier) in since_frontiers {
+                                                if id.is_user() {
+                                                    tracing::info!("downgrade command for {id}: {:?}", frontier);
+                                                }
                                                 downgrades.insert(id, (span.clone(), frontier));
                                             }
                                         }
@@ -1780,7 +1783,7 @@ mod persist_read_handles {
                                                     // into rate-limiting. It's okay for the since to
                                                     // lag behind a bit and this _greatly_ reduces the
                                                     // persist traffic.
-                                                    read.maybe_downgrade_since(&since).instrument(span).await;
+                                                    read.downgrade_since(&since).instrument(span).await;
                                                 };
 
                                                 futs.push(fut);
