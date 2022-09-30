@@ -58,7 +58,7 @@ pub mod write;
 pub use crate::internal::state::{Since, Upper};
 
 /// An implementation of the public crate interface.
-pub(crate) mod internal {
+pub mod internal {
     pub mod compact;
     pub mod encoding;
     pub mod gc;
