@@ -201,6 +201,13 @@ where
             return None;
         }
 
+        info!(
+            "Running compaction on {} with {} inputs and {} updates",
+            req.shard_id,
+            req.inputs.len(),
+            req.inputs.iter().map(|x| x.len).sum::<usize>()
+        );
+
         let (compaction_completed_sender, compaction_completed_receiver) = oneshot::channel();
         let new_compaction_sender = self.sender.clone();
 
@@ -358,7 +365,16 @@ where
                 .iter()
                 .map(|x| x.encoded_size_bytes)
                 .max()
-                .unwrap_or(cfg.blob_target_size);
+                .unwrap_or_else(|| {
+                    info!(
+                        "defaulting to max blob target size. [{:?}]",
+                        run.1
+                            .iter()
+                            .map(|x| x.encoded_size_bytes)
+                            .collect::<Vec<usize>>()
+                    );
+                    cfg.blob_target_size
+                });
             current_chunk.push(*run);
             current_chunk_max_memory_usage += run_greatest_part_size;
 
@@ -368,7 +384,16 @@ where
                     .iter()
                     .map(|x| x.encoded_size_bytes)
                     .max()
-                    .unwrap_or(cfg.blob_target_size);
+                    .unwrap_or_else(|| {
+                        info!(
+                            "defaulting to max blob target size. [{:?}]",
+                            run.1
+                                .iter()
+                                .map(|x| x.encoded_size_bytes)
+                                .collect::<Vec<usize>>()
+                        );
+                        cfg.blob_target_size
+                    });
 
                 // if we can fit the next run in our chunk without going over our reserved memory, we should do so
                 if current_chunk_max_memory_usage + next_run_greatest_part_size
