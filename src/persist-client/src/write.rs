@@ -127,7 +127,8 @@ where
 {
     pub(crate) cfg: PersistConfig,
     pub(crate) metrics: Arc<Metrics>,
-    pub(crate) machine: Machine<K, V, T, D>,
+    /// Yeah yeah...
+    pub machine: Machine<K, V, T, D>,
     pub(crate) gc: GarbageCollector<K, V, T, D>,
     pub(crate) compact: Option<Compactor<T, D>>,
     pub(crate) blob: Arc<dyn Blob + Send + Sync>,

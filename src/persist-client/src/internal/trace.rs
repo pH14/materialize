@@ -77,7 +77,7 @@ pub struct FueledMergeRes<T> {
 /// we push as many changes as possible into this wrapper.
 #[derive(Debug, Clone)]
 pub struct Trace<T> {
-    spine: Spine<T>,
+    pub spine: Spine<T>,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -264,7 +264,7 @@ impl<T: Timestamp + Lattice> Trace<T> {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(any(test, debug_assertions), derive(PartialEq))]
-enum SpineBatch<T> {
+pub enum SpineBatch<T> {
     Merged(HollowBatch<T>),
     Fueled {
         desc: Description<T>,
@@ -281,7 +281,8 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
         self.desc().upper()
     }
 
-    fn desc(&self) -> &Description<T> {
+    /// Yes!
+    pub fn desc(&self) -> &Description<T> {
         match self {
             SpineBatch::Merged(HollowBatch { desc, .. }) => desc,
             SpineBatch::Fueled { desc, .. } => desc,
@@ -494,11 +495,11 @@ impl<T: Timestamp + Lattice> FuelingMerge<T> {
 /// have completed, at least until they have paid back any "debt" to higher
 /// layers by continuing to provide fuel as updates arrive.
 #[derive(Debug, Clone)]
-struct Spine<T> {
+pub struct Spine<T> {
     effort: usize,
-    since: Antichain<T>,
-    upper: Antichain<T>,
-    merging: Vec<MergeState<T>>,
+    pub since: Antichain<T>,
+    pub upper: Antichain<T>,
+    pub merging: Vec<MergeState<T>>,
 }
 
 impl<T> Spine<T> {
@@ -509,8 +510,12 @@ impl<T> Spine<T> {
                     f(batch1);
                     f(batch2);
                 }
-                MergeState::Double(MergeVariant::Complete(Some((batch, _)))) => f(batch),
-                MergeState::Single(Some(batch)) => f(batch),
+                MergeState::Double(MergeVariant::Complete(Some((batch, _)))) => {
+                    f(batch)
+                }
+                MergeState::Single(Some(batch)) => {
+                    f(batch)
+                }
                 _ => {}
             }
         }
@@ -635,7 +640,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
         batch_index: usize,
         merge_reqs: &mut Vec<FueledMergeReq<T>>,
     ) {
-        tracing::info!("introduce_batch at index: {batch_index}");
+        println!("introduce_batch at index: {batch_index}");
         // Step 0.  Determine an amount of fuel to use for the computation.
         //
         //          Fuel is used to drive maintenance of the data structure,
@@ -904,7 +909,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
 /// A layer can be empty, contain a single batch, or contain a pair of batches
 /// that are in the process of merging into a batch for the next layer.
 #[derive(Debug, Clone)]
-enum MergeState<T> {
+pub enum MergeState<T> {
     /// An empty layer, containing no updates.
     Vacant,
     /// A layer containing a single batch.
@@ -918,7 +923,7 @@ enum MergeState<T> {
 
 impl<T: Timestamp + Lattice> MergeState<T> {
     /// The number of actual updates contained in the level.
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         match self {
             MergeState::Single(Some(b)) => b.len(),
             MergeState::Double(MergeVariant::InProgress(b1, b2, _)) => b1.len() + b2.len(),
@@ -928,7 +933,7 @@ impl<T: Timestamp + Lattice> MergeState<T> {
     }
 
     /// True only for the MergeState::Vacant variant.
-    fn is_vacant(&self) -> bool {
+    pub fn is_vacant(&self) -> bool {
         if let MergeState::Vacant = self {
             true
         } else {
@@ -937,7 +942,7 @@ impl<T: Timestamp + Lattice> MergeState<T> {
     }
 
     /// True only for the MergeState::Single variant.
-    fn is_single(&self) -> bool {
+    pub fn is_single(&self) -> bool {
         if let MergeState::Single(_) = self {
             true
         } else {
@@ -946,7 +951,7 @@ impl<T: Timestamp + Lattice> MergeState<T> {
     }
 
     /// True only for the MergeState::Double variant.
-    fn is_double(&self) -> bool {
+    pub fn is_double(&self) -> bool {
         if let MergeState::Double(_) = self {
             true
         } else {
@@ -974,7 +979,7 @@ impl<T: Timestamp + Lattice> MergeState<T> {
     }
 
     /// True iff the layer is a complete merge, ready for extraction.
-    fn is_complete(&mut self) -> bool {
+    pub fn is_complete(&mut self) -> bool {
         if let MergeState::Double(MergeVariant::Complete(_)) = self {
             true
         } else {
@@ -1035,8 +1040,9 @@ impl<T: Timestamp + Lattice> MergeState<T> {
     }
 }
 
+/// Yeah yeah...
 #[derive(Debug, Clone)]
-enum MergeVariant<T> {
+pub enum MergeVariant<T> {
     /// Describes an actual in-progress merge between two non-trivial batches.
     InProgress(SpineBatch<T>, SpineBatch<T>, FuelingMerge<T>),
     /// A merge that requires no further work. May or may not represent a

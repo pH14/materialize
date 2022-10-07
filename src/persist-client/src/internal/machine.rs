@@ -51,7 +51,7 @@ pub struct Machine<K, V, T, D> {
     pub(crate) shard_metrics: Arc<ShardMetrics>,
     pub(crate) state_versions: Arc<StateVersions>,
 
-    state: State<K, V, T, D>,
+    pub state: State<K, V, T, D>,
 }
 
 // Impl Clone regardless of the type params.
@@ -221,6 +221,7 @@ where
         loop {
             let (seqno, res, routine) = self
                 .apply_unbatched_cmd(&metrics.cmds.compare_and_append, |_, state| {
+                    println!("-- attempting state.compare_and_append",);
                     state.compare_and_append(batch, writer_id, heartbeat_timestamp_ms)
                 })
                 .await?;

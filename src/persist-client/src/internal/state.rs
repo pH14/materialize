@@ -146,7 +146,7 @@ pub struct StateCollections<T> {
     // - Invariant: `trace.since` doesn't regress across state versions.
     // - Invariant: `trace.upper` doesn't regress across state versions.
     // - Invariant: `trace` upholds its own invariants.
-    pub(crate) trace: Trace<T>,
+    pub trace: Trace<T>,
 }
 
 impl<T> StateCollections<T>
@@ -419,7 +419,7 @@ pub struct State<K, V, T, D> {
     pub(crate) shard_id: ShardId,
 
     pub(crate) seqno: SeqNo,
-    pub(crate) collections: StateCollections<T>,
+    pub collections: StateCollections<T>,
 
     // According to the docs, PhantomData is to "mark things that act like they
     // own a T". State doesn't actually own K, V, or D, just the ability to

@@ -674,6 +674,8 @@ pub struct ProtoStateFieldDiff<'a> {
     pub to: &'a [u8],
 }
 
+/// Yeah yeah...
+#[derive(Debug)]
 pub struct ProtoStateFieldDiffsIter<'a> {
     len: usize,
     diff_idx: usize,

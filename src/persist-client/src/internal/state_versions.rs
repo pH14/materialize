@@ -635,6 +635,7 @@ impl StateVersions {
 }
 
 /// An iterator over consecutive versions of [State].
+#[derive(Debug)]
 pub struct StateVersionsIter<K, V, T, D> {
     cfg: PersistConfig,
     metrics: Arc<Metrics>,
