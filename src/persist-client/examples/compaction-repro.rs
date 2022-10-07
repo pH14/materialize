@@ -27,6 +27,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use differential_dataflow::consolidation::consolidate_updates;
 use timely::progress::Antichain;
 use tokio::sync::Mutex;
 
@@ -71,7 +72,7 @@ async fn main() {
         .expect("invalid usage");
 
     // Immediately allow compaction to "the max", so we don't block compactions.
-    read.downgrade_since(&Antichain::from_elem(num_rounds + 1))
+    read.downgrade_since(&Antichain::from_elem(num_rounds - 1))
         .await;
 
     for round in 0..(num_rounds) {
@@ -146,9 +147,33 @@ async fn main() {
             }
         }
 
-        println!("num_batches: {num_batches}, num_entries: {num_entries}");
-        // println!("consolidated updates.len: {}", updates.len());
+        println!("num_batches: {num_batches}, num_entries: {num_entries} ");
 
         println!("---\n");
     }
+
+    let recent_upper = write.fetch_recent_upper().await;
+    println!(
+        "recent_upper: {:?}, trying to snapshot at {}",
+        recent_upper,
+        num_rounds - 1
+    );
+    let snap = read
+        .snapshot_and_fetch(Antichain::from_elem(num_rounds - 1))
+        .await
+        .expect("incorrect since");
+
+    let mut updates = snap
+        .into_iter()
+        .map(|((key, value), ts, diff)| ((key.unwrap(), value.unwrap()), ts, diff))
+        .collect::<Vec<_>>();
+
+    let num_entries_from_snapshot = updates.len();
+
+    consolidate_updates(&mut updates);
+
+    let num_consolidated_entries = updates.len();
+
+    println!("num_entries_from_snapshot: {num_entries_from_snapshot}");
+    println!("consolidated updates.len: {}", num_consolidated_entries);
 }
