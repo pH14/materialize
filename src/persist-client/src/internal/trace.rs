@@ -635,6 +635,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
         batch_index: usize,
         merge_reqs: &mut Vec<FueledMergeReq<T>>,
     ) {
+        tracing::info!("introduce_batch at index: {batch_index}");
         // Step 0.  Determine an amount of fuel to use for the computation.
         //
         //          Fuel is used to drive maintenance of the data structure,
@@ -719,6 +720,8 @@ impl<T: Timestamp + Lattice> Spine<T> {
     /// should not introduce more virtual records than 2^index, as that is the
     /// amount of excess fuel we have budgeted for completing merges.
     fn roll_up(&mut self, index: usize, merge_reqs: &mut Vec<FueledMergeReq<T>>) {
+        println!("roll_up to index: {index}");
+
         // Ensure entries sufficient for `index`.
         while self.merging.len() <= index {
             self.merging.push(MergeState::Vacant);
@@ -756,6 +759,8 @@ impl<T: Timestamp + Lattice> Spine<T> {
     /// of completing merges of large batches later, but tbh probably not much
     /// later).
     pub fn apply_fuel(&mut self, fuel: &mut isize, merge_reqs: &mut Vec<FueledMergeReq<T>>) {
+        println!("apply_fuel: {fuel}");
+
         // For the moment our strategy is to apply fuel independently to each
         // merge in progress, rather than prioritizing small merges. This sounds
         // like a great idea, but we need better accounting in place to ensure
@@ -791,6 +796,8 @@ impl<T: Timestamp + Lattice> Spine<T> {
     /// into a layer which already contains two batches (and is still in the
     /// process of merging).
     fn insert_at(&mut self, batch: Option<SpineBatch<T>>, index: usize) {
+        println!("insert_at index {index}");
+
         // Ensure the spine is large enough.
         while self.merging.len() <= index {
             self.merging.push(MergeState::Vacant);
@@ -826,6 +833,8 @@ impl<T: Timestamp + Lattice> Spine<T> {
 
     /// Attempts to draw down large layers to size appropriate layers.
     fn tidy_layers(&mut self) {
+        println!("tidy_layers");
+
         // If the largest layer is complete (not merging), we can attempt to
         // draw it down to the next layer. This is permitted if we can maintain
         // our invariant that below each merge there are at most half the
@@ -1006,6 +1015,11 @@ impl<T: Timestamp + Lattice> MergeState<T> {
         batch2: Option<SpineBatch<T>>,
         compaction_frontier: Option<AntichainRef<T>>,
     ) -> MergeState<T> {
+        println!(
+            "begin_merge, batch1: {:?}, begin2: {:?}",
+            batch1.as_ref().map(SpineBatch::desc),
+            batch2.as_ref().map(SpineBatch::desc)
+        );
         let variant = match (batch1, batch2) {
             (Some(batch1), Some(batch2)) => {
                 assert!(batch1.upper() == batch2.lower());
@@ -1057,6 +1071,7 @@ impl<T: Timestamp + Lattice> MergeVariant<T> {
         if let MergeVariant::InProgress(b1, b2, mut merge) = variant {
             merge.work(&b1, &b2, fuel);
             if *fuel > 0 {
+                println!("merge done! b1: {:?} b2: {:?}", b1.desc(), b2.desc());
                 *self = MergeVariant::Complete(Some((merge.done(merge_reqs), Some((b1, b2)))));
             } else {
                 *self = MergeVariant::InProgress(b1, b2, merge);
