@@ -110,7 +110,10 @@ async fn main() {
             .expect("invalid expected upper");
 
         // let persist do some work if it has to
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Force a state refetch!
+        write.fetch_recent_upper().await;
 
         let spine = &write.machine.state.collections.trace.spine;
 

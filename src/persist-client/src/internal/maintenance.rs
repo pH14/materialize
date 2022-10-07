@@ -198,7 +198,6 @@ where
     /// tasks have completed and the maintenance is done.
     ///
     /// Used for testing maintenance-related state transitions deterministically
-    #[cfg(test)]
     pub(crate) async fn perform<K, V, D>(
         self,
         machine: &Machine<K, V, T, D>,

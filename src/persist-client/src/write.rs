@@ -510,7 +510,7 @@ where
             Err(err) => return Ok(Err(err)),
         };
 
-        maintenance.start_performing(&self.machine, &self.gc, self.compact.as_ref());
+        maintenance.perform(&self.machine, &self.gc, self.compact.as_ref()).await;
 
         Ok(Ok(Ok(())))
     }

@@ -144,8 +144,10 @@ where
                             let res = FueledMergeRes { output: res.output };
                             let applied = machine.merge_res(&res).await;
                             if applied {
+                                println!("merge result APPLIED!");
                                 metrics.compaction.applied.inc();
                             } else {
+                                println!("merge result dit NOT apply!");
                                 metrics.compaction.noop.inc();
                                 for part in res.output.parts {
                                     let key = part.key.complete(&machine.shard_id());
