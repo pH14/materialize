@@ -160,6 +160,8 @@ mod tests {
                     "since-upper" => trace_dd::since_upper(&mut state, args),
                     "spine-batches" => trace_dd::batches(&mut state, args),
                     "take-merge-reqs" => trace_dd::take_merge_req(&mut state, args),
+                    "spine-from-json" => trace_dd::spine_from_json(&mut state, args),
+                    "apply-spine-diff" => trace_dd::apply_spine_diff(&mut state, args),
                     _ => panic!("unknown directive {:?}", tc),
                 };
                 match res {

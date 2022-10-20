@@ -1,0 +1,297 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+spine-from-json
+{
+  "since": {
+    "elements": [
+      16
+    ]
+  },
+  "spine": [
+    {
+      "desc": {
+        "lower": {
+          "elements": [
+            0
+          ]
+        },
+        "upper": {
+          "elements": [
+            2
+          ]
+        },
+        "since": {
+          "elements": [
+            1
+          ]
+        }
+      },
+      "parts": [
+        {
+          "key": "b1-k1",
+          "encoded_size_bytes": 2201203
+        }
+      ],
+      "len": 42525,
+      "runs": [],
+      "deprecated_keys": []
+    },
+    {
+      "desc": {
+        "lower": {
+          "elements": [
+            2
+          ]
+        },
+        "upper": {
+          "elements": [
+            4
+          ]
+        },
+        "since": {
+          "elements": [
+            3
+          ]
+        }
+      },
+      "parts": [
+        {
+          "key": "b2-k1",
+          "encoded_size_bytes": 1057140
+        }
+      ],
+      "len": 20412,
+      "runs": [],
+      "deprecated_keys": []
+    },
+    {
+      "desc": {
+        "lower": {
+          "elements": [
+            4
+          ]
+        },
+        "upper": {
+          "elements": [
+            6
+          ]
+        },
+        "since": {
+          "elements": [
+            5
+          ]
+        }
+      },
+      "parts": [
+        {
+          "key": "b3-k1",
+          "encoded_size_bytes": 177075
+        }
+      ],
+      "len": 3402,
+      "runs": [],
+      "deprecated_keys": []
+    },
+    {
+      "desc": {
+        "lower": {
+          "elements": [
+            6
+          ]
+        },
+        "upper": {
+          "elements": [
+            8
+          ]
+        },
+        "since": {
+          "elements": [
+            7
+          ]
+        }
+      },
+      "parts": [],
+      "len": 0,
+      "runs": [],
+      "deprecated_keys": []
+    },
+    {
+      "desc": {
+        "lower": {
+          "elements": [
+            8
+          ]
+        },
+        "upper": {
+          "elements": [
+            10
+          ]
+        },
+        "since": {
+          "elements": [
+            9
+          ]
+        }
+      },
+      "parts": [
+        {
+          "key": "b5-k1",
+          "encoded_size_bytes": 177075
+        }
+      ],
+      "len": 3402,
+      "runs": [],
+      "deprecated_keys": []
+    },
+    {
+      "desc": {
+        "lower": {
+          "elements": [
+            10
+          ]
+        },
+        "upper": {
+          "elements": [
+            12
+          ]
+        },
+        "since": {
+          "elements": [
+            11
+          ]
+        }
+      },
+      "parts": [
+        {
+          "key": "b6-1",
+          "encoded_size_bytes": 25836
+        },
+        {
+          "key": "b6-2",
+          "encoded_size_bytes": 25088
+        },
+        {
+          "key": "b6-3",
+          "encoded_size_bytes": 26706
+        },
+        {
+          "key": "b6-4",
+          "encoded_size_bytes": 28344
+        },
+        {
+          "key": "b6-5",
+          "encoded_size_bytes": 26238
+        },
+        {
+          "key": "b6-6",
+          "encoded_size_bytes": 23978
+        },
+        {
+          "key": "b6-7",
+          "encoded_size_bytes": 27084
+        }
+      ],
+      "len": 3402,
+      "runs": [],
+      "deprecated_keys": []
+    },
+    {
+      "desc": {
+        "lower": {
+          "elements": [
+            12
+          ]
+        },
+        "upper": {
+          "elements": [
+            14
+          ]
+        },
+        "since": {
+          "elements": [
+            13
+          ]
+        }
+      },
+      "parts": [],
+      "len": 0,
+      "runs": [],
+      "deprecated_keys": []
+    },
+    {
+      "desc": {
+        "lower": {
+          "elements": [
+            14
+          ]
+        },
+        "upper": {
+          "elements": [
+            16
+          ]
+        },
+        "since": {
+          "elements": [
+            0
+          ]
+        }
+      },
+      "parts": [
+        {
+          "key": "b8-1",
+          "encoded_size_bytes": 27084
+        },
+        {
+          "key": "b8-2",
+          "encoded_size_bytes": 26238
+        },
+        {
+          "key": "b8-3",
+          "encoded_size_bytes": 26706
+        },
+        {
+          "key": "b8-4",
+          "encoded_size_bytes": 25088
+        },
+        {
+          "key": "b8-5",
+          "encoded_size_bytes": 28344
+        },
+        {
+          "key": "b8-6",
+          "encoded_size_bytes": 25836
+        },
+        {
+          "key": "b8-7",
+          "encoded_size_bytes": 23978
+        }
+      ],
+      "len": 3402,
+      "runs": [],
+      "deprecated_keys": []
+    }
+  ]
+}
+----
+ok
+
+spine-batches
+----
+[0][2][1] 42525 b1-k1
+[2][4][3] 20412 b2-k1
+[4][12][16] 4/10206 b3-k1 b5-k1 b6-1 b6-2 b6-3 b6-4 b6-5 b6-6 b6-7
+[12][14][13] 0
+[14][16][0] 3402 b8-1 b8-2 b8-3 b8-4 b8-5 b8-6 b8-7
+
+apply-spine-diff
+d [4][6][5]
+d [6][16][5]
+----
+ok

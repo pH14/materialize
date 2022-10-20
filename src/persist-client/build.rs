@@ -13,7 +13,7 @@ fn main() {
     env::set_var("PROTOC", protobuf_src::protoc());
 
     prost_build::Config::new()
-        .type_attribute(".", "#[derive(serde::Serialize)]")
+        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .compile_protos(&["persist-client/src/internal/state.proto"], &[".."])
         .unwrap();
 }

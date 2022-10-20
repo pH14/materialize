@@ -1171,6 +1171,15 @@ impl<T: Timestamp + Lattice> MergeVariant<T> {
 pub mod datadriven {
     use super::*;
     use crate::internal::datadriven::DirectiveArgs;
+    use crate::internal::state::ProtoTrace;
+    use crate::internal::state_diff::{apply_diffs_spine, StateFieldDiff, StateFieldValDiff};
+    use crate::{Metrics, PersistConfig};
+    use anyhow::anyhow;
+    use mz_build_info::DUMMY_BUILD_INFO;
+    use mz_ore::metrics::MetricsRegistry;
+    use mz_ore::now::SYSTEM_TIME;
+    use mz_proto::ProtoType;
+    use tracing::info;
 
     /// Shared state for a single [crate::internal::trace] [datadriven::TestFile].
     #[derive(Debug, Default)]
@@ -1300,6 +1309,56 @@ pub mod datadriven {
             ApplyMergeResult::NotAppliedInvalidSince => Ok("no-op invalid since\n".into()),
             ApplyMergeResult::NotAppliedTooManyUpdates => Ok("no-op too many updates\n".into()),
         }
+    }
+
+    pub fn spine_from_json(
+        datadriven: &mut TraceState,
+        args: DirectiveArgs,
+    ) -> Result<String, anyhow::Error> {
+        let json = args.input.trim();
+        let trace: ProtoTrace = serde_json::from_str(json)?;
+        let trace = trace.into_rust()?;
+        datadriven.trace = trace;
+        Ok("ok\n".to_owned())
+    }
+
+    pub fn apply_spine_diff(
+        datadriven: &mut TraceState,
+        args: DirectiveArgs,
+    ) -> Result<String, anyhow::Error> {
+        let mut diffs = vec![];
+        for x in args.input.trim().split('\n') {
+            match x.trim().split_once(' ').expect("<usage>") {
+                ("d", desc @ _) => {
+                    let description = DirectiveArgs::parse_desc(desc);
+                    let mut found = false;
+                    for batch in datadriven.trace.batches() {
+                        println!("checking {:?} vs {:?}", batch.desc, description);
+                        if batch.desc == description {
+                            diffs.push(StateFieldDiff {
+                                key: batch.clone(),
+                                val: StateFieldValDiff::Delete(()),
+                            });
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if !found {
+                        return Err(anyhow!("unable to find batch with desc: {}", desc));
+                    }
+                }
+                _ => {
+                    panic!("oops");
+                }
+            }
+        }
+
+        let cfg = PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone());
+        let metrics = Metrics::new(&cfg, &MetricsRegistry::new());
+        apply_diffs_spine(&metrics, diffs, &mut datadriven.trace).expect("applies");
+
+        Ok("Ok\n".to_owned())
     }
 }
 
