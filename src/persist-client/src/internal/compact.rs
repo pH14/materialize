@@ -31,7 +31,7 @@ use mz_persist::location::Blob;
 use mz_persist_types::{Codec, Codec64};
 use timely::progress::Timestamp;
 use timely::PartialOrder;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::sync::{mpsc, oneshot, TryAcquireError};
 use tokio::task::JoinHandle;
 use tracing::log::warn;
@@ -74,19 +74,21 @@ pub struct CompactRes<T> {
 /// merging adjacent batches. Logical compaction is advancing timestamps to a
 /// new since and consolidating the resulting updates.
 #[derive(Debug, Clone)]
-pub struct Compactor<T, D> {
+pub struct Compactor<K, V, T, D> {
     cfg: PersistConfig,
     metrics: Arc<Metrics>,
-    sender: UnboundedSender<(CompactReq<T>, oneshot::Sender<()>)>,
+    sender: Sender<(CompactReq<T>, oneshot::Sender<()>, Machine<K, V, T, D>)>,
     _phantom: PhantomData<fn() -> D>,
 }
 
-impl<T, D> Compactor<T, D>
+impl<K, V, T, D> Compactor<K, V, T, D>
 where
+    K: Debug + Codec,
+    V: Debug + Codec,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send,
 {
-    pub fn new<K, V>(
+    pub fn new(
         machine: Machine<K, V, T, D>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         writer_id: WriterId,
@@ -96,7 +98,9 @@ where
         V: Debug + Codec,
     {
         let (compact_req_sender, mut compact_req_receiver) =
-            mpsc::unbounded_channel::<(CompactReq<T>, oneshot::Sender<()>)>();
+            mpsc::channel::<(CompactReq<T>, oneshot::Sender<()>, Machine<K, V, T, D>)>(
+                machine.cfg.compaction_concurrency_limit,
+            );
         let concurrency_limit = Arc::new(tokio::sync::Semaphore::new(
             machine.cfg.compaction_concurrency_limit,
         ));
@@ -106,14 +110,13 @@ where
         // spin off a single task responsible for executing compaction requests.
         // work is enqueued into the task through a channel
         let _worker_handle = mz_ore::task::spawn(|| "PersistCompactionWorker", async move {
-            while let Some((req, completer)) = compact_req_receiver.recv().await {
-                assert_eq!(req.shard_id, machine.shard_id());
+            while let Some((req, completer, mut machinez)) = compact_req_receiver.recv().await {
+                assert_eq!(req.shard_id, machinez.shard_id());
 
-                let cfg = machine.cfg.clone();
-                let blob = Arc::clone(&machine.state_versions.blob);
-                let metrics = Arc::clone(&machine.metrics);
+                let cfg = machinez.cfg.clone();
+                let blob = Arc::clone(&machinez.state_versions.blob);
+                let metrics = Arc::clone(&machinez.metrics);
                 let cpu_heavy_runtime = Arc::clone(&cpu_heavy_runtime);
-                let mut machine = machine.clone();
                 let writer_id = writer_id.clone();
                 let permit = {
                     let inner = Arc::clone(&concurrency_limit);
@@ -131,15 +134,16 @@ where
                         Err(TryAcquireError::Closed) => {
                             // should never happen in practice. the semaphore is
                             // never explicitly closed, nor will it close on Drop
-                            warn!("semaphore for shard {} is closed", machine.shard_id());
+                            warn!("semaphore for shard {} is closed", machinez.shard_id());
                             continue;
                         }
                     }
                 };
 
                 let compact_span =
-                    debug_span!(parent: None, "compact::apply", shard_id=%machine.shard_id());
+                    debug_span!(parent: None, "compact::apply", shard_id=%machinez.shard_id());
                 compact_span.follows_from(&Span::current());
+                let req_clone = req.clone();
                 async move {
                     metrics.compaction.started.inc();
                     let start = Instant::now();
@@ -202,18 +206,23 @@ where
 
                     match res {
                         Ok(Ok(res)) => {
-                            let res = FueledMergeRes { output: res.output };
-                            let apply_merge_result = machine.merge_res(&res).await;
+                            let res = FueledMergeRes { output: res.output, should_log: true };
+                            println!("created res with desc {:?}", res.output.desc);
+                            let apply_merge_result = machinez.merge_res(&res).await;
+                            let input_updates = req_clone.inputs.iter().map(|x| x.len).sum::<usize>();
+                            let output_updates = res.output.len;
                             match &apply_merge_result {
                                 ApplyMergeResult::AppliedExact => {
                                     metrics.compaction.applied.inc();
                                     metrics.compaction.applied_exact_match.inc();
-                                    machine.shard_metrics.compaction_applied.inc();
+                                    machinez.shard_metrics.compaction_applied.inc();
+                                    println!("applied compaction {output_updates} from {input_updates}");
                                 }
                                 ApplyMergeResult::AppliedSubset => {
                                     metrics.compaction.applied.inc();
                                     metrics.compaction.applied_subset_match.inc();
-                                    machine.shard_metrics.compaction_applied.inc();
+                                    machinez.shard_metrics.compaction_applied.inc();
+                                    println!("applied subset compaction {output_updates} from {input_updates}");
                                 }
                                 ApplyMergeResult::NotAppliedNoMatch
                                 | ApplyMergeResult::NotAppliedInvalidSince
@@ -224,8 +233,9 @@ where
                                         metrics.compaction.not_applied_too_many_updates.inc();
                                     }
                                     metrics.compaction.noop.inc();
+                                    println!("NOT APPLIED compaction, result: {:?}. would produce {output_updates} updates from {input_updates} input updates", apply_merge_result);
                                     for part in res.output.parts {
-                                        let key = part.key.complete(&machine.shard_id());
+                                        let key = part.key.complete(&machinez.shard_id());
                                         retry_external(
                                             &metrics.retries.external.compaction_noop_delete,
                                             || blob.delete(&key),
@@ -237,7 +247,7 @@ where
                         }
                         Ok(Err(err)) | Err(err) => {
                             metrics.compaction.failed.inc();
-                            debug!("compaction for {} failed: {:#}", machine.shard_id(), err);
+                            debug!("compaction for {} failed: {:#}", machinez.shard_id(), err);
                         }
                     };
 
@@ -268,6 +278,7 @@ where
     pub fn compact_and_apply_background(
         &self,
         req: CompactReq<T>,
+        machine: &Machine<K, V, T, D>,
     ) -> Option<oneshot::Receiver<()>> {
         // Run some initial heuristics to ignore some requests for compaction.
         // We don't gain much from e.g. compacting two very small batches that
@@ -275,18 +286,33 @@ where
         // (especially in aggregate). This heuristic is something we'll need to
         // tune over time.
         let should_compact = req.inputs.len() >= self.cfg.compaction_heuristic_min_inputs
+            || req.inputs.iter().map(|x| x.parts.len()).sum::<usize>()
+                >= self.cfg.compaction_heuristic_min_inputs
             || req.inputs.iter().map(|x| x.len).sum::<usize>()
                 >= self.cfg.compaction_heuristic_min_updates;
+        let inputs = req.inputs.len();
+        let parts = req.inputs.iter().map(|x| x.parts.len()).sum::<usize>();
+        let updates = req.inputs.iter().map(|x| x.len).sum::<usize>();
         if !should_compact {
+            println!(
+                "not compacting: inputs = {}, parts = {}, updates = {}, req = {:?}",
+                inputs, parts, updates, req
+            );
             self.metrics.compaction.skipped.inc();
             return None;
         }
+        println!(
+            "compacting: inputs = {}, parts = {}, updates = {}, req = {:?}",
+            inputs, parts, updates, req
+        );
 
         let (compaction_completed_sender, compaction_completed_receiver) = oneshot::channel();
         let new_compaction_sender = self.sender.clone();
 
         self.metrics.compaction.requested.inc();
-        let send = new_compaction_sender.send((req, compaction_completed_sender));
+        // maybe get rid of the single worker. use a single semaphore. if we try_acquire, great
+        // we can clone machine and fire it off. if not, we drop the request and log that fact
+        let send = new_compaction_sender.send((req, compaction_completed_sender, machine.clone()));
         if let Err(e) = send {
             // In the steady state we expect this to always succeed, but during
             // shutdown it is possible the destination task has already spun down

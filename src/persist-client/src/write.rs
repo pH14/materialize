@@ -131,7 +131,7 @@ where
     /// Yeah yeah...
     pub machine: Machine<K, V, T, D>,
     pub(crate) gc: GarbageCollector<K, V, T, D>,
-    pub(crate) compact: Option<Compactor<T, D>>,
+    pub(crate) compact: Option<Compactor<K, V, T, D>>,
     pub(crate) blob: Arc<dyn Blob + Send + Sync>,
     pub(crate) cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
     pub(crate) writer_id: WriterId,
@@ -155,7 +155,7 @@ where
         metrics: Arc<Metrics>,
         machine: Machine<K, V, T, D>,
         gc: GarbageCollector<K, V, T, D>,
-        compact: Option<Compactor<T, D>>,
+        compact: Option<Compactor<K, V, T, D>>,
         blob: Arc<dyn Blob + Send + Sync>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         writer_id: WriterId,

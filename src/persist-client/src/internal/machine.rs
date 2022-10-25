@@ -223,7 +223,7 @@ where
         loop {
             let (seqno, res, routine) = self
                 .apply_unbatched_cmd(&metrics.cmds.compare_and_append, |_, state| {
-                    println!("-- attempting state.compare_and_append",);
+                    // println!("-- attempting state.compare_and_append",);
                     state.compare_and_append(batch, writer_id, heartbeat_timestamp_ms)
                 })
                 .await?;

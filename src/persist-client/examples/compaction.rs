@@ -35,15 +35,15 @@ use mz_build_info::DUMMY_BUILD_INFO;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::SYSTEM_TIME;
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::internal::trace::MergeState;
 use mz_persist_client::internal::trace::MergeVariant;
+use mz_persist_client::internal::trace::{MergeState, SpineBatch};
 use mz_persist_client::{PersistConfig, PersistLocation, ShardId};
 
 #[tokio::main]
 async fn main() {
-    let num_rounds = 200;
-    let num_keys = 1_00;
-    let num_keys_last_round = 1_000;
+    let num_rounds = 100;
+    let num_keys = 4;
+    let num_keys_last_round = 4;
 
     let persistcfg = PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone());
 
@@ -110,9 +110,9 @@ async fn main() {
             .expect("invalid expected upper");
 
         // let persist do some work if it has to
-        // tokio::time::sleep(Duration::from_millis(100)).await;
+        // tokio::time::sleep(Duration::from_millis(25)).await;
 
-        write.machine.fetch_and_update_state().await;
+        // write.machine.fetch_and_update_state().await;
         let spine = &write.machine.state.collections.trace.spine;
 
         // println!(
@@ -121,37 +121,59 @@ async fn main() {
         // );
 
         let mut num_batches = 0;
+        let mut num_batch_parts = 0;
         let mut num_entries = 0;
+        let mut num_fueled_merges = 0;
 
         for batch in spine.merging.iter().rev() {
             match batch {
                 MergeState::Double(MergeVariant::InProgress(batch1, batch2, _)) => {
                     // println!("double-batch(in-progress)!");
                     num_batches += 2;
+                    num_batch_parts += batch1.parts() + batch2.parts();
                     num_entries += batch1.len() + batch2.len();
+
+                    match batch1 {
+                        SpineBatch::Merged(_) => {}
+                        SpineBatch::Fueled { .. } => num_fueled_merges += 1,
+                    };
+                    match batch2 {
+                        SpineBatch::Merged(_) => {}
+                        SpineBatch::Fueled { .. } => num_fueled_merges += 1,
+                    };
                     // println!("batch {:?}, len: {} ", batch1.desc(), batch1.len());
                     // println!("batch {:?}, len: {} ", batch2.desc(), batch2.len());
                 }
                 MergeState::Double(MergeVariant::Complete(Some((batch, _)))) => {
                     // println!("double-batch(merged)!");
                     num_batches += 1;
+                    num_batch_parts += batch.parts();
                     num_entries += batch.len();
+                    match batch {
+                        SpineBatch::Merged(_) => {}
+                        SpineBatch::Fueled { .. } => num_fueled_merges += 1,
+                    };
                     // println!("batch {:?}, len: {} ", batch.desc(), batch.len());
                 }
                 MergeState::Single(Some(batch)) => {
                     // println!("single-batch!");
                     num_batches += 1;
+                    num_batch_parts += batch.parts();
                     num_entries += batch.len();
+                    match batch {
+                        SpineBatch::Merged(_) => {}
+                        SpineBatch::Fueled { .. } => num_fueled_merges += 1,
+                    };
                     // println!("batch {:?}, len: {} ", batch.desc(), batch.len());
                 }
                 _ => {}
             }
         }
 
-        println!("{round}: num_batches: {num_batches}, num_entries: {num_entries} ");
+        println!("{round}: num_batches: {num_batches}, num_batch_parts: {num_batch_parts}, num_entries: {num_entries}, num_fueled_merges: {num_fueled_merges} ");
     }
 
-    tokio::time::sleep(Duration::from_millis(60000)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
 
     let recent_upper = write.fetch_recent_upper().await;
     println!(

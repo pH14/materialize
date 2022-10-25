@@ -290,7 +290,7 @@ impl PersistConfig {
             compaction_memory_bound_bytes: 1024 * MB,
             compaction_heuristic_min_inputs: 8,
             compaction_heuristic_min_updates: 1024,
-            compaction_concurrency_limit: 5,
+            compaction_concurrency_limit: 15,
             compaction_minimum_timeout: Duration::from_secs(90),
             consensus_connection_pool_max_size: 50,
             writer_lease_duration: Duration::from_secs(60 * 15),

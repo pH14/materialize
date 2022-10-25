@@ -69,6 +69,7 @@ pub struct FueledMergeReq<T> {
 #[derive(Debug)]
 pub struct FueledMergeRes<T> {
     pub output: HollowBatch<T>,
+    pub should_log: bool,
 }
 
 /// An append-only collection of compactable update batches.
@@ -331,6 +332,13 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
         }
     }
 
+    pub fn parts(&self) -> usize {
+        match self {
+            SpineBatch::Merged(_) => 1,
+            SpineBatch::Fueled { parts, .. } => parts.len(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         match self {
             SpineBatch::Merged(HollowBatch { len, .. }) => *len == 0,
@@ -366,6 +374,18 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
     }
 
     fn maybe_replace(&mut self, res: &FueledMergeRes<T>) -> ApplyMergeResult {
+        if res.should_log {
+            println!("res: {:?}", res.output.desc);
+            println!("self: {:?}", self.desc());
+            println!(
+                "trying to merge res [{:?}][{:?}] into [{:?}][{:?}] batch.",
+                res.output.desc.lower().first().unwrap(),
+                res.output.desc.upper().first().unwrap(),
+                self.desc().lower().first().unwrap(),
+                self.desc().upper().first().unwrap(),
+            );
+        }
+
         // The spine's and merge res's sinces don't need to match (which could occur if Spine
         // has been reloaded from state due to compare_and_set mismatch), but if so, the Spine
         // since must be in advance of the merge res since.
@@ -388,6 +408,9 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
             if res.output.len > self.len() {
                 return ApplyMergeResult::NotAppliedTooManyUpdates;
             }
+            if res.should_log {
+                println!("\t exact match",);
+            }
             *self = SpineBatch::Merged(res.output.clone());
             return ApplyMergeResult::AppliedExact;
         }
@@ -409,6 +432,14 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
                 let mut lower = None;
                 let mut upper = None;
                 for (i, batch) in parts.iter().enumerate() {
+                    if res.should_log {
+                        println!(
+                            "\t\t subset part: [{:?}][{:?}]",
+                            batch.desc.lower().first().unwrap(),
+                            batch.desc.upper().first().unwrap()
+                        );
+                    }
+
                     if batch.desc.lower() == res.output.desc.lower() {
                         lower = Some(i);
                     }
@@ -422,6 +453,7 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
                 // next, replace parts with the merge res batch if we can
                 match (lower, upper) {
                     (Some(lower), Some(upper)) => {
+                        println!("\t subset match",);
                         let mut new_parts = vec![];
                         new_parts.extend_from_slice(&parts[..lower]);
                         new_parts.push(res.output.clone());
@@ -598,12 +630,8 @@ impl<T> Spine<T> {
                     f(batch1);
                     f(batch2);
                 }
-                MergeState::Double(MergeVariant::Complete(Some((batch, _)))) => {
-                    f(batch)
-                }
-                MergeState::Single(Some(batch)) => {
-                    f(batch)
-                }
+                MergeState::Double(MergeVariant::Complete(Some((batch, _)))) => f(batch),
+                MergeState::Single(Some(batch)) => f(batch),
                 _ => {}
             }
         }
@@ -728,7 +756,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
         batch_index: usize,
         merge_reqs: &mut Vec<FueledMergeReq<T>>,
     ) {
-        println!("introduce_batch at index: {batch_index}");
+        // println!("introduce_batch at index: {batch_index}");
         // Step 0.  Determine an amount of fuel to use for the computation.
         //
         //          Fuel is used to drive maintenance of the data structure,
@@ -813,7 +841,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
     /// should not introduce more virtual records than 2^index, as that is the
     /// amount of excess fuel we have budgeted for completing merges.
     fn roll_up(&mut self, index: usize, merge_reqs: &mut Vec<FueledMergeReq<T>>) {
-        println!("roll_up to index: {index}");
+        // println!("roll_up to index: {index}");
 
         // Ensure entries sufficient for `index`.
         while self.merging.len() <= index {
@@ -852,7 +880,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
     /// of completing merges of large batches later, but tbh probably not much
     /// later).
     pub fn apply_fuel(&mut self, fuel: &mut isize, merge_reqs: &mut Vec<FueledMergeReq<T>>) {
-        println!("apply_fuel: {fuel}");
+        // println!("apply_fuel: {fuel}");
 
         // For the moment our strategy is to apply fuel independently to each
         // merge in progress, rather than prioritizing small merges. This sounds
@@ -889,7 +917,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
     /// into a layer which already contains two batches (and is still in the
     /// process of merging).
     fn insert_at(&mut self, batch: Option<SpineBatch<T>>, index: usize) {
-        println!("insert_at index {index}");
+        // println!("insert_at index {index}");
 
         // Ensure the spine is large enough.
         while self.merging.len() <= index {
@@ -926,7 +954,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
 
     /// Attempts to draw down large layers to size appropriate layers.
     fn tidy_layers(&mut self) {
-        println!("tidy_layers");
+        // println!("tidy_layers");
 
         // If the largest layer is complete (not merging), we can attempt to
         // draw it down to the next layer. This is permitted if we can maintain
@@ -1120,11 +1148,11 @@ impl<T: Timestamp + Lattice> MergeState<T> {
         batch2: Option<SpineBatch<T>>,
         compaction_frontier: Option<AntichainRef<T>>,
     ) -> MergeState<T> {
-        println!(
-            "begin_merge, batch1: {:?}, begin2: {:?}",
-            batch1.as_ref().map(SpineBatch::desc),
-            batch2.as_ref().map(SpineBatch::desc)
-        );
+        // println!(
+        //     "begin_merge, batch1: {:?}, begin2: {:?}",
+        //     batch1.as_ref().map(SpineBatch::desc),
+        //     batch2.as_ref().map(SpineBatch::desc)
+        // );
         let variant = match (batch1, batch2) {
             (Some(batch1), Some(batch2)) => {
                 assert!(batch1.upper() == batch2.lower());
@@ -1177,7 +1205,7 @@ impl<T: Timestamp + Lattice> MergeVariant<T> {
         if let MergeVariant::InProgress(b1, b2, mut merge) = variant {
             merge.work(&b1, &b2, fuel);
             if *fuel > 0 {
-                println!("merge done! b1: {:?} b2: {:?}", b1.desc(), b2.desc());
+                // println!("merge done! b1: {:?} b2: {:?}", b1.desc(), b2.desc());
                 *self = MergeVariant::Complete(Some((merge.done(merge_reqs), Some((b1, b2)))));
             } else {
                 *self = MergeVariant::InProgress(b1, b2, merge);
@@ -1313,6 +1341,7 @@ pub mod datadriven {
     ) -> Result<String, anyhow::Error> {
         let res = FueledMergeRes {
             output: DirectiveArgs::parse_hollow_batch(args.input),
+            should_log: false,
         };
         match datadriven.trace.apply_merge_res(&res) {
             ApplyMergeResult::AppliedExact => Ok("applied exact\n".into()),

@@ -29,7 +29,7 @@ name = "persistcli"
 bench = false
 
 [[example]]
-name = "compaction-repro"
+name = "compaction"
 bench = false
 
 [dependencies]
