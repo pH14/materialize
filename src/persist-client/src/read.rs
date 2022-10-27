@@ -689,7 +689,7 @@ where
     }
 
     /// Heartbeats the read lease if necessary.
-    ///
+    ///{
     /// This is an internally rate limited helper, designed to allow users to
     /// call it as frequently as they like. Call this [Self::downgrade_since],
     /// or [Self::maybe_downgrade_since] on some interval that is "frequent"

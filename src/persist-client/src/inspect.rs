@@ -11,11 +11,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::io::{BufRead, BufReader, Read};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::anyhow;
-use bytes::BufMut;
+use bytes::{Buf, BufMut, Bytes};
 use differential_dataflow::difference::Semigroup;
+use flate2::read::GzDecoder;
+
 use differential_dataflow::trace::Description;
 use prost::Message;
 
@@ -25,6 +29,8 @@ use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::SYSTEM_TIME;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
+use mz_persist::location::{SeqNo, VersionedData};
+use mz_persist::s3::S3BlobConfig;
 use mz_persist_types::{Codec, Codec64};
 use mz_proto::RustType;
 
@@ -33,6 +39,7 @@ use crate::internal::paths::{
     BlobKey, BlobKeyPrefix, PartialBatchKey, PartialBlobKey, PartialRollupKey,
 };
 use crate::internal::state::{ProtoStateDiff, ProtoStateRollup};
+use crate::internal::state_diff::StateDiff;
 use crate::{Metrics, PersistConfig, ShardId, StateVersions};
 
 const READ_ALL_BUILD_INFO: BuildInfo = BuildInfo {
@@ -387,6 +394,109 @@ pub async fn unreferenced_blobs(
     }
 
     Ok(unreferenced_blobs)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ChangefeedEntry {
+    after: Option<ChangefeedAfter>,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ChangefeedAfter {
+    data: String,
+    sequence_number: u64,
+    shard: ShardId,
+}
+
+///
+pub async fn changefeed(
+    s3_bucket: String,
+    environmentd_id: String,
+    shard_id: ShardId,
+    timestamp: u64,
+) -> Result<impl serde::Serialize, anyhow::Error> {
+    let s3config = S3BlobConfig::new(
+        s3_bucket.clone(),
+        environmentd_id.clone(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let client = s3config.client;
+
+    let mut continuation_token = None;
+
+    // WIP could be nice to output the preceding and following pages in S3 in the output
+
+    's3_continuations: loop {
+        let list_objects = client
+            .list_objects_v2()
+            .set_bucket(Some(s3_bucket.clone()))
+            .set_prefix(Some(environmentd_id.clone()))
+            .set_continuation_token(continuation_token)
+            .send()
+            .await?;
+
+        for list in list_objects.contents() {
+            for object in list {
+                if let Some(last_modified) = object.last_modified() {
+                    if last_modified.to_millis()? > timestamp as i64 {
+                        println!(
+                            "Pulling contents from {:?} created at {:?}",
+                            object.key(),
+                            object.last_modified()
+                        );
+
+                        let changefeed_blob = client
+                            .get_object()
+                            .set_bucket(Some(s3_bucket.clone()))
+                            .set_key(object.key().map(|x| x.to_string()))
+                            .send()
+                            .await?;
+
+                        let bytes = changefeed_blob.body.collect().await?;
+
+                        let d = GzDecoder::new(bytes.reader());
+                        for line in BufReader::new(d).lines() {
+                            let line = line?;
+                            let v: ChangefeedEntry =
+                                serde_json::from_str(&line).expect(&format!("parseable: {}", line));
+
+                            if let Some(after) = v.after {
+                                if after.shard != shard_id {
+                                    continue;
+                                }
+                                let v = VersionedData {
+                                    seqno: SeqNo(after.sequence_number),
+                                    data: Bytes::from(
+                                        hex::decode(&after.data[2..]).expect("hex encoded string"),
+                                    ),
+                                };
+                                let (seqno, diff): (SeqNo, StateDiff<u64>) = (&v).try_into()?;
+                                println!("{}-{}: {:?}", &after.shard, seqno, diff);
+                            }
+                        }
+
+                        // break 's3_continuations;
+                    } else {
+                        println!(
+                            "Skipping page... {:?} created at {:?}",
+                            object.key(),
+                            object.last_modified()
+                        );
+                    }
+                }
+            }
+        }
+
+        match list_objects.next_continuation_token() {
+            None => break,
+            Some(token) => continuation_token = Some(token.to_string()),
+        }
+    }
+
+    Ok(())
 }
 
 /// The following is a very terrible hack that no one should draw inspiration from. Currently State

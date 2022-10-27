@@ -42,7 +42,7 @@ use crate::location::{Atomicity, Blob, BlobMetadata, ExternalError};
 /// Configuration for opening an [S3Blob].
 #[derive(Clone, Debug)]
 pub struct S3BlobConfig {
-    client: S3Client,
+    pub client: S3Client,
     bucket: String,
     prefix: String,
 }

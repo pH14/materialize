@@ -10,6 +10,7 @@
 //! Persist command-line utilities
 
 use mz_persist_client::ShardId;
+use std::borrow::Borrow;
 
 use serde_json::json;
 use std::str::FromStr;
@@ -63,6 +64,9 @@ pub(crate) enum Command {
     ///
     #[clap(verbatim_doc_comment)]
     StateDiff(StateArgs),
+
+    /// Digests the contents of a CRDB Changefeed stored in S3
+    Changefeed(ChangefeedArgs),
 }
 
 /// Arguments for viewing the current state of a given shard
@@ -114,6 +118,35 @@ pub struct BlobArgs {
     /// URI scoped to the environment's bucket prefix.
     #[clap(long)]
     blob_uri: String,
+}
+
+/// TODO
+#[derive(Debug, Clone, clap::Parser)]
+pub struct ChangefeedArgs {
+    #[clap(long)]
+    environment_id: String,
+
+    /// Shard to view
+    #[clap(long)]
+    shard_id: String,
+
+    /// Blob to use
+    ///
+    /// When connecting to a deployed environment's blob, the necessary connection glue must be in
+    /// place. e.g. for S3, sign into SSO, set AWS_PROFILE and AWS_REGION appropriately, with a blob
+    /// URI scoped to the environment's bucket prefix.
+    #[clap(long)]
+    s3_bucket: String,
+
+    /// Target timestamp in epoch millis
+    #[clap(long)]
+    timestamp: u64,
+
+    #[clap(long, default_value = "0")]
+    preceding_pages: u64,
+
+    #[clap(long, default_value = "0")]
+    following_pages: u64,
 }
 
 /// Arguments for viewing the blobs of a given shard
@@ -204,6 +237,17 @@ pub async fn run(command: InspectArgs) -> Result<(), anyhow::Error> {
                 &shard_id,
                 &args.consensus_uri,
                 &args.blob_uri,
+            )
+            .await?;
+            println!("{}", json!(unreferenced_blobs));
+        }
+        Command::Changefeed(args) => {
+            let shard_id = ShardId::from_str(&args.shard_id).expect("invalid shard id");
+            let unreferenced_blobs = mz_persist_client::inspect::changefeed(
+                args.s3_bucket,
+                args.environment_id,
+                shard_id,
+                args.timestamp,
             )
             .await?;
             println!("{}", json!(unreferenced_blobs));
