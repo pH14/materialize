@@ -590,16 +590,16 @@ impl BatchWriteMetrics {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompactionMetrics {
-    pub(crate) requested: IntCounter,
-    pub(crate) dropped: IntCounter,
-    pub(crate) skipped: IntCounter,
-    pub(crate) started: IntCounter,
-    pub(crate) applied: IntCounter,
-    pub(crate) timed_out: IntCounter,
-    pub(crate) failed: IntCounter,
-    pub(crate) noop: IntCounter,
+    pub requested: IntCounter,
+    pub dropped: IntCounter,
+    pub skipped: IntCounter,
+    pub started: IntCounter,
+    pub applied: IntCounter,
+    pub timed_out: IntCounter,
+    pub failed: IntCounter,
+    pub noop: IntCounter,
     pub(crate) seconds: Counter,
     pub(crate) concurrency_waits: IntCounter,
     pub(crate) memory_violations: IntCounter,
@@ -609,9 +609,9 @@ pub struct CompactionMetrics {
     pub(crate) parts_prefetched: IntCounter,
     pub(crate) parts_waited: IntCounter,
 
-    pub(crate) applied_exact_match: IntCounter,
-    pub(crate) applied_subset_match: IntCounter,
-    pub(crate) not_applied_too_many_updates: IntCounter,
+    pub applied_exact_match: IntCounter,
+    pub applied_subset_match: IntCounter,
+    pub not_applied_too_many_updates: IntCounter,
 
     pub(crate) batch: BatchWriteMetrics,
     pub(crate) steps: CompactionStepTimings,
@@ -711,7 +711,7 @@ impl CompactionMetrics {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompactionStepTimings {
     pub(crate) part_fetch_seconds: Counter,
     pub(crate) heap_population_seconds: Counter,

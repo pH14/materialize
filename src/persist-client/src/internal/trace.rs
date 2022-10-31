@@ -267,6 +267,10 @@ impl<T: Timestamp + Lattice> Trace<T> {
         }
         ret
     }
+
+    pub fn internal_stats(&self) -> Vec<(usize, usize, usize, Option<usize>)> {
+        self.spine.describe()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +331,13 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
             // NB: This is an upper bound on len, we won't know for sure until
             // we compact it.
             SpineBatch::Fueled { parts, .. } => parts.iter().map(|b| b.len).sum(),
+        }
+    }
+
+    pub fn parts(&self) -> usize {
+        match self {
+            SpineBatch::Merged(HollowBatch { .. }) => 1,
+            SpineBatch::Fueled { parts, .. } => parts.len(),
         }
     }
 
@@ -700,14 +711,13 @@ impl<T: Timestamp + Lattice> Spine<T> {
     /// Describes the merge progress of layers in the trace.
     ///
     /// Intended for diagnostics rather than public consumption.
-    #[allow(dead_code)]
-    fn describe(&self) -> Vec<(usize, usize)> {
+    fn describe(&self) -> Vec<(usize, usize, usize, Option<usize>)> {
         self.merging
             .iter()
             .map(|b| match b {
-                MergeState::Vacant => (0, 0),
-                x @ MergeState::Single(_) => (1, x.len()),
-                x @ MergeState::Double(_) => (2, x.len()),
+                MergeState::Vacant => (0, 0, 0, None),
+                x @ MergeState::Single(_) => (1, x.len(), x.parts(), None),
+                x @ MergeState::Double(mv) => (2, x.len(), x.parts(), Some(mv.fuel_needed())),
             })
             .collect()
     }
@@ -1006,6 +1016,16 @@ impl<T: Timestamp + Lattice> MergeState<T> {
         }
     }
 
+    /// The number of parts contained in the level.
+    fn parts(&self) -> usize {
+        match self {
+            MergeState::Single(Some(b)) => b.parts(),
+            MergeState::Double(MergeVariant::InProgress(b1, b2, _)) => b1.parts() + b2.parts(),
+            MergeState::Double(MergeVariant::Complete(Some((b, _)))) => b.parts(),
+            _ => 0,
+        }
+    }
+
     /// True if this merge state contains no updates.
     fn is_empty(&self) -> bool {
         match self {
@@ -1131,6 +1151,14 @@ enum MergeVariant<T> {
 }
 
 impl<T: Timestamp + Lattice> MergeVariant<T> {
+    /// Amount of fuel needed to complete merge. For diagnostic use only.
+    fn fuel_needed(&self) -> usize {
+        match self {
+            MergeVariant::InProgress(_, _, fueling_merge) => fueling_merge.remaining_work,
+            MergeVariant::Complete(_) => 0,
+        }
+    }
+
     /// Completes and extracts the batch, unless structurally empty.
     ///
     /// The result is either `None`, for structurally empty batches, or a batch

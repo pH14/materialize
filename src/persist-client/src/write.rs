@@ -35,7 +35,7 @@ use crate::error::InvalidUsage;
 use crate::internal::compact::Compactor;
 use crate::internal::encoding::SerdeWriterEnrichedHollowBatch;
 use crate::internal::machine::{Machine, INFO_MIN_ATTEMPTS};
-use crate::internal::metrics::Metrics;
+use crate::internal::metrics::{CompactionMetrics, Metrics};
 use crate::internal::state::{HollowBatch, Upper};
 use crate::{parse_id, CpuHeavyRuntime, GarbageCollector, PersistConfig, ShardId};
 
@@ -673,6 +673,15 @@ where
     pub async fn expire(mut self) {
         self.machine.expire_writer(&self.writer_id).await;
         self.explicitly_expired = true;
+    }
+
+    /// Purposefully underdocumented as this isn't intended to be consumed
+    /// by anything outside of test harnesses in `examples` and `bench`
+    pub fn internal_stats(&self) -> (Vec<(usize, usize, usize, Option<usize>)>, CompactionMetrics) {
+        (
+            self.machine.internal_stats(),
+            self.metrics.compaction.clone(),
+        )
     }
 
     /// Test helper for an [Self::append] call that is expected to succeed.

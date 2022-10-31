@@ -24,6 +24,7 @@ use mz_ore::tracing::TracingConfig;
 use tokio::runtime::Handle;
 use tracing::{info_span, Instrument};
 
+pub mod compaction;
 pub mod inspect;
 pub mod maelstrom;
 pub mod open_loop;
@@ -45,6 +46,7 @@ enum Command {
     OpenLoop(crate::open_loop::Args),
     SourceExample(crate::source_example::Args),
     Inspect(crate::inspect::InspectArgs),
+    Compaction(crate::compaction::Args),
 }
 
 fn main() {
@@ -100,6 +102,9 @@ fn main() {
         }
         Command::Inspect(command) => {
             runtime.block_on(crate::inspect::run(command).instrument(root_span))
+        }
+        Command::Compaction(command) => {
+            runtime.block_on(crate::compaction::run(command).instrument(root_span))
         }
     };
 

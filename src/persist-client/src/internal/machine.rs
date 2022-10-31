@@ -699,6 +699,10 @@ where
             self.state.seqno
         );
     }
+
+    pub(crate) fn internal_stats(&self) -> Vec<(usize, usize, usize, Option<usize>)> {
+        self.state.collections.trace.internal_stats()
+    }
 }
 
 pub const INFO_MIN_ATTEMPTS: usize = 3;
