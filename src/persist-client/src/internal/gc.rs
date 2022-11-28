@@ -109,57 +109,61 @@ where
 
         // spin off a single task responsible for executing GC requests.
         // work is enqueued into the task through a channel
-        let _worker_handle = mz_ore::task::spawn(|| "PersistGcWorker", async move {
-            while let Some((req, completer)) = gc_req_recv.recv().await {
-                let mut consolidated_req = req;
-                let mut gc_completed_senders = vec![completer];
+        let shard_id = machine.shard_id();
+        let _worker_handle = mz_ore::task::spawn(
+            || format!("PersistGcWorker({})", shard_id),
+            async move {
+                while let Some((req, completer)) = gc_req_recv.recv().await {
+                    let mut consolidated_req = req;
+                    let mut gc_completed_senders = vec![completer];
 
-                // check if any further gc requests have built up. we'll merge their requests
-                // together and run a single GC pass to satisfy all of them
-                while let Ok((req, completer)) = gc_req_recv.try_recv() {
-                    assert_eq!(req.shard_id, consolidated_req.shard_id);
-                    gc_completed_senders.push(completer);
-                    consolidated_req.new_seqno_since =
-                        std::cmp::max(req.new_seqno_since, consolidated_req.new_seqno_since);
-                }
+                    // check if any further gc requests have built up. we'll merge their requests
+                    // together and run a single GC pass to satisfy all of them
+                    while let Ok((req, completer)) = gc_req_recv.try_recv() {
+                        assert_eq!(req.shard_id, consolidated_req.shard_id);
+                        gc_completed_senders.push(completer);
+                        consolidated_req.new_seqno_since =
+                            std::cmp::max(req.new_seqno_since, consolidated_req.new_seqno_since);
+                    }
 
-                let merged_requests = gc_completed_senders.len() - 1;
-                if merged_requests > 0 {
+                    let merged_requests = gc_completed_senders.len() - 1;
+                    if merged_requests > 0 {
+                        machine
+                            .metrics
+                            .gc
+                            .merged
+                            .inc_by(u64::cast_from(merged_requests));
+                        debug!(
+                            "Merged {} gc requests together for shard {}",
+                            merged_requests, consolidated_req.shard_id
+                        );
+                    }
+
+                    let gc_span = debug_span!(parent: None, "gc_and_truncate", shard_id=%consolidated_req.shard_id);
+                    gc_span.follows_from(&Span::current());
+
+                    let start = Instant::now();
+                    machine.metrics.gc.started.inc();
+                    Self::gc_and_truncate(&mut machine, consolidated_req)
+                        .instrument(gc_span)
+                        .await;
+                    machine.metrics.gc.finished.inc();
+                    machine.shard_metrics.gc_finished.inc();
                     machine
                         .metrics
                         .gc
-                        .merged
-                        .inc_by(u64::cast_from(merged_requests));
-                    debug!(
-                        "Merged {} gc requests together for shard {}",
-                        merged_requests, consolidated_req.shard_id
-                    );
+                        .seconds
+                        .inc_by(start.elapsed().as_secs_f64());
+
+                    // inform all callers who enqueued GC reqs that their work is complete
+                    for sender in gc_completed_senders {
+                        // we can safely ignore errors here, it's possible the caller
+                        // wasn't interested in waiting and dropped their receiver
+                        let _ = sender.send(());
+                    }
                 }
-
-                let gc_span = debug_span!(parent: None, "gc_and_truncate", shard_id=%consolidated_req.shard_id);
-                gc_span.follows_from(&Span::current());
-
-                let start = Instant::now();
-                machine.metrics.gc.started.inc();
-                Self::gc_and_truncate(&mut machine, consolidated_req)
-                    .instrument(gc_span)
-                    .await;
-                machine.metrics.gc.finished.inc();
-                machine.shard_metrics.gc_finished.inc();
-                machine
-                    .metrics
-                    .gc
-                    .seconds
-                    .inc_by(start.elapsed().as_secs_f64());
-
-                // inform all callers who enqueued GC reqs that their work is complete
-                for sender in gc_completed_senders {
-                    // we can safely ignore errors here, it's possible the caller
-                    // wasn't interested in waiting and dropped their receiver
-                    let _ = sender.send(());
-                }
-            }
-        });
+            },
+        );
 
         GarbageCollector {
             sender: gc_req_sender,

@@ -93,6 +93,7 @@ where
         metrics: Arc<Metrics>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         writer_id: WriterId,
+        shard_id: ShardId,
     ) -> Self {
         let (compact_req_sender, mut compact_req_receiver) =
             mpsc::channel::<(CompactReq<T>, Machine<K, V, T, D>, oneshot::Sender<()>)>(
@@ -104,7 +105,12 @@ where
 
         // spin off a single task responsible for executing compaction requests.
         // work is enqueued into the task through a channel
-        let _worker_handle = mz_ore::task::spawn(|| "PersistCompactionWorker", async move {
+        let task_name = format!(
+            "PersistCompactionWorker ({}, {})",
+            shard_id,
+            writer_id.clone()
+        );
+        let _worker_handle = mz_ore::task::spawn(|| task_name, async move {
             while let Some((req, mut machine, completer)) = compact_req_receiver.recv().await {
                 assert_eq!(req.shard_id, machine.shard_id());
 

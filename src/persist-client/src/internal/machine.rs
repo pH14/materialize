@@ -597,7 +597,12 @@ where
 
     pub async fn start_reader_heartbeat_task(self, reader_id: LeasedReaderId) -> JoinHandle<()> {
         let mut machine = self;
-        spawn(|| "persist::heartbeat_read", async move {
+        let task_name = format!(
+            "persist::heartbeat_read ({}, {})",
+            machine.shard_id(),
+            reader_id.clone()
+        );
+        spawn(|| task_name, async move {
             let sleep_duration = machine.cfg.reader_lease_duration / 2;
             loop {
                 let before_sleep = Instant::now();
@@ -651,7 +656,12 @@ where
 
     pub async fn start_writer_heartbeat_task(self, writer_id: WriterId) -> JoinHandle<()> {
         let mut machine = self;
-        spawn(|| "persist::heartbeat_write", async move {
+        let task_name = format!(
+            "persist::heartbeat_write ({}, {})",
+            machine.shard_id(),
+            writer_id.clone()
+        );
+        spawn(|| task_name, async move {
             let sleep_duration = machine.cfg.writer_lease_duration / 4;
             loop {
                 let before_sleep = Instant::now();

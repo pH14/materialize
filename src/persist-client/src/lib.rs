@@ -642,6 +642,7 @@ impl PersistClient {
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.cpu_heavy_runtime),
                 writer_id.clone(),
+                shard_id,
             )
         });
         let heartbeat_ts = (self.cfg.now)();
