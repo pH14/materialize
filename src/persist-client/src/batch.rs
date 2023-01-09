@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use differential_dataflow::consolidation::consolidate_updates;
+// use differential_dataflow::consolidation::consolidate_updates;
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
@@ -492,7 +492,7 @@ where
         }
 
         let start = Instant::now();
-        consolidate_updates(&mut updates);
+        // consolidate_updates(&mut updates);
         self.batch_write_metrics
             .step_consolidation
             .inc_by(start.elapsed().as_secs_f64());
