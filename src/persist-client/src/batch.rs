@@ -493,16 +493,26 @@ where
         }
 
         let start = Instant::now();
+        let already_sorted = updates
+            .iter()
+            .map(|x| (x.0, x.1))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|w| w[0] <= w[1]);
         // if !self.is_user_batch {
+        let original_len = updates.len();
         consolidate_updates(&mut updates);
         // }
         self.batch_write_metrics
             .step_consolidation
             .inc_by(start.elapsed().as_secs_f64());
-        if self.is_user_batch {
+        if self.is_user_batch && original_len > 1000 {
             info!(
-                "Time to consolidate updates: {}s",
-                start.elapsed().as_secs_f64()
+                "Time to consolidate updates: {}s. Was already sorted: {}, Original len: {}, New len: {}",
+                start.elapsed().as_secs_f64(),
+                already_sorted,
+                original_len,
+                updates.len(),
             );
         }
 
