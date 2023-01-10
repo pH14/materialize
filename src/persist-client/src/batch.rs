@@ -30,7 +30,7 @@ use mz_persist_types::{Codec, Codec64};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tokio::task::JoinHandle;
-use tracing::{debug_span, instrument, trace_span, warn, Instrument};
+use tracing::{debug_span, info, instrument, trace_span, warn, Instrument};
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::InvalidUsage;
@@ -493,12 +493,18 @@ where
         }
 
         let start = Instant::now();
-        if !self.is_user_batch {
-            consolidate_updates(&mut updates);
-        }
+        // if !self.is_user_batch {
+        consolidate_updates(&mut updates);
+        // }
         self.batch_write_metrics
             .step_consolidation
             .inc_by(start.elapsed().as_secs_f64());
+        if self.is_user_batch {
+            info!(
+                "Time to consolidate updates: {}s",
+                start.elapsed().as_secs_f64()
+            );
+        }
 
         if updates.is_empty() {
             self.key_buf.clear();
