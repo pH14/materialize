@@ -501,7 +501,9 @@ where
         let start = Instant::now();
         let original_vec = updates.clone();
         consolidate_updates(&mut updates);
-        updates = original_vec;
+        if self.is_user_batch {
+            updates = original_vec;
+        }
         self.batch_write_metrics
             .step_consolidation
             .inc_by(start.elapsed().as_secs_f64());
