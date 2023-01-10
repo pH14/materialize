@@ -874,6 +874,8 @@ where
                 status_shard,
             };
 
+            info!("Associating {} to data shard {}", id, metadata.data_shard);
+
             // should be replaced with real introspection (https://github.com/MaterializeInc/materialize/issues/14266)
             // but for now, it's helpful to have this mapping written down somewhere
             debug!(

@@ -252,6 +252,7 @@ where
                 batch_write_metrics,
                 cfg.blob_target_size,
                 since == Antichain::from_elem(T::minimum()),
+                shard_id,
             ),
             metrics,
             max_kvt_in_run: None,
@@ -425,6 +426,7 @@ struct BatchBuffer<D> {
     current_part_value_bytes: usize,
 
     is_user_batch: bool,
+    shard_id: ShardId,
 }
 
 impl<D> BatchBuffer<D>
@@ -436,6 +438,7 @@ where
         batch_write_metrics: BatchWriteMetrics,
         blob_target_size: usize,
         is_user_batch: bool,
+        shard_id: ShardId,
     ) -> Self {
         BatchBuffer {
             metrics,
@@ -448,6 +451,7 @@ where
             current_part_key_bytes: Default::default(),
             current_part_value_bytes: Default::default(),
             is_user_batch,
+            shard_id,
         }
     }
 
@@ -493,6 +497,7 @@ where
         }
 
         let start = Instant::now();
+        let original_vec = updates.clone();
         let already_sorted = updates
             .iter()
             .map(|x| (x.0, x.1))
@@ -508,8 +513,10 @@ where
             .inc_by(start.elapsed().as_secs_f64());
         if self.is_user_batch && original_len > 1000 {
             info!(
-                "Time to consolidate updates: {}s. Was already sorted: {}, Original len: {}, New len: {}",
+                "{}: Time to consolidate updates: {}s. equal after consolidate: {}, already sorted: {}, Original len: {}, New len: {}",
+                self.shard_id,
                 start.elapsed().as_secs_f64(),
+                original_vec == updates,
                 already_sorted,
                 original_len,
                 updates.len(),
