@@ -251,6 +251,7 @@ where
                 Arc::clone(&metrics),
                 batch_write_metrics,
                 cfg.blob_target_size,
+                since == Antichain::from_elem(T::minimum()),
             ),
             metrics,
             max_kvt_in_run: None,
@@ -422,6 +423,8 @@ struct BatchBuffer<D> {
     current_part_total_bytes: usize,
     current_part_key_bytes: usize,
     current_part_value_bytes: usize,
+
+    is_user_batch: bool,
 }
 
 impl<D> BatchBuffer<D>
@@ -432,6 +435,7 @@ where
         metrics: Arc<Metrics>,
         batch_write_metrics: BatchWriteMetrics,
         blob_target_size: usize,
+        is_user_batch: bool,
     ) -> Self {
         BatchBuffer {
             metrics,
@@ -443,6 +447,7 @@ where
             current_part_total_bytes: Default::default(),
             current_part_key_bytes: Default::default(),
             current_part_value_bytes: Default::default(),
+            is_user_batch,
         }
     }
 
@@ -488,7 +493,9 @@ where
         }
 
         let start = Instant::now();
-        consolidate_updates(&mut updates);
+        if !self.is_user_batch {
+            consolidate_updates(&mut updates);
+        }
         self.batch_write_metrics
             .step_consolidation
             .inc_by(start.elapsed().as_secs_f64());
