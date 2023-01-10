@@ -197,7 +197,7 @@ where
     blob: Arc<dyn Blob + Send + Sync>,
     metrics: Arc<Metrics>,
 
-    buffer: BatchBuffer<D>,
+    buffer: BatchBuffer<K, V, T, D>,
 
     max_kvt_in_run: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     runs: Vec<usize>,
@@ -325,6 +325,8 @@ where
             },
         );
 
+        info!("{}: Finishing batch", self.shard_id);
+
         Ok(batch)
     }
 
@@ -412,7 +414,7 @@ where
 }
 
 #[derive(Debug)]
-struct BatchBuffer<D> {
+struct BatchBuffer<K, V, T, D> {
     metrics: Arc<Metrics>,
     batch_write_metrics: BatchWriteMetrics,
     blob_target_size: usize,
@@ -427,10 +429,15 @@ struct BatchBuffer<D> {
 
     is_user_batch: bool,
     shard_id: ShardId,
+
+    phantom: PhantomData<(K, V, T, D)>,
 }
 
-impl<D> BatchBuffer<D>
+impl<K, V, T, D> BatchBuffer<K, V, T, D>
 where
+    K: Debug + Codec,
+    V: Debug + Codec,
+    T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64,
 {
     fn new(
@@ -452,16 +459,11 @@ where
             current_part_value_bytes: Default::default(),
             is_user_batch,
             shard_id,
+            phantom: PhantomData::default(),
         }
     }
 
-    fn push<K: Codec, V: Codec, T: Codec64>(
-        &mut self,
-        key: &K,
-        val: &V,
-        ts: &T,
-        diff: D,
-    ) -> Option<ColumnarRecords> {
+    fn push(&mut self, key: &K, val: &V, ts: &T, diff: D) -> Option<ColumnarRecords> {
         let initial_key_buf_len = self.key_buf.len();
         let initial_val_buf_len = self.val_buf.len();
         self.metrics
@@ -521,6 +523,28 @@ where
                 original_len,
                 updates.len(),
             );
+
+            for ((k, v), t, d) in original_vec.iter().take(25) {
+                info!(
+                    "{}: original K={:?}, V={:?}, T={:?}, D={:?}",
+                    self.shard_id,
+                    K::decode(k).expect("k"),
+                    V::decode(v).expect("v"),
+                    T::decode(*t),
+                    d
+                );
+            }
+
+            for ((k, v), t, d) in updates.iter().take(25) {
+                info!(
+                    "{}: updated K={:?}, V={:?}, T={:?}, D={:?}",
+                    self.shard_id,
+                    K::decode(k).expect("k"),
+                    V::decode(v).expect("v"),
+                    T::decode(*t),
+                    d
+                );
+            }
         }
 
         if updates.is_empty() {
