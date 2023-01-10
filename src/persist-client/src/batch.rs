@@ -500,52 +500,11 @@ where
 
         let start = Instant::now();
         let original_vec = updates.clone();
-        let already_sorted = updates
-            .iter()
-            .map(|x| (x.0, x.1))
-            .collect::<Vec<_>>()
-            .windows(2)
-            .all(|w| w[0] <= w[1]);
-        // if !self.is_user_batch {
-        let original_len = updates.len();
         consolidate_updates(&mut updates);
-        // }
+        updates = original_vec;
         self.batch_write_metrics
             .step_consolidation
             .inc_by(start.elapsed().as_secs_f64());
-        if self.is_user_batch && original_len > 1000 {
-            info!(
-                "{}: Time to consolidate updates: {}s. equal after consolidate: {}, already sorted: {}, Original len: {}, New len: {}",
-                self.shard_id,
-                start.elapsed().as_secs_f64(),
-                original_vec == updates,
-                already_sorted,
-                original_len,
-                updates.len(),
-            );
-
-            for ((k, v), t, d) in original_vec.iter().take(25) {
-                info!(
-                    "{}: original K={:?}, V={:?}, T={:?}, D={:?}",
-                    self.shard_id,
-                    K::decode(k).expect("k"),
-                    V::decode(v).expect("v"),
-                    T::decode(*t),
-                    d
-                );
-            }
-
-            for ((k, v), t, d) in updates.iter().take(25) {
-                info!(
-                    "{}: updated K={:?}, V={:?}, T={:?}, D={:?}",
-                    self.shard_id,
-                    K::decode(k).expect("k"),
-                    V::decode(v).expect("v"),
-                    T::decode(*t),
-                    d
-                );
-            }
-        }
 
         if updates.is_empty() {
             self.key_buf.clear();
