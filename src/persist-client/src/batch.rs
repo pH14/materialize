@@ -10,6 +10,7 @@
 //! A handle to a batch of updates
 
 use std::collections::VecDeque;
+use std::env;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -325,8 +326,6 @@ where
             },
         );
 
-        info!("{}: Finishing batch", self.shard_id);
-
         Ok(batch)
     }
 
@@ -501,8 +500,10 @@ where
         let start = Instant::now();
         let original_vec = updates.clone();
         consolidate_updates(&mut updates);
-        if self.is_user_batch {
-            updates = original_vec;
+
+        let should_persist_unsorted_updates = mz_ore::env::is_var_truthy("PERSIST_UNSORTED");
+        if self.is_user_batch && should_persist_unsorted_updates {
+            updates = original_vec
         }
         self.batch_write_metrics
             .step_consolidation
