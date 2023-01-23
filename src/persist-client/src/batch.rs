@@ -9,6 +9,7 @@
 
 //! A handle to a batch of updates
 
+use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -30,6 +31,8 @@ use mz_ore::cast::CastFrom;
 use mz_persist::indexed::columnar::{ColumnarRecords, ColumnarRecordsBuilder};
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Atomicity, Blob};
+use mz_persist_types::columnar::{PartEncoder, Schema};
+use mz_persist_types::part::{Part, PartBuilder};
 use mz_persist_types::{Codec, Codec64};
 
 use crate::async_runtime::CpuHeavyRuntime;
@@ -183,11 +186,18 @@ pub enum Added {
     RecordAndParts,
 }
 
+pub(crate) enum FilledPart {
+    Row(ColumnarRecords),
+    Arrow(Part),
+}
+
 /// A builder for [Batches](Batch) that allows adding updates piece by piece and
 /// then finishing it.
 #[derive(Debug)]
 pub struct BatchBuilder<K, V, T, D>
 where
+    K: Codec,
+    V: Codec,
     T: Timestamp + Lattice + Codec64,
 {
     lower: Antichain<T>,
@@ -198,7 +208,7 @@ where
     metrics: Arc<Metrics>,
     consolidate: bool,
 
-    buffer: BatchBuffer<D>,
+    buffer: BatchBuffer<K, V, D>,
 
     max_kvt_in_run: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     runs: Vec<usize>,
@@ -209,6 +219,9 @@ where
 
     since: Antichain<T>,
     inline_upper: Antichain<T>,
+
+    k_schema: Arc<K::Schema>,
+    v_schema: Arc<V::Schema>,
 
     // These provide a bit more safety against appending a batch with the wrong
     // type to a shard.
@@ -234,6 +247,8 @@ where
         since: Antichain<T>,
         inline_upper: Option<Antichain<T>>,
         consolidate: bool,
+        k_schema: Arc<K::Schema>,
+        v_schema: Arc<V::Schema>,
     ) -> Self {
         let parts = BatchParts::new(
             cfg.batch_builder_max_outstanding_parts,
@@ -254,6 +269,8 @@ where
                 batch_write_metrics,
                 cfg.blob_target_size,
                 consolidate,
+                Arc::clone(&k_schema),
+                Arc::clone(&v_schema),
             ),
             metrics,
             consolidate,
@@ -271,6 +288,8 @@ where
             // to make a tighter bound, possibly by changing the part
             // description to be an _inclusive_ upper.
             inline_upper: inline_upper.unwrap_or_else(|| Antichain::new()),
+            k_schema,
+            v_schema,
             _phantom: PhantomData,
         }
     }
@@ -363,56 +382,68 @@ where
     /// the updates. It is the caller's responsibility to chunk `current_part` to be no greater
     /// than [crate::PersistConfig::blob_target_size], and must absolutely be less than
     /// [mz_persist::indexed::columnar::KEY_VAL_DATA_MAX_LEN]
-    async fn flush_part(&mut self, columnar: ColumnarRecords) {
-        let num_updates = columnar.len();
-        if num_updates == 0 {
-            return;
-        }
-
-        if self.consolidate {
-            // if our parts are consolidated, we can rely on their sorted order to
-            // appropriately determine runs of ordered parts
-            let ((min_part_k, min_part_v), min_part_t, _d) =
-                columnar.get(0).expect("num updates is greater than zero");
-            let ((max_part_k, max_part_v), max_part_t, _d) = columnar
-                .get(num_updates.saturating_sub(1))
-                .expect("num updates is greater than zero");
-
-            if let Some((max_run_k, max_run_v, max_run_t)) = &mut self.max_kvt_in_run {
-                // start a new run if our part contains an update that exists in the
-                // range already covered by the existing parts of the current run
-                if (min_part_k, min_part_v, min_part_t.as_slice())
-                    < (max_run_k, max_run_v, max_run_t)
-                {
-                    self.runs.push(self.parts_written);
+    async fn flush_part(&mut self, part: FilledPart) {
+        let num_updates = match &part {
+            FilledPart::Row(columnar) => {
+                let num_updates = columnar.len();
+                if num_updates == 0 {
+                    return;
                 }
 
-                // given the above check, whether or not we extended an existing run or
-                // started a new one, this part contains the greatest KVT in the run
-                max_run_k.clear();
-                max_run_v.clear();
-                max_run_t.clear();
-                max_run_k.extend_from_slice(max_part_k);
-                max_run_v.extend_from_slice(max_part_v);
-                max_run_t.extend_from_slice(&max_part_t);
-            } else {
-                self.max_kvt_in_run = Some((
-                    max_part_k.to_vec(),
-                    max_part_v.to_vec(),
-                    max_part_t.to_vec(),
-                ));
+                if self.consolidate {
+                    // if our parts are consolidated, we can rely on their sorted order to
+                    // appropriately determine runs of ordered parts
+                    let ((min_part_k, min_part_v), min_part_t, _d) =
+                        columnar.get(0).expect("num updates is greater than zero");
+                    let ((max_part_k, max_part_v), max_part_t, _d) = columnar
+                        .get(num_updates.saturating_sub(1))
+                        .expect("num updates is greater than zero");
+
+                    if let Some((max_run_k, max_run_v, max_run_t)) = &mut self.max_kvt_in_run {
+                        // start a new run if our part contains an update that exists in the
+                        // range already covered by the existing parts of the current run
+                        if (min_part_k, min_part_v, min_part_t.as_slice())
+                            < (max_run_k, max_run_v, max_run_t)
+                        {
+                            self.runs.push(self.parts_written);
+                        }
+
+                        // given the above check, whether or not we extended an existing run or
+                        // started a new one, this part contains the greatest KVT in the run
+                        max_run_k.clear();
+                        max_run_v.clear();
+                        max_run_t.clear();
+                        max_run_k.extend_from_slice(max_part_k);
+                        max_run_v.extend_from_slice(max_part_v);
+                        max_run_t.extend_from_slice(&max_part_t);
+                    } else {
+                        self.max_kvt_in_run = Some((
+                            max_part_k.to_vec(),
+                            max_part_v.to_vec(),
+                            max_part_t.to_vec(),
+                        ));
+                    }
+                } else {
+                    // if our parts are not consolidated, we simply say each part is its own run.
+                    // NB: there is an implicit run starting at index 0
+                    if self.parts_written > 0 {
+                        self.runs.push(self.parts_written);
+                    }
+                }
+
+                num_updates
             }
-        } else {
-            // if our parts are not consolidated, we simply say each part is its own run.
-            // NB: there is an implicit run starting at index 0
-            if self.parts_written > 0 {
-                self.runs.push(self.parts_written);
+            FilledPart::Arrow(part) => {
+                if part.len() == 0 {
+                    return;
+                }
+                part.len()
             }
-        }
+        };
 
         let start = Instant::now();
         self.parts
-            .write(columnar, self.inline_upper.clone(), self.since.clone())
+            .write(part, self.inline_upper.clone(), self.since.clone())
             .await;
         self.metrics
             .compaction
@@ -426,7 +457,11 @@ where
 }
 
 #[derive(Debug)]
-struct BatchBuffer<D> {
+struct BatchBuffer<K, V, D>
+where
+    K: Codec,
+    V: Codec,
+{
     metrics: Arc<Metrics>,
     batch_write_metrics: BatchWriteMetrics,
     blob_target_size: usize,
@@ -439,10 +474,18 @@ struct BatchBuffer<D> {
     current_part_total_bytes: usize,
     current_part_key_bytes: usize,
     current_part_value_bytes: usize,
+
+    part_builder: PartBuilder,
+    k_schema: Arc<K::Schema>,
+    v_schema: Arc<V::Schema>,
+
+    _phantom: PhantomData<(K, V)>,
 }
 
-impl<D> BatchBuffer<D>
+impl<K, V, D> BatchBuffer<K, V, D>
 where
+    K: Codec,
+    V: Codec,
     D: Semigroup + Codec64,
 {
     fn new(
@@ -450,6 +493,8 @@ where
         batch_write_metrics: BatchWriteMetrics,
         blob_target_size: usize,
         should_consolidate: bool,
+        k_schema: Arc<K::Schema>,
+        v_schema: Arc<V::Schema>,
     ) -> Self {
         BatchBuffer {
             metrics,
@@ -462,16 +507,33 @@ where
             current_part_total_bytes: Default::default(),
             current_part_key_bytes: Default::default(),
             current_part_value_bytes: Default::default(),
+            part_builder: PartBuilder::new::<K, K::Schema, V, V::Schema>(
+                k_schema.borrow(),
+                v_schema.borrow(),
+            ),
+            k_schema,
+            v_schema,
+            _phantom: PhantomData::default(),
         }
     }
 
-    fn push<K: Codec, V: Codec, T: Codec64>(
-        &mut self,
-        key: &K,
-        val: &V,
-        ts: &T,
-        diff: D,
-    ) -> Option<ColumnarRecords> {
+    fn push<T: Codec64>(&mut self, key: &K, val: &V, ts: &T, diff: D) -> Option<FilledPart> {
+        // WIP: need a way to avoid rebuilding encoder for each KV. right now it hits
+        // multiple mut borrows of part_builder if we try to precompute
+        self.k_schema
+            .encoder(self.part_builder.key_mut())
+            .expect("abc")
+            .encode(key);
+        self.v_schema
+            .encoder(self.part_builder.val_mut())
+            .expect("def")
+            .encode(val);
+        self.part_builder.push_ts_diff(
+            i64::decode(Codec64::encode(ts)),
+            i64::decode(D::encode(&diff)),
+        );
+
+        // WIP: wrap in a cfg feature
         let initial_key_buf_len = self.key_buf.len();
         let initial_val_buf_len = self.val_buf.len();
         self.metrics
@@ -500,7 +562,17 @@ where
         }
     }
 
-    fn drain(&mut self) -> ColumnarRecords {
+    fn drain(&mut self) -> FilledPart {
+        // WIP: wrap in a cfg feature
+        let builder = std::mem::take(&mut self.part_builder);
+        // TODO: should reset this in one call
+        self.part_builder = PartBuilder::new::<K, K::Schema, V, V::Schema>(
+            self.k_schema.borrow(),
+            self.v_schema.borrow(),
+        );
+        let finished_part = builder.finish().expect("dun");
+        return FilledPart::Arrow(finished_part);
+
         let mut updates = Vec::with_capacity(self.current_part.len());
         for ((k_range, v_range), t, d) in self.current_part.drain(..) {
             updates.push(((&self.key_buf[k_range], &self.val_buf[v_range]), t, d));
@@ -517,7 +589,7 @@ where
         if updates.is_empty() {
             self.key_buf.clear();
             self.val_buf.clear();
-            return ColumnarRecordsBuilder::default().finish();
+            return FilledPart::Row(ColumnarRecordsBuilder::default().finish());
         }
 
         let start = Instant::now();
@@ -545,7 +617,7 @@ where
         self.current_part_value_bytes = 0;
         assert_eq!(self.current_part.len(), 0);
 
-        columnar
+        FilledPart::Row(columnar)
     }
 }
 
@@ -592,7 +664,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
 
     pub(crate) async fn write(
         &mut self,
-        updates: ColumnarRecords,
+        filled_part: FilledPart,
         upper: Antichain<T>,
         since: Antichain<T>,
     ) {
@@ -609,26 +681,44 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
         let handle = mz_ore::task::spawn(
             || "batch::write_part",
             async move {
-                let goodbytes = updates.goodbytes();
-                let batch = BlobTraceBatchPart {
-                    desc,
-                    updates: vec![updates],
-                    index,
+                let start = Instant::now();
+                let buf = match filled_part {
+                    FilledPart::Row(updates) => {
+                        let goodbytes = updates.goodbytes();
+                        let batch = BlobTraceBatchPart {
+                            desc,
+                            updates: vec![updates],
+                            index,
+                        };
+                        // WIP: move to the right spot
+                        batch_metrics.goodbytes.inc_by(u64::cast_from(goodbytes));
+
+                        cpu_heavy_runtime
+                            .spawn_named(|| "batch::encode_part", async move {
+                                let mut buf = Vec::new();
+                                batch.encode(&mut buf);
+
+                                // Drop batch as soon as we can to reclaim its memory.
+                                drop(batch);
+                                Bytes::from(buf)
+                            })
+                            .instrument(debug_span!("batch::encode_part"))
+                            .await
+                            .expect("part encode task failed")
+                    }
+                    FilledPart::Arrow(part) => cpu_heavy_runtime
+                        .spawn_named(|| "batch::encode_part::arrow", async move {
+                            let mut buf = Vec::new();
+                            mz_persist_types::parquet::encode_part(&mut buf, &part)
+                                .expect("encoded into arrow");
+                            drop(part);
+                            Bytes::from(buf)
+                        })
+                        .instrument(debug_span!("batch::encode_part::arrow"))
+                        .await
+                        .expect("part encode task failed"),
                 };
 
-                let start = Instant::now();
-                let buf = cpu_heavy_runtime
-                    .spawn_named(|| "batch::encode_part", async move {
-                        let mut buf = Vec::new();
-                        batch.encode(&mut buf);
-
-                        // Drop batch as soon as we can to reclaim its memory.
-                        drop(batch);
-                        Bytes::from(buf)
-                    })
-                    .instrument(debug_span!("batch::encode_part"))
-                    .await
-                    .expect("part encode task failed");
                 // Can't use the `CodecMetrics::encode` helper because of async.
                 metrics.codecs.batch.encode_count.inc();
                 metrics
@@ -647,7 +737,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
                 .await;
                 batch_metrics.seconds.inc_by(start.elapsed().as_secs_f64());
                 batch_metrics.bytes.inc_by(u64::cast_from(payload_len));
-                batch_metrics.goodbytes.inc_by(u64::cast_from(goodbytes));
+                // batch_metrics.goodbytes.inc_by(u64::cast_from(goodbytes));
                 payload_len
             }
             .instrument(write_span),

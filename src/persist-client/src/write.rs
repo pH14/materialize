@@ -139,6 +139,9 @@ where
     explicitly_expired: bool,
 
     pub(crate) heartbeat_task: Option<JoinHandle<()>>,
+
+    pub(crate) k_schema: Arc<K::Schema>,
+    pub(crate) v_schema: Arc<V::Schema>,
 }
 
 impl<K, V, T, D> WriteHandle<K, V, T, D>
@@ -159,6 +162,8 @@ where
         writer_id: WriterId,
         upper: Antichain<T>,
         last_heartbeat: EpochMillis,
+        k_schema: Arc<K::Schema>,
+        v_schema: Arc<V::Schema>,
     ) -> Self {
         WriteHandle {
             cfg,
@@ -173,6 +178,8 @@ where
             last_heartbeat,
             explicitly_expired: false,
             heartbeat_task: Some(machine.start_writer_heartbeat_task(writer_id).await),
+            k_schema,
+            v_schema,
         }
     }
 
@@ -535,6 +542,8 @@ where
             Antichain::from_elem(T::minimum()),
             None,
             false,
+            Arc::clone(&self.k_schema),
+            Arc::clone(&self.v_schema),
         )
     }
 

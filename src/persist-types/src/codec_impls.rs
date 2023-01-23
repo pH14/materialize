@@ -623,27 +623,27 @@ impl ColumnPush<Option<String>> for MutableUtf8Array<i32> {
 
 /// A placeholder for a [Codec] impl that hasn't yet gotten a real [Schema].
 #[derive(Debug)]
-pub struct TodoSchema<T>(PhantomData<T>);
+pub struct TodoSchema<T: Send + Sync>(PhantomData<T>);
 
-impl<T> Default for TodoSchema<T> {
+impl<T: Send + Sync> Default for TodoSchema<T> {
     fn default() -> Self {
         Self(Default::default())
     }
 }
 
-impl<T> PartEncoder<'_, T> for TodoSchema<T> {
+impl<T: Send + Sync> PartEncoder<'_, T> for TodoSchema<T> {
     fn encode(&mut self, _val: &T) {
         panic!("TODO")
     }
 }
 
-impl<T> PartDecoder<'_, T> for TodoSchema<T> {
+impl<T: Send + Sync> PartDecoder<'_, T> for TodoSchema<T> {
     fn decode(&self, _idx: usize, _val: &mut T) {
         panic!("TODO")
     }
 }
 
-impl<T: Debug> Schema<T> for TodoSchema<T> {
+impl<T: Debug + Send + Sync> Schema<T> for TodoSchema<T> {
     type Encoder<'a> = Self;
     type Decoder<'a> = Self;
 

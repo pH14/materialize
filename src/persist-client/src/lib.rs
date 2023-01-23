@@ -732,8 +732,8 @@ impl PersistClient {
         &self,
         shard_id: ShardId,
         purpose: &str,
-        _key_schema: Arc<K::Schema>,
-        _val_schema: Arc<V::Schema>,
+        key_schema: Arc<K::Schema>,
+        val_schema: Arc<V::Schema>,
     ) -> Result<WriteHandle<K, V, T, D>, InvalidUsage<T>>
     where
         K: Debug + Codec,
@@ -762,6 +762,8 @@ impl PersistClient {
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.cpu_heavy_runtime),
                 writer_id.clone(),
+                Arc::clone(&key_schema),
+                Arc::clone(&val_schema),
             )
         });
         let heartbeat_ts = (self.cfg.now)();
@@ -784,6 +786,8 @@ impl PersistClient {
             writer_id,
             shard_upper.0,
             heartbeat_ts,
+            key_schema,
+            val_schema,
         )
         .await;
         Ok(writer)

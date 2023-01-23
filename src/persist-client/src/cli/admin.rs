@@ -17,14 +17,16 @@ use std::time::Instant;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bytes::Bytes;
+use prometheus::proto::{MetricFamily, MetricType};
+use tracing::{info, warn};
+
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::SYSTEM_TIME;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::{
     Atomicity, Blob, BlobMetadata, Consensus, ExternalError, SeqNo, VersionedData,
 };
-use prometheus::proto::{MetricFamily, MetricType};
-use tracing::{info, warn};
+use mz_persist_types::codec_impls::TodoSchema;
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::cli::inspect::StateArgs;
@@ -223,6 +225,8 @@ pub async fn force_compaction(
                     Arc::new(CpuHeavyRuntime::new()),
                     req,
                     writer_id.clone(),
+                    Arc::new(TodoSchema::default()),
+                    Arc::new(TodoSchema::default()),
                 )
                 .await?;
             info!(

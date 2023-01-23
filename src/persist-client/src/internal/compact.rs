@@ -24,6 +24,7 @@ use futures_util::TryFutureExt;
 use mz_ore::cast::CastFrom;
 use mz_ore::task::spawn;
 use mz_persist::location::Blob;
+use mz_persist_types::codec_impls::VecU8Schema;
 use mz_persist_types::{Codec, Codec64};
 use timely::progress::Timestamp;
 use timely::PartialOrder;
@@ -94,6 +95,8 @@ where
         metrics: Arc<Metrics>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         writer_id: WriterId,
+        k_schema: Arc<K::Schema>,
+        v_schema: Arc<V::Schema>,
     ) -> Self {
         let (compact_req_sender, mut compact_req_receiver) = mpsc::channel::<(
             Instant,
@@ -144,6 +147,8 @@ where
                 let blob = Arc::clone(&machine.state_versions.blob);
                 let cpu_heavy_runtime = Arc::clone(&cpu_heavy_runtime);
                 let writer_id = writer_id.clone();
+                let k_schema = Arc::clone(&k_schema);
+                let v_schema = Arc::clone(&v_schema);
 
                 let compact_span =
                     debug_span!(parent: None, "compact::apply", shard_id=%machine.shard_id());
@@ -157,6 +162,8 @@ where
                         req,
                         writer_id,
                         &mut machine,
+                        k_schema,
+                        v_schema,
                     )
                     .instrument(compact_span)
                     .await;
@@ -234,6 +241,8 @@ where
         req: CompactReq<T>,
         writer_id: WriterId,
         machine: &mut Machine<K, V, T, D>,
+        k_schema: Arc<K::Schema>,
+        v_schema: Arc<V::Schema>,
     ) -> Result<ApplyMergeResult, anyhow::Error> {
         metrics.compaction.started.inc();
         let start = Instant::now();
@@ -274,6 +283,8 @@ where
                         Arc::clone(&cpu_heavy_runtime),
                         req,
                         writer_id,
+                        k_schema,
+                        v_schema,
                     )
                     .instrument(compact_span),
                 )
@@ -368,6 +379,8 @@ where
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         req: CompactReq<T>,
         writer_id: WriterId,
+        k_schema: Arc<K::Schema>,
+        v_schema: Arc<V::Schema>,
     ) -> Result<CompactRes<T>, anyhow::Error> {
         let () = Self::validate_req(&req)?;
         // compaction needs memory enough for at least 2 runs and 2 in-progress parts
@@ -408,6 +421,8 @@ where
                 Arc::clone(&metrics),
                 Arc::clone(&cpu_heavy_runtime),
                 writer_id.clone(),
+                Arc::clone(&k_schema),
+                Arc::clone(&v_schema),
             )
             .await?;
             let (parts, runs, updates) = (batch.parts, batch.runs, batch.len);
@@ -570,6 +585,8 @@ where
         metrics: Arc<Metrics>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         writer_id: WriterId,
+        k_schema: Arc<K::Schema>,
+        v_schema: Arc<V::Schema>,
     ) -> Result<HollowBatch<T>, anyhow::Error> {
         // TODO: Figure out a more principled way to allocate our memory budget.
         // Currently, we give any excess budget to write parallelism. If we had
@@ -610,6 +627,9 @@ where
             desc.since().clone(),
             Some(desc.upper().clone()),
             true,
+            // TODO: thread full schemes down
+            Arc::new(VecU8Schema),
+            Arc::new(VecU8Schema),
         );
 
         start_prefetches(prefetch_budget_bytes, &mut runs, shard_id, &blob, &metrics);

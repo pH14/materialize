@@ -32,6 +32,8 @@ use crate::storage_state::StorageState;
 
 struct BatchBuilderAndCounts<K, V, T, D>
 where
+    K: mz_persist_types::Codec,
+    V: mz_persist_types::Codec,
     T: timely::progress::Timestamp
         + differential_dataflow::lattice::Lattice
         + mz_persist_types::Codec64,
@@ -45,6 +47,8 @@ where
 
 impl<K, V, T, D> BatchBuilderAndCounts<K, V, T, D>
 where
+    K: mz_persist_types::Codec,
+    V: mz_persist_types::Codec,
     T: timely::progress::Timestamp
         + differential_dataflow::lattice::Lattice
         + mz_persist_types::Codec64,

@@ -336,6 +336,10 @@ impl PartBuilder {
         self.diff.push(diff);
     }
 
+    pub fn consolidate(self) {
+        ()
+    }
+
     /// Completes construction of the [Part].
     pub fn finish(self) -> Result<Part, String> {
         let key = self
