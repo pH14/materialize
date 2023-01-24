@@ -112,6 +112,7 @@ pub(crate) mod sealed {
     use arrow2::io::parquet::write::Encoding;
 
     /// A common trait implemented by all `Data::Col` types.
+    // WIP: implement PartialOrd
     pub trait ColumnRef: Sized + Send + Sync {
         /// Returns the number of elements in this column.
         fn len(&self) -> usize;

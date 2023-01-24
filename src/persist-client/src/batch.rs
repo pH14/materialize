@@ -479,6 +479,8 @@ where
     k_schema: Arc<K::Schema>,
     v_schema: Arc<V::Schema>,
 
+    should_use_arrow: bool,
+
     _phantom: PhantomData<(K, V)>,
 }
 
@@ -496,6 +498,7 @@ where
         k_schema: Arc<K::Schema>,
         v_schema: Arc<V::Schema>,
     ) -> Self {
+        let should_use_arrow = k_schema.columns()[0].0.starts_with("arrow_");
         BatchBuffer {
             metrics,
             batch_write_metrics,
@@ -513,6 +516,7 @@ where
             ),
             k_schema,
             v_schema,
+            should_use_arrow,
             _phantom: PhantomData::default(),
         }
     }
@@ -520,18 +524,20 @@ where
     fn push<T: Codec64>(&mut self, key: &K, val: &V, ts: &T, diff: D) -> Option<FilledPart> {
         // WIP: need a way to avoid rebuilding encoder for each KV. right now it hits
         // multiple mut borrows of part_builder if we try to precompute
-        self.k_schema
-            .encoder(self.part_builder.key_mut())
-            .expect("abc")
-            .encode(key);
-        self.v_schema
-            .encoder(self.part_builder.val_mut())
-            .expect("def")
-            .encode(val);
-        self.part_builder.push_ts_diff(
-            i64::decode(Codec64::encode(ts)),
-            i64::decode(D::encode(&diff)),
-        );
+        if self.should_use_arrow {
+            self.k_schema
+                .encoder(self.part_builder.key_mut())
+                .expect("abc")
+                .encode(key);
+            self.v_schema
+                .encoder(self.part_builder.val_mut())
+                .expect("def")
+                .encode(val);
+            self.part_builder.push_ts_diff(
+                i64::decode(Codec64::encode(ts)),
+                i64::decode(D::encode(&diff)),
+            );
+        }
 
         // WIP: wrap in a cfg feature
         let initial_key_buf_len = self.key_buf.len();
@@ -564,14 +570,18 @@ where
 
     fn drain(&mut self) -> FilledPart {
         // WIP: wrap in a cfg feature
-        let builder = std::mem::take(&mut self.part_builder);
-        // TODO: should reset this in one call
-        self.part_builder = PartBuilder::new::<K, K::Schema, V, V::Schema>(
-            self.k_schema.borrow(),
-            self.v_schema.borrow(),
-        );
-        let finished_part = builder.finish().expect("dun");
-        return FilledPart::Arrow(finished_part);
+        let arrow_part = if self.should_use_arrow {
+            let builder = std::mem::take(&mut self.part_builder);
+            // TODO: should reset this in one call
+            self.part_builder = PartBuilder::new::<K, K::Schema, V, V::Schema>(
+                self.k_schema.borrow(),
+                self.v_schema.borrow(),
+            );
+            let finished_part = builder.finish().expect("dun");
+            Some(FilledPart::Arrow(finished_part))
+        } else {
+            None
+        };
 
         let mut updates = Vec::with_capacity(self.current_part.len());
         for ((k_range, v_range), t, d) in self.current_part.drain(..) {
@@ -617,7 +627,7 @@ where
         self.current_part_value_bytes = 0;
         assert_eq!(self.current_part.len(), 0);
 
-        FilledPart::Row(columnar)
+        arrow_part.unwrap_or_else(|| FilledPart::Row(columnar))
     }
 }
 

@@ -306,6 +306,8 @@ impl PartBuilder {
         PartBuilder { key, val, ts, diff }
     }
 
+    // WIP: return key / val / ts / diff as mut in one go
+
     /// Returns a [ColumnsMut] for the key columns.
     pub fn key_mut<'a>(&'a mut self) -> ColumnsMut<'a> {
         ColumnsMut {

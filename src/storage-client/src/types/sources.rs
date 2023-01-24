@@ -24,7 +24,7 @@ use differential_dataflow::lattice::Lattice;
 use globset::{Glob, GlobBuilder};
 use itertools::Itertools;
 use mz_persist_types::codec_impls::{TodoSchema, UnitSchema};
-use mz_persist_types::columnar::Schema;
+use mz_persist_types::columnar::{ColumnGet, ColumnPush, Data, Schema};
 use once_cell::sync::Lazy;
 use proptest::prelude::{any, Arbitrary, BoxedStrategy, Strategy};
 use proptest_derive::Arbitrary;
@@ -2537,27 +2537,178 @@ impl Codec for SourceData {
     }
 }
 
-impl Schema<SourceData> for RelationDesc {
-    type Encoder<'a> = TodoSchema<SourceData>;
+// WIP: Copy Schema from Row, delete from Row
 
-    type Decoder<'a> = TodoSchema<SourceData>;
+#[derive(Debug)]
+enum DatumEncoder<'a> {
+    Bool(&'a mut <bool as Data>::Mut),
+    BoolOpt(&'a mut <Option<bool> as Data>::Mut),
+    String(&'a mut <String as Data>::Mut),
+    StringOpt(&'a mut <Option<String> as Data>::Mut),
+}
+
+impl<'a> DatumEncoder<'a> {
+    fn encode(&mut self, datum: Datum) {
+        match self {
+            DatumEncoder::Bool(col) => {
+                let x = match datum {
+                    Datum::True => true,
+                    Datum::False => false,
+                    _ => panic!("Datum cannot be converted into bool: {}", datum),
+                };
+                col.push(x);
+            }
+            DatumEncoder::BoolOpt(col) => {
+                let x = match datum {
+                    Datum::True => Some(true),
+                    Datum::False => Some(false),
+                    Datum::Null => None,
+                    _ => panic!("Datum cannot be converted into Option<bool>: {}", datum),
+                };
+                col.push(x)
+            }
+            DatumEncoder::String(col) => {
+                let x = match datum {
+                    Datum::String(x) => x,
+                    _ => panic!("Datum cannot be converted into String: {}", datum),
+                };
+                ColumnPush::<String>::push(*col, x);
+            }
+            DatumEncoder::StringOpt(col) => {
+                let x = match datum {
+                    Datum::String(x) => Some(x),
+                    Datum::Null => None,
+                    _ => panic!("Datum cannot be converted into Option<String>: {}", datum),
+                };
+                ColumnPush::<Option<String>>::push(*col, x);
+            }
+        }
+    }
+}
+
+/// An implementation of [PartEncoder] for [Row].
+#[derive(Debug)]
+pub struct RowEncoder<'a>(Vec<DatumEncoder<'a>>);
+
+impl<'a> mz_persist_types::columnar::PartEncoder<'a, SourceData> for RowEncoder<'a> {
+    fn encode(&mut self, val: &SourceData) {
+        let val = val.as_ref().expect("WIP: no errors");
+        for (encoder, datum) in self.0.iter_mut().zip(val.iter()) {
+            encoder.encode(datum);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DatumDecoder<'a> {
+    Bool(&'a <bool as Data>::Col),
+    BoolOpt(&'a <Option<bool> as Data>::Col),
+    String(&'a <String as Data>::Col),
+    StringOpt(&'a <Option<String> as Data>::Col),
+}
+
+impl<'a> DatumDecoder<'a> {
+    fn decode(&self, idx: usize) -> Datum<'a> {
+        match self {
+            DatumDecoder::Bool(col) => Datum::from(col.get(idx)),
+            DatumDecoder::BoolOpt(col) => Datum::from(col.get(idx)),
+            DatumDecoder::String(col) => Datum::from(ColumnGet::<String>::get(*col, idx)),
+            DatumDecoder::StringOpt(col) => {
+                Datum::from(ColumnGet::<Option<String>>::get(*col, idx))
+            }
+        }
+    }
+}
+
+/// An implementation of [PartDecoder] for [Row].
+#[derive(Debug)]
+pub struct RowDecoder<'a>(Vec<DatumDecoder<'a>>);
+
+impl<'a> mz_persist_types::columnar::PartDecoder<'a, SourceData> for RowDecoder<'a> {
+    fn decode(&self, idx: usize, val: &mut SourceData) {
+        let mut val = val.as_mut().expect("WIP: no errors");
+        let mut packer = val.packer();
+        for decoder in self.0.iter() {
+            packer.push(decoder.decode(idx));
+        }
+    }
+}
+
+impl Schema<SourceData> for RelationDesc {
+    type Encoder<'a> = RowEncoder<'a>;
+    type Decoder<'a> = RowDecoder<'a>;
 
     fn columns(&self) -> Vec<(String, mz_persist_types::columnar::DataType)> {
-        panic!("TODO")
+        // WIP: no such thing as errors
+        self.iter()
+            .map(|(name, typ)| {
+                let data_type = mz_persist_types::columnar::DataType {
+                    optional: typ.nullable,
+                    format: mz_persist_types::columnar::ColumnFormat::from(&typ.scalar_type),
+                };
+                (name.as_str().to_owned(), data_type)
+            })
+            .collect()
     }
 
     fn decoder<'a>(
         &self,
-        _cols: mz_persist_types::part::ColumnsRef<'a>,
+        mut part: mz_persist_types::part::ColumnsRef<'a>,
     ) -> Result<Self::Decoder<'a>, String> {
-        panic!("TODO")
+        let mut decoders = Vec::new();
+        for (name, typ) in self.iter() {
+            match (typ.nullable, &typ.scalar_type) {
+                (false, ScalarType::Bool) => {
+                    decoders.push(DatumDecoder::Bool(part.col::<bool>(name.as_str())?));
+                }
+                (true, ScalarType::Bool) => {
+                    decoders.push(DatumDecoder::BoolOpt(
+                        part.col::<Option<bool>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::String) => {
+                    decoders.push(DatumDecoder::String(part.col::<String>(name.as_str())?));
+                }
+                (true, ScalarType::String) => {
+                    decoders.push(DatumDecoder::StringOpt(
+                        part.col::<Option<String>>(name.as_str())?,
+                    ));
+                }
+                _ => panic!("TODO: finish implementing all the Datum variants"),
+            };
+        }
+        let () = part.finish()?;
+        Ok(RowDecoder(decoders))
     }
 
     fn encoder<'a>(
         &self,
-        _cols: mz_persist_types::part::ColumnsMut<'a>,
+        mut part: mz_persist_types::part::ColumnsMut<'a>,
     ) -> Result<Self::Encoder<'a>, String> {
-        panic!("TODO")
+        let mut encoders = Vec::new();
+        for (name, typ) in self.iter() {
+            match (typ.nullable, &typ.scalar_type) {
+                (false, ScalarType::Bool) => {
+                    encoders.push(DatumEncoder::Bool(part.col::<bool>(name.as_str())?));
+                }
+                (true, ScalarType::Bool) => {
+                    encoders.push(DatumEncoder::BoolOpt(
+                        part.col::<Option<bool>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::String) => {
+                    encoders.push(DatumEncoder::String(part.col::<String>(name.as_str())?));
+                }
+                (true, ScalarType::String) => {
+                    encoders.push(DatumEncoder::StringOpt(
+                        part.col::<Option<String>>(name.as_str())?,
+                    ));
+                }
+                _ => panic!("TODO: finish implementing all the Datum variants"),
+            }
+        }
+        let () = part.finish()?;
+        Ok(RowEncoder(encoders))
     }
 }
 

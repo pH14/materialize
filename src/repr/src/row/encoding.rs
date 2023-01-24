@@ -20,6 +20,7 @@ use mz_persist_types::columnar::{
 use mz_persist_types::part::{ColumnsMut, ColumnsRef};
 use mz_persist_types::Codec;
 use prost::Message;
+use tracing::warn;
 use uuid::Uuid;
 
 use mz_ore::cast::CastFrom;
@@ -82,7 +83,13 @@ impl From<&ScalarType> for ColumnFormat {
             ScalarType::Float64 => ColumnFormat::F64,
             ScalarType::Bytes => ColumnFormat::Bytes,
             ScalarType::String => ColumnFormat::String,
-            _ => panic!("TODO: finish implementing all the ScalarType variants"),
+            _ => {
+                warn!(
+                    "TODO: finish implementing all the ScalarType variants: {:?}",
+                    value
+                );
+                ColumnFormat::Bool
+            }
         }
     }
 }
