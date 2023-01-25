@@ -31,7 +31,7 @@ use mz_persist_types::{Codec, Codec64};
 use mz_proto::RustType;
 use serde_json::json;
 
-use crate::fetch::EncodedPart;
+use crate::fetch::{EncodedPart, WrittenPart};
 use crate::internal::paths::{
     BlobKey, BlobKeyPrefix, PartialBatchKey, PartialBlobKey, PartialRollupKey,
 };
@@ -441,7 +441,7 @@ pub async fn blob_batch_part(
     let part = BlobTraceBatchPart::<u64>::decode(&part).expect("decodable");
     let desc = part.desc.clone();
 
-    let mut encoded_part = EncodedPart::new(&*key, part.desc.clone(), part);
+    let mut encoded_part = EncodedPart::new(&*key, part.desc.clone(), WrittenPart::Row(part));
     let mut out = BatchPartOutput {
         desc,
         updates: Vec::new(),

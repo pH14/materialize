@@ -77,8 +77,8 @@ pub fn shard_source<K, V, D, G>(
     val_schema: Arc<V::Schema>,
 ) -> (Stream<G, FetchedPart<K, V, G::Timestamp, D>>, Rc<dyn Any>)
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     D: Semigroup + Codec64 + Send + Sync,
     G: Scope,
     // TODO: Figure out how to get rid of the TotalOrder bound :(.
@@ -161,8 +161,8 @@ pub(crate) fn shard_source_descs<K, V, D, G>(
     val_schema: Arc<V::Schema>,
 ) -> (Stream<G, (usize, SerdeLeasedBatchPart)>, ShutdownButton<()>)
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     D: Semigroup + Codec64 + Send + Sync,
     G: Scope,
     // TODO: Figure out how to get rid of the TotalOrder bound :(.
@@ -425,8 +425,8 @@ pub(crate) fn shard_source_fetch<K, V, T, D, G>(
     Stream<G, SerdeLeasedBatchPart>,
 )
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
     G: Scope<Timestamp = T>,

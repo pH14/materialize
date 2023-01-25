@@ -94,8 +94,8 @@ pub struct Subscribe<K, V, T, D>
 where
     T: Timestamp + Lattice + Codec64,
     // These are only here so we can use them in the auto-expiring `Drop` impl.
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default, // WIP: Remove Default
+    V: Debug + Codec + Default, // WIP: Remove Default
     D: Semigroup + Codec64 + Send + Sync,
 {
     snapshot: Option<Vec<LeasedBatchPart<T>>>,
@@ -104,8 +104,8 @@ where
 
 impl<K, V, T, D> Subscribe<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
@@ -182,8 +182,8 @@ where
 
 impl<K, V, T, D> Drop for Subscribe<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
@@ -216,8 +216,8 @@ pub struct Listen<K, V, T, D>
 where
     T: Timestamp + Lattice + Codec64,
     // These are only here so we can use them in the auto-expiring `Drop` impl.
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     D: Semigroup + Codec64 + Send + Sync,
 {
     handle: ReadHandle<K, V, T, D>,
@@ -229,8 +229,8 @@ where
 
 impl<K, V, T, D> Listen<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
@@ -384,6 +384,8 @@ where
             Arc::clone(&self.handle.metrics),
             &self.handle.metrics.read.listen,
             Some(&self.handle.reader_id),
+            Arc::clone(&self.handle.key_schema),
+            Arc::clone(&self.handle.val_schema),
         )
         .await;
         self.handle.process_returned_leased_part(part);
@@ -471,13 +473,16 @@ where
     explicitly_expired: bool,
     leased_seqnos: BTreeMap<SeqNo, usize>,
 
+    pub(crate) key_schema: Arc<K::Schema>,
+    pub(crate) val_schema: Arc<V::Schema>,
+
     pub(crate) heartbeat_task: Option<JoinHandle<()>>,
 }
 
 impl<K, V, T, D> ReadHandle<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default, // WIP: Remove Default
+    V: Debug + Codec + Default, // WIP: Remove Default
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
@@ -490,6 +495,8 @@ where
         reader_id: LeasedReaderId,
         since: Antichain<T>,
         last_heartbeat: EpochMillis,
+        key_schema: Arc<K::Schema>,
+        val_schema: Arc<V::Schema>,
     ) -> Self {
         ReadHandle {
             cfg,
@@ -502,6 +509,8 @@ where
             last_heartbeat,
             explicitly_expired: false,
             leased_seqnos: BTreeMap::new(),
+            key_schema,
+            val_schema,
             heartbeat_task: Some(machine.start_reader_heartbeat_task(reader_id).await),
         }
     }
@@ -641,6 +650,8 @@ where
                 Arc::clone(&self.metrics),
                 &self.metrics.read.snapshot,
                 Some(&self.reader_id),
+                Arc::clone(&self.key_schema),
+                Arc::clone(&self.val_schema),
             )
             .await;
             self.process_returned_leased_part(part);
@@ -744,6 +755,8 @@ where
             new_reader_id,
             reader_state.since,
             heartbeat_ts,
+            Arc::clone(&self.key_schema),
+            Arc::clone(&self.val_schema),
         )
         .await;
         new_reader

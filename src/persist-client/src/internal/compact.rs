@@ -21,11 +21,6 @@ use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
 use futures_util::TryFutureExt;
-use mz_ore::cast::CastFrom;
-use mz_ore::task::spawn;
-use mz_persist::location::Blob;
-use mz_persist_types::codec_impls::VecU8Schema;
-use mz_persist_types::{Codec, Codec64};
 use timely::progress::Timestamp;
 use timely::PartialOrder;
 use tokio::sync::mpsc::Sender;
@@ -33,6 +28,13 @@ use tokio::sync::{mpsc, oneshot, TryAcquireError};
 use tokio::task::JoinHandle;
 use tracing::log::warn;
 use tracing::{debug, debug_span, trace, Instrument, Span};
+
+use mz_ore::cast::CastFrom;
+use mz_ore::task::spawn;
+use mz_persist::location::Blob;
+use mz_persist_types::codec_impls::VecU8Schema;
+use mz_persist_types::columnar::Schema;
+use mz_persist_types::{Codec, Codec64};
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::batch::BatchBuilder;
@@ -585,8 +587,8 @@ where
         metrics: Arc<Metrics>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         writer_id: WriterId,
-        k_schema: Arc<K::Schema>,
-        v_schema: Arc<V::Schema>,
+        key_schema: Arc<K::Schema>,
+        val_schema: Arc<V::Schema>,
     ) -> Result<HollowBatch<T>, anyhow::Error> {
         // TODO: Figure out a more principled way to allocate our memory budget.
         // Currently, we give any excess budget to write parallelism. If we had
@@ -632,7 +634,15 @@ where
             Arc::new(VecU8Schema),
         );
 
-        start_prefetches(prefetch_budget_bytes, &mut runs, shard_id, &blob, &metrics);
+        start_prefetches::<K, V, T>(
+            prefetch_budget_bytes,
+            &mut runs,
+            shard_id,
+            &blob,
+            &metrics,
+            Arc::clone(&key_schema),
+            Arc::clone(&val_schema),
+        );
 
         let all_prefetched = runs
             .iter()
@@ -646,13 +656,27 @@ where
             if let Some(part) = parts.pop_front() {
                 let start = Instant::now();
                 let mut part = part
-                    .join(shard_id, blob.as_ref(), &metrics, part_desc)
+                    .join::<K, V>(
+                        shard_id,
+                        blob.as_ref(),
+                        &metrics,
+                        part_desc,
+                        key_schema.clone(),
+                        val_schema.clone(),
+                    )
                     .await?;
                 // Ideally we'd hook into start_prefetches here, too, but runs
                 // is mutable borrowed. Not the end of the world. Instead do it
                 // once after this initial heap population.
                 timings.part_fetching += start.elapsed();
                 let start = Instant::now();
+
+                // let mut fetched_part = FetchedPart {
+                //     metrics: Arc::clone(&metrics),
+                //     ts_filter:
+                //
+                // }
+
                 while let Some((k, v, mut t, d)) = part.next() {
                     t.advance_by(desc.since().borrow());
                     let d = D::decode(d);
@@ -666,7 +690,15 @@ where
             }
         }
 
-        start_prefetches(prefetch_budget_bytes, &mut runs, shard_id, &blob, &metrics);
+        start_prefetches::<K, V, T>(
+            prefetch_budget_bytes,
+            &mut runs,
+            shard_id,
+            &blob,
+            &metrics,
+            Arc::clone(&key_schema),
+            Arc::clone(&val_schema),
+        );
 
         // repeatedly pull off the least element from our heap, refilling from the originating run
         // if needed. the heap will be exhausted only when all parts from all input runs have been
@@ -679,7 +711,14 @@ where
                 if let Some(part) = parts.pop_front() {
                     let start = Instant::now();
                     let mut part = part
-                        .join(shard_id, blob.as_ref(), &metrics, part_desc)
+                        .join::<K, V>(
+                            shard_id,
+                            blob.as_ref(),
+                            &metrics,
+                            part_desc,
+                            key_schema.clone(),
+                            val_schema.clone(),
+                        )
                         .await?;
                     // start_prefetches is O(n) so calling it here is O(n^2). N
                     // is the number of things we're about to fetch over the
@@ -687,9 +726,28 @@ where
                     // got bigger problems. It might be possible to do make this
                     // overall linear, but the bookkeeping would be pretty
                     // subtle.
-                    start_prefetches(prefetch_budget_bytes, &mut runs, shard_id, &blob, &metrics);
+                    start_prefetches::<K, V, T>(
+                        prefetch_budget_bytes,
+                        &mut runs,
+                        shard_id,
+                        &blob,
+                        &metrics,
+                        Arc::clone(&key_schema),
+                        Arc::clone(&val_schema),
+                    );
                     timings.part_fetching += start.elapsed();
                     let start = Instant::now();
+
+                    // WIP: replace direct access with FetchedPart so we can inform decoding with schemas
+                    // let x: FetchedPart<K, V, T, D> = FetchedPart::new(
+                    //     part,
+                    //     Arc::clone(&key_schema),
+                    //     Arc::clone(&val_schema),
+                    //     Arc::clone(&metrics),
+                    // );
+                    // for y in x {
+                    //
+                    // }
                     while let Some((k, v, mut t, d)) = part.next() {
                         t.advance_by(desc.since().borrow());
                         let d = D::decode(d);
@@ -828,12 +886,14 @@ impl<'a, T: Timestamp + Lattice + Codec64> CompactionPart<'a, T> {
         }
     }
 
-    async fn join(
+    async fn join<K: Codec, V: Codec>(
         self,
         shard_id: &ShardId,
         blob: &(dyn Blob + Send + Sync),
         metrics: &Metrics,
         part_desc: &Description<T>,
+        key_schema: Arc<K::Schema>,
+        val_schema: Arc<V::Schema>,
     ) -> Result<EncodedPart<T>, anyhow::Error> {
         match self {
             CompactionPart::Prefetched(_, task) => {
@@ -846,13 +906,15 @@ impl<'a, T: Timestamp + Lattice + Codec64> CompactionPart<'a, T> {
             }
             CompactionPart::Queued(part) => {
                 metrics.compaction.parts_waited.inc();
-                fetch_batch_part(
+                fetch_batch_part::<K, V, T>(
                     shard_id,
                     blob,
                     metrics,
                     &metrics.read.compaction,
                     &part.key,
                     part_desc,
+                    key_schema,
+                    val_schema,
                 )
                 .await
             }
@@ -860,12 +922,14 @@ impl<'a, T: Timestamp + Lattice + Codec64> CompactionPart<'a, T> {
     }
 }
 
-fn start_prefetches<T: Timestamp + Lattice + Codec64>(
+fn start_prefetches<K: Codec, V: Codec, T: Timestamp + Lattice + Codec64>(
     mut prefetch_budget_bytes: usize,
     runs: &mut Vec<(&Description<T>, VecDeque<CompactionPart<'_, T>>)>,
     shard_id: &ShardId,
     blob: &Arc<dyn Blob + Send + Sync>,
     metrics: &Arc<Metrics>,
+    key_schema: Arc<K::Schema>,
+    val_schema: Arc<V::Schema>,
 ) {
     // First account for how much budget has already been used
     for (_, run) in runs.iter() {
@@ -909,16 +973,20 @@ fn start_prefetches<T: Timestamp + Lattice + Codec64>(
             let metrics = Arc::clone(metrics);
             let part_key = part.key.clone();
             let part_desc = part_desc.clone();
+            let key_schema = Arc::clone(&key_schema);
+            let val_schema = Arc::clone(&val_schema);
             let handle = spawn(
                 || "persist::compaction::prefetch",
                 async move {
-                    fetch_batch_part(
+                    fetch_batch_part::<K, V, T>(
                         &shard_id,
                         blob.as_ref(),
                         &metrics,
                         &metrics.read.compaction,
                         &part_key,
                         &part_desc,
+                        key_schema,
+                        val_schema,
                     )
                     .await
                 }
@@ -931,11 +999,13 @@ fn start_prefetches<T: Timestamp + Lattice + Codec64>(
 
 #[cfg(test)]
 mod tests {
-    use crate::internal::paths::PartialBatchKey;
-    use crate::PersistLocation;
     use timely::progress::Antichain;
 
+    use mz_persist_types::codec_impls::UnitSchema;
+
+    use crate::internal::paths::PartialBatchKey;
     use crate::tests::{all_ok, expect_fetch_part, new_test_client, new_test_client_cache};
+    use crate::PersistLocation;
 
     use super::*;
 
@@ -1068,35 +1138,49 @@ mod tests {
 
         // Enough budget for none, some, and all parts of a single run
         let mut runs = parse(" 1, 1, 1");
-        start_prefetches(0, &mut runs, &shard_id, blob, metrics);
+        start_prefetches(
+            0, &mut runs, &shard_id, blob, metrics, UnitSchema, UnitSchema,
+        );
         assert_eq!(print(&runs), " 1, 1, 1");
 
         let mut runs = parse(" 1, 1, 1");
-        start_prefetches(1, &mut runs, &shard_id, blob, metrics);
+        start_prefetches(
+            1, &mut runs, &shard_id, blob, metrics, UnitSchema, UnitSchema,
+        );
         assert_eq!(print(&runs), "f1, 1, 1");
 
         let mut runs = parse(" 1, 1, 1");
-        start_prefetches(3, &mut runs, &shard_id, blob, metrics);
+        start_prefetches(
+            3, &mut runs, &shard_id, blob, metrics, UnitSchema, UnitSchema,
+        );
         assert_eq!(print(&runs), "f1,f1,f1");
 
         // Budget partially covers some part (which is then not prefetched)
         let mut runs = parse(" 1| 2| 2");
-        start_prefetches(4, &mut runs, &shard_id, blob, metrics);
+        start_prefetches(
+            4, &mut runs, &shard_id, blob, metrics, UnitSchema, UnitSchema,
+        );
         assert_eq!(print(&runs), "f1|f2| 2");
 
         // Runs of length > 1
         let mut runs = parse(" 1, 1, 1, 1| 1| 1, 1, 1");
-        start_prefetches(5, &mut runs, &shard_id, blob, metrics);
+        start_prefetches(
+            5, &mut runs, &shard_id, blob, metrics, UnitSchema, UnitSchema,
+        );
         assert_eq!(print(&runs), "f1,f1, 1, 1|f1|f1,f1, 1");
 
         // Some budget is already used from a previous call
         let mut runs = parse(" 1| 1|f1,f1");
-        start_prefetches(3, &mut runs, &shard_id, blob, metrics);
+        start_prefetches(
+            3, &mut runs, &shard_id, blob, metrics, UnitSchema, UnitSchema,
+        );
         assert_eq!(print(&runs), "f1| 1|f1,f1");
 
         // Sanity check budget has gone down (no panics)
         let mut runs = parse(" 1| 1|f9");
-        start_prefetches(1, &mut runs, &shard_id, blob, metrics);
+        start_prefetches(
+            1, &mut runs, &shard_id, blob, metrics, UnitSchema, UnitSchema,
+        );
         assert_eq!(print(&runs), " 1| 1|f9");
     }
 }

@@ -23,7 +23,7 @@ use crate::columnar::sealed::ColumnRef;
 use crate::columnar::{ColumnFormat, Data, DataType, Schema};
 
 /// A columnar representation of one blob's worth of data.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Part {
     len: usize,
     key: Vec<(String, DynColumnRef)>,
@@ -59,6 +59,16 @@ impl Part {
                 .map(|(name, col)| (name.as_str(), col))
                 .collect(),
         }
+    }
+
+    /// WIP
+    pub fn ts_ref<'a>(&'a self) -> &[i64] {
+        self.ts.as_slice()
+    }
+
+    /// WIP
+    pub fn diff_ref<'a>(&'a self) -> &[i64] {
+        self.diff.as_slice()
     }
 
     pub(crate) fn to_arrow(&self) -> (Vec<Field>, Vec<Vec<Encoding>>, Chunk<Box<dyn Array>>) {
@@ -371,7 +381,7 @@ impl PartBuilder {
 }
 
 /// Hack to make things work with `Arc<dyn Any>::downcast_ref`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DynColumnRef(DataType, Arc<dyn Any + Send + Sync>);
 
 impl DynColumnRef {

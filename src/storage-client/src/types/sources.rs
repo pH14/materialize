@@ -2481,6 +2481,13 @@ impl RustType<ProtoS3KeySource> for S3KeySource {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceData(pub Result<Row, DataflowError>);
 
+// WIP: Remove this
+impl Default for SourceData {
+    fn default() -> Self {
+        Self(Ok(Row::default()))
+    }
+}
+
 impl Deref for SourceData {
     type Target = Result<Row, DataflowError>;
 

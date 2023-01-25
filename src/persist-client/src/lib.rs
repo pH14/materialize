@@ -508,8 +508,8 @@ impl PersistClient {
         val_schema: Arc<V::Schema>,
     ) -> Result<(WriteHandle<K, V, T, D>, ReadHandle<K, V, T, D>), InvalidUsage<T>>
     where
-        K: Debug + Codec,
-        V: Debug + Codec,
+        K: Debug + Codec + Default,
+        V: Debug + Codec + Default,
         T: Timestamp + Lattice + Codec64,
         D: Semigroup + Codec64 + Send + Sync,
     {
@@ -539,12 +539,12 @@ impl PersistClient {
         &self,
         shard_id: ShardId,
         purpose: &str,
-        _key_schema: Arc<K::Schema>,
-        _val_schema: Arc<V::Schema>,
+        key_schema: Arc<K::Schema>,
+        val_schema: Arc<V::Schema>,
     ) -> Result<ReadHandle<K, V, T, D>, InvalidUsage<T>>
     where
-        K: Debug + Codec,
-        V: Debug + Codec,
+        K: Debug + Codec + Default,
+        V: Debug + Codec + Default,
         T: Timestamp + Lattice + Codec64,
         D: Semigroup + Codec64 + Send + Sync,
     {
@@ -582,6 +582,8 @@ impl PersistClient {
             reader_id,
             reader_state.since,
             heartbeat_ts,
+            key_schema,
+            val_schema,
         )
         .await;
 
@@ -597,12 +599,12 @@ impl PersistClient {
     pub async fn create_batch_fetcher<K, V, T, D>(
         &self,
         shard_id: ShardId,
-        _key_schema: Arc<K::Schema>,
-        _val_schema: Arc<V::Schema>,
+        key_schema: Arc<K::Schema>,
+        val_schema: Arc<V::Schema>,
     ) -> BatchFetcher<K, V, T, D>
     where
-        K: Debug + Codec,
-        V: Debug + Codec,
+        K: Debug + Codec + Default,
+        V: Debug + Codec + Default,
         T: Timestamp + Lattice + Codec64,
         D: Semigroup + Codec64 + Send + Sync,
     {
@@ -627,6 +629,8 @@ impl PersistClient {
             blob: Arc::clone(&self.blob),
             metrics: Arc::clone(&self.metrics),
             shard_id,
+            key_schema,
+            val_schema,
             _phantom: PhantomData,
         };
 

@@ -9,12 +9,13 @@
 
 //! Fetching batches of data from persist's backing store
 
+use std::borrow::BorrowMut;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Error};
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
@@ -22,10 +23,12 @@ use mz_ore::cast::CastFrom;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
-use tracing::{debug_span, trace_span, Instrument};
+use tracing::{debug_span, info, trace_span, Instrument};
 
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Blob, SeqNo};
+use mz_persist_types::columnar::{PartDecoder, Schema};
+use mz_persist_types::part::Part;
 use mz_persist_types::{Codec, Codec64};
 
 use crate::error::InvalidUsage;
@@ -48,6 +51,8 @@ where
     pub(crate) blob: Arc<dyn Blob + Send + Sync>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) shard_id: ShardId,
+    pub(crate) key_schema: Arc<K::Schema>,
+    pub(crate) val_schema: Arc<V::Schema>,
 
     // Ensures that `BatchFetcher` is of the same type as the `ReadHandle` it's
     // derived from.
@@ -56,8 +61,8 @@ where
 
 impl<K, V, T, D> BatchFetcher<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
@@ -66,6 +71,8 @@ where
             blob: Arc::clone(&handle.blob),
             metrics: Arc::clone(&handle.metrics),
             shard_id: handle.machine.shard_id(),
+            key_schema: Arc::clone(&handle.key_schema),
+            val_schema: Arc::clone(&handle.val_schema),
             _phantom: PhantomData,
         };
         handle.expire().await;
@@ -105,6 +112,8 @@ where
             Arc::clone(&self.metrics),
             &self.metrics.read.batch_fetcher,
             None,
+            Arc::clone(&self.key_schema),
+            Arc::clone(&self.val_schema),
         )
         .await;
         (part, Ok(fetched_part))
@@ -113,6 +122,7 @@ where
 
 #[derive(Debug, Clone)]
 enum FetchBatchFilter<T> {
+    None,
     Snapshot {
         as_of: Antichain<T>,
     },
@@ -125,6 +135,7 @@ enum FetchBatchFilter<T> {
 impl<T: Timestamp + Lattice> FetchBatchFilter<T> {
     fn filter_ts(&self, t: &mut T) -> bool {
         match self {
+            FetchBatchFilter::None => true,
             FetchBatchFilter::Snapshot { as_of } => {
                 // This time is covered by a listen
                 if as_of.less_than(t) {
@@ -165,6 +176,8 @@ pub(crate) async fn fetch_leased_part<K, V, T, D>(
     metrics: Arc<Metrics>,
     read_metrics: &ReadMetrics,
     reader_id: Option<&LeasedReaderId>,
+    key_schema: Arc<K::Schema>,
+    val_schema: Arc<V::Schema>,
 ) -> (LeasedBatchPart<T>, FetchedPart<K, V, T, D>)
 where
     K: Debug + Codec,
@@ -184,13 +197,15 @@ where
         }
     };
 
-    let encoded_part = fetch_batch_part(
+    let encoded_part = fetch_batch_part::<K, V, T>(
         &part.shard_id,
         blob,
         &metrics,
         read_metrics,
         &part.key,
         &part.desc,
+        key_schema.clone(),
+        val_schema.clone(),
     )
     .await
     .unwrap_or_else(|err| {
@@ -214,19 +229,29 @@ where
         metrics,
         ts_filter,
         part: encoded_part,
+        key_schema,
+        val_schema,
         _phantom: PhantomData,
     };
 
     (part, fetched_part)
 }
 
-pub(crate) async fn fetch_batch_part<T>(
+#[derive(Debug, Clone)]
+pub(crate) enum WrittenPart<T> {
+    Row(BlobTraceBatchPart<T>),
+    Arrow(Part),
+}
+
+pub(crate) async fn fetch_batch_part<K: Codec, V: Codec, T>(
     shard_id: &ShardId,
     blob: &(dyn Blob + Send + Sync),
     metrics: &Metrics,
     read_metrics: &ReadMetrics,
     key: &PartialBatchKey,
     registered_desc: &Description<T>,
+    key_schema: Arc<K::Schema>,
+    val_schema: Arc<V::Schema>,
 ) -> Result<EncodedPart<T>, anyhow::Error>
 where
     T: Timestamp + Lattice + Codec64,
@@ -254,26 +279,43 @@ where
     read_metrics.part_count.inc();
     read_metrics.part_bytes.inc_by(u64::cast_from(value.len()));
 
-    let part = trace_span!("fetch_batch::decode").in_scope(|| {
-        let part = metrics
+    let written_part = trace_span!("fetch_batch::decode").in_scope(|| {
+        let maybe_row_part = metrics
             .codecs
             .batch
             .decode(|| BlobTraceBatchPart::decode(&value))
-            .map_err(|err| anyhow!("couldn't decode batch at key {}: {}", key, err))
-            // We received a State that we couldn't decode. This could happen if
-            // persist messes up backward/forward compatibility, if the durable
-            // data was corrupted, or if operations messes up deployment. In any
-            // case, fail loudly.
-            .expect("internal error: invalid encoded state");
+            .map_err(|err| anyhow!("couldn't decode batch at key {}: {}", key, err));
+        // We received a State that we couldn't decode. This could happen if
+        // persist messes up backward/forward compatibility, if the durable
+        // data was corrupted, or if operations messes up deployment. In any
+        // case, fail loudly.
+        // .expect("internal error: invalid encoded state");
 
-        // Drop the encoded representation as soon as we can to reclaim memory.
-        drop(value);
-        read_metrics.part_goodbytes.inc_by(u64::cast_from(
-            part.updates.iter().map(|x| x.goodbytes()).sum::<usize>(),
-        ));
+        match maybe_row_part {
+            Ok(part) => {
+                // Drop the encoded representation as soon as we can to reclaim memory.
+                drop(value);
+                read_metrics.part_goodbytes.inc_by(u64::cast_from(
+                    part.updates.iter().map(|x| x.goodbytes()).sum::<usize>(),
+                ));
 
-        EncodedPart::new(key, registered_desc.clone(), part)
+                WrittenPart::Row(part)
+            }
+            Err(err) => {
+                let result = mz_persist_types::parquet::decode_part(
+                    &mut std::io::Cursor::new(&value),
+                    key_schema.as_ref(),
+                    val_schema.as_ref(),
+                );
+                let part = result.expect("WIP: oh noes");
+                info!("Decoded part as Arrow: {:?}", part);
+                drop(value);
+                WrittenPart::Arrow(part)
+            }
+        }
     });
+
+    let part = EncodedPart::new(key, registered_desc.clone(), written_part);
 
     read_metrics.seconds.inc_by(now.elapsed().as_secs_f64());
 
@@ -408,47 +450,58 @@ where
 
 /// A [Blob] object that has been fetched, but not yet decoded.
 #[derive(Debug)]
-pub struct FetchedPart<K, V, T, D> {
+pub struct FetchedPart<K: Codec, V: Codec, T, D> {
     metrics: Arc<Metrics>,
     ts_filter: FetchBatchFilter<T>,
     part: EncodedPart<T>,
+    key_schema: Arc<K::Schema>,
+    val_schema: Arc<V::Schema>,
 
     _phantom: PhantomData<fn() -> (K, V, D)>,
 }
 
-impl<K, V, T: Clone, D> Clone for FetchedPart<K, V, T, D> {
+impl<K: Codec, V: Codec, T, D> FetchedPart<K, V, T, D> {
+    pub(crate) fn new(
+        part: EncodedPart<T>,
+        key_schema: Arc<K::Schema>,
+        val_schema: Arc<V::Schema>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            part,
+            key_schema,
+            val_schema,
+            metrics: Arc::clone(&metrics),
+            ts_filter: FetchBatchFilter::None,
+            _phantom: PhantomData::default(),
+        }
+    }
+}
+
+impl<K: Codec, V: Codec, T: Clone, D> Clone for FetchedPart<K, V, T, D> {
     fn clone(&self) -> Self {
         Self {
             metrics: Arc::clone(&self.metrics),
             ts_filter: self.ts_filter.clone(),
             part: self.part.clone(),
+            key_schema: Arc::clone(&self.key_schema),
+            val_schema: Arc::clone(&self.val_schema),
             _phantom: self._phantom.clone(),
         }
     }
 }
 
-/// A [Blob] object that has been fetched, but has no associated decoding
-/// logic.
-#[derive(Debug, Clone)]
-pub(crate) struct EncodedPart<T> {
-    registered_desc: Description<T>,
-    part: Arc<BlobTraceBatchPart<T>>,
-
-    needs_truncation: bool,
-    part_idx: usize,
-    idx: usize,
-}
-
 impl<K, V, T, D> Iterator for FetchedPart<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Default + Codec,
+    V: Debug + Default + Codec,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
     type Item = ((Result<K, String>, Result<V, String>), T, D);
 
     fn next(&mut self) -> Option<Self::Item> {
+        // WIP: Legacy path
         while let Some((k, v, mut t, d)) = self.part.next() {
             if !self.ts_filter.filter_ts(&mut t) {
                 continue;
@@ -459,25 +512,91 @@ where
             let d = D::decode(d);
             return Some(((k, v), t, d));
         }
-        None
+
+        loop {
+            let WrittenPart::Arrow(part) = &mut self.part.part else {
+                info!("Part is not Arrow formatted: {:?}", self.part.part);
+                return None;
+            };
+            let mut k = K::default();
+            let mut v = V::default();
+
+            if self.part.idx == part.len() {
+                info!("Part idx {} part len {}", self.part.idx, part.len());
+                return None;
+            }
+
+            // WIP: account for index
+            self.key_schema
+                .decoder(part.key_ref())
+                .expect("WIP")
+                .decode(self.part.idx, &mut k);
+            self.val_schema
+                .decoder(part.val_ref())
+                .expect("WIP")
+                .decode(self.part.idx, &mut v);
+            let t = T::decode(i64::encode(part.ts_ref().get(self.part.idx).expect("WIP")));
+            let d = D::decode(i64::encode(
+                part.diff_ref().get(self.part.idx).expect("WIP"),
+            ));
+            // WIP: this is awful
+            self.part.idx += 1;
+
+            // WIP: We need truncation
+
+            // This filtering is really subtle, see the comment above for
+            // what's going on here.
+            // if self.needs_truncation {
+            //     if !self.registered_desc.lower().less_equal(&t) {
+            //         continue;
+            //     }
+            //     if self.registered_desc.upper().less_equal(&t) {
+            //         continue;
+            //     }
+            // }
+            info!(
+                "Arrow: yielding {:?} {:?} {:?} {:?} on index {} of {}",
+                k,
+                v,
+                t,
+                d,
+                self.part.idx,
+                part.len()
+            );
+
+            return Some(((Ok(k), Ok(v)), t, d));
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // We don't know in advance how restrictive the filter will be.
-        let max_len = self.part.part.updates.iter().map(|x| x.len()).sum();
-        (0, Some(max_len))
+        match &self.part.part {
+            WrittenPart::Row(part) => {
+                // We don't know in advance how restrictive the filter will be.
+                let max_len = part.updates.iter().map(|x| x.len()).sum();
+                (0, Some(max_len))
+            }
+            WrittenPart::Arrow(part) => (0, Some(part.len())),
+        }
     }
+}
+
+/// A [Blob] object that has been fetched, but has no associated decoding
+/// logic.
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedPart<T> {
+    registered_desc: Description<T>,
+    part: WrittenPart<T>,
+
+    needs_truncation: bool,
+    part_idx: usize,
+    idx: usize,
 }
 
 impl<T> EncodedPart<T>
 where
     T: Timestamp + Lattice + Codec64,
 {
-    pub(crate) fn new(
-        key: &str,
-        registered_desc: Description<T>,
-        part: BlobTraceBatchPart<T>,
-    ) -> Self {
+    pub(crate) fn new(key: &str, registered_desc: Description<T>, part: WrittenPart<T>) -> Self {
         // There are two types of batches in persist:
         // - Batches written by a persist user (either directly or indirectly
         //   via BatchBuilder). These always have a since of the minimum
@@ -489,47 +608,53 @@ where
         // - Batches written by compaction. These always have an inline desc
         //   that exactly matches the one they are registered with. The since
         //   can be anything.
-        let inline_desc = &part.desc;
-        let needs_truncation = inline_desc.lower() != registered_desc.lower()
-            || inline_desc.upper() != registered_desc.upper();
-        if needs_truncation {
-            assert!(
-                PartialOrder::less_equal(inline_desc.lower(), registered_desc.lower()),
-                "key={} inline={:?} registered={:?}",
-                key,
-                inline_desc,
-                registered_desc
-            );
-            assert!(
-                PartialOrder::less_equal(registered_desc.upper(), inline_desc.upper()),
-                "key={} inline={:?} registered={:?}",
-                key,
-                inline_desc,
-                registered_desc
-            );
-            // As mentioned above, batches that needs truncation will always have a
-            // since of the minimum timestamp. Technically we could truncate any
-            // batch where the since is less_than the output_desc's lower, but we're
-            // strict here so we don't get any surprises.
-            assert_eq!(
-                inline_desc.since(),
-                &Antichain::from_elem(T::minimum()),
-                "key={} inline={:?} registered={:?}",
-                key,
-                inline_desc,
-                registered_desc
-            );
-        } else {
-            assert_eq!(
-                inline_desc, &registered_desc,
-                "key={} inline={:?} registered={:?}",
-                key, inline_desc, registered_desc
-            );
-        }
+        let needs_truncation = match &part {
+            WrittenPart::Row(part) => {
+                let inline_desc = &part.desc;
+                let needs_truncation = inline_desc.lower() != registered_desc.lower()
+                    || inline_desc.upper() != registered_desc.upper();
+                if needs_truncation {
+                    assert!(
+                        PartialOrder::less_equal(inline_desc.lower(), registered_desc.lower()),
+                        "key={} inline={:?} registered={:?}",
+                        key,
+                        inline_desc,
+                        registered_desc
+                    );
+                    assert!(
+                        PartialOrder::less_equal(registered_desc.upper(), inline_desc.upper()),
+                        "key={} inline={:?} registered={:?}",
+                        key,
+                        inline_desc,
+                        registered_desc
+                    );
+                    // As mentioned above, batches that needs truncation will always have a
+                    // since of the minimum timestamp. Technically we could truncate any
+                    // batch where the since is less_than the output_desc's lower, but we're
+                    // strict here so we don't get any surprises.
+                    assert_eq!(
+                        inline_desc.since(),
+                        &Antichain::from_elem(T::minimum()),
+                        "key={} inline={:?} registered={:?}",
+                        key,
+                        inline_desc,
+                        registered_desc
+                    );
+                } else {
+                    assert_eq!(
+                        inline_desc, &registered_desc,
+                        "key={} inline={:?} registered={:?}",
+                        key, inline_desc, registered_desc
+                    );
+                }
+                needs_truncation
+            }
+            WrittenPart::Arrow(_) => false,
+        };
 
         EncodedPart {
             registered_desc,
-            part: Arc::new(part),
+            part,
             part_idx: 0,
             idx: 0,
             needs_truncation,
@@ -537,32 +662,37 @@ where
     }
 
     pub fn next<'a>(&'a mut self) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
-        while let Some(part) = self.part.updates.get(self.part_idx) {
-            let ((k, v), t, d) = match part.get(self.idx) {
-                Some(x) => {
-                    self.idx += 1;
-                    x
-                }
-                None => {
-                    self.part_idx += 1;
-                    self.idx = 0;
-                    continue;
-                }
-            };
+        match &mut self.part {
+            WrittenPart::Row(part) => {
+                while let Some(part) = part.updates.get(self.part_idx) {
+                    let ((k, v), t, d) = match part.get(self.idx) {
+                        Some(x) => {
+                            self.idx += 1;
+                            x
+                        }
+                        None => {
+                            self.part_idx += 1;
+                            self.idx = 0;
+                            continue;
+                        }
+                    };
 
-            let t = T::decode(t);
+                    let t = T::decode(t);
 
-            // This filtering is really subtle, see the comment above for
-            // what's going on here.
-            if self.needs_truncation {
-                if !self.registered_desc.lower().less_equal(&t) {
-                    continue;
-                }
-                if self.registered_desc.upper().less_equal(&t) {
-                    continue;
+                    // This filtering is really subtle, see the comment above for
+                    // what's going on here.
+                    if self.needs_truncation {
+                        if !self.registered_desc.lower().less_equal(&t) {
+                            continue;
+                        }
+                        if self.registered_desc.upper().less_equal(&t) {
+                            continue;
+                        }
+                    }
+                    return Some((k, v, t, d));
                 }
             }
-            return Some((k, v, t, d));
+            WrittenPart::Arrow(part) => {}
         }
         None
     }
