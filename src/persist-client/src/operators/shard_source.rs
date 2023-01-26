@@ -35,7 +35,7 @@ use timely::order::TotalOrder;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tokio::sync::{mpsc, Mutex};
-use tracing::trace;
+use tracing::{info, trace};
 
 use crate::cache::PersistClientCache;
 use crate::fetch::{FetchedPart, SerdeLeasedBatchPart};
@@ -481,9 +481,15 @@ where
                 data.swap(&mut buffer);
 
                 for (_idx, part) in buffer.drain(..) {
-                    let (token, fetched) = fetcher
-                        .fetch_leased_part(fetcher.leased_part_from_exchangeable(part))
-                        .await;
+                    let leased_batch_part = fetcher.leased_part_from_exchangeable(part);
+                    if let Some(stats) = &leased_batch_part.stats {
+                        info!(
+                            "About to fetch part with K min: {:?}, K max: {:?}",
+                            K::decode(&stats.key_min),
+                            K::decode(&stats.key_max),
+                        );
+                    }
+                    let (token, fetched) = fetcher.fetch_leased_part(leased_batch_part).await;
                     let fetched = fetched.expect("shard_id should match across all workers");
                     {
                         // Do very fine-grained output activation/session

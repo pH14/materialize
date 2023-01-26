@@ -50,11 +50,11 @@ pub fn run(args: Args) -> Result<(), anyhow::Error> {
 }
 
 /// Key of the persist shard used by [Transactor]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)] // WIP: Remove Default
 pub struct MaelstromKey(u64);
 
 /// Val of the persist shard used by [Transactor]
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)] // WIP: Remove Default
 pub struct MaelstromVal(Vec<u64>);
 
 /// An implementation of read-write transactions on top of persist

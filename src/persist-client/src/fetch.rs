@@ -35,6 +35,7 @@ use crate::error::InvalidUsage;
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{Metrics, ReadMetrics};
 use crate::internal::paths::PartialBatchKey;
+use crate::internal::state::BatchPartStats;
 use crate::read::{LeasedReaderId, ReadHandle};
 use crate::ShardId;
 
@@ -382,6 +383,8 @@ where
     /// long as necessary to ensure the `SeqNo` isn't garbage collected while a
     /// read still depends on it.
     pub(crate) leased_seqno: Option<SeqNo>,
+    /// WIP:
+    pub(crate) stats: Option<BatchPartStats>,
 }
 
 impl<T> LeasedBatchPart<T>
@@ -407,6 +410,7 @@ where
             key: self.key.clone(),
             encoded_size_bytes: self.encoded_size_bytes,
             leased_seqno: self.leased_seqno,
+            stats: self.stats.clone(),
             reader_id: self.reader_id.clone(),
         };
         // If `x` has a lease, we've effectively transferred it to `r`.
@@ -717,6 +721,7 @@ pub struct SerdeLeasedBatchPart {
     key: PartialBatchKey,
     encoded_size_bytes: usize,
     leased_seqno: Option<SeqNo>,
+    stats: Option<BatchPartStats>,
     reader_id: LeasedReaderId,
 }
 
@@ -744,6 +749,7 @@ impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
             encoded_size_bytes: x.encoded_size_bytes,
             leased_seqno: x.leased_seqno,
             reader_id: x.reader_id,
+            stats: x.stats,
         }
     }
 }

@@ -40,7 +40,7 @@ use crate::error::InvalidUsage;
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{BatchWriteMetrics, Metrics};
 use crate::internal::paths::{PartId, PartialBatchKey};
-use crate::internal::state::{HollowBatch, HollowBatchPart};
+use crate::internal::state::{BatchPartStats, HollowBatch, HollowBatchPart};
 use crate::write::WriterEnrichedHollowBatch;
 use crate::{PersistConfig, ShardId, WriterId};
 
@@ -331,22 +331,45 @@ where
 
         let remainder = self.buffer.drain();
 
+        let mut key_stats = vec![];
         match &remainder {
             FilledPart::Row(_) => {}
             FilledPart::Arrow(part) => {
+                // WIP: if we keep this fn, where should it go? seems like we probably want it
+                // to go in the encoding step so it uses the cpu heavy runtime
                 let aggregate_part = part.compute_aggregates();
                 let mut k = K::default();
+
+                let mut key_min = vec![];
                 self.k_schema
                     .decoder(aggregate_part.key_ref())
                     .expect("WIP")
                     .decode(0, &mut k);
-                info!("K of all the maxes: {:?}", k);
+                K::encode(&k, &mut key_min);
+                info!("K min: {:?}", k);
+
+                let mut key_max = vec![];
+                self.k_schema
+                    .decoder(aggregate_part.key_ref())
+                    .expect("WIP")
+                    .decode(1, &mut k);
+                K::encode(&k, &mut key_max);
+                info!("K max: {:?}", k);
+                key_stats.push(BatchPartStats {
+                    key_min,
+                    key_max,
+                    val_min: vec![],
+                    val_max: vec![],
+                });
             }
         }
 
         self.flush_part(remainder).await;
 
-        let parts = self.parts.finish().await;
+        let mut parts = self.parts.finish().await;
+        for (part, stats) in parts.iter_mut().zip(key_stats) {
+            part.stats = Some(stats);
+        }
 
         let desc = Description::new(self.lower, registered_upper, self.since);
         let batch = Batch::new(
@@ -786,6 +809,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
             self.finished_parts.push(HollowBatchPart {
                 key,
                 encoded_size_bytes,
+                stats: None,
             });
         }
     }
@@ -802,6 +826,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
             parts.push(HollowBatchPart {
                 key,
                 encoded_size_bytes,
+                stats: None,
             });
         }
         parts

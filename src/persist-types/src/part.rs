@@ -15,7 +15,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::Codec;
-use arrow2::array::{Array, BooleanArray, MutableBooleanArray, PrimitiveArray, StructArray};
+use arrow2::array::{
+    Array, BooleanArray, MutableBooleanArray, NullArray, PrimitiveArray, StructArray,
+};
 use arrow2::buffer::Buffer;
 use arrow2::chunk::Chunk;
 use arrow2::compute::sort::SortColumn;
@@ -105,12 +107,10 @@ impl Part {
         //<K, KS: Schema<K>, V, VS: Schema<V>>(
         &self,
     ) -> Part {
-        let mut maxes = vec![];
-
         let mut keys = vec![];
         let mut vals = vec![];
-        let ts = Buffer::from(vec![1]);
-        let diff = Buffer::from(vec![1]);
+        let ts = Buffer::from(vec![1, 1]);
+        let diff = Buffer::from(vec![1, 1]);
 
         // WIP: this is a horrible hack to run aggregations over Arrow types, but it's not
         // guaranteed to be 1:1 with the user type, e.g. DatumList implements Ord but can_max
@@ -118,45 +118,58 @@ impl Part {
         // to be storing large, complex values in our part metadata? What does it even mean?
         // you can't run sort aggregations over jsonb or a list type, so maybe limiting the
         // # of things we can sort on is actually OK
-        for (_name, col) in self.key.iter() {
+        for (name, col) in self.key.iter() {
             let (_encoding, data) = col.to_arrow();
             if arrow2::compute::aggregate::can_max(data.data_type()) {
-                let x = arrow2::compute::aggregate::max(data.as_ref()).expect("WIP: maxable");
+                let min = arrow2::compute::aggregate::min(data.as_ref()).expect("WIP: minable");
+                let max = arrow2::compute::aggregate::max(data.as_ref()).expect("WIP: maxable");
 
-                match x.data_type().to_physical_type() {
-                    PhysicalType::Null => {}
+                match max.data_type().to_physical_type() {
                     PhysicalType::Boolean => {
-                        let x = x
+                        let min = min
                             .as_any()
                             .downcast_ref::<BooleanScalar>()
                             .expect("WIP: abc");
-                        let mut bool_array = MutableBooleanArray::with_capacity(1);
-                        bool_array.push(x.value());
-                        let y: BooleanArray = bool_array.into();
-                        keys.push((_name.to_owned(), DynColumnRef(col.0.clone(), Arc::new(y))));
+                        let max = max
+                            .as_any()
+                            .downcast_ref::<BooleanScalar>()
+                            .expect("WIP: abc");
+                        let mut array = MutableBooleanArray::with_capacity(1);
+                        array.push(min.value());
+                        array.push(max.value());
+                        let array: BooleanArray = array.into();
+                        keys.push((
+                            name.to_owned(),
+                            DynColumnRef(col.0.clone(), Arc::new(array)),
+                        ));
                     }
-                    PhysicalType::Primitive(_) => {}
-                    PhysicalType::Binary => {}
-                    PhysicalType::FixedSizeBinary => {}
-                    PhysicalType::LargeBinary => {}
-                    PhysicalType::Utf8 => {}
-                    PhysicalType::LargeUtf8 => {}
-                    PhysicalType::List => {}
-                    PhysicalType::FixedSizeList => {}
-                    PhysicalType::LargeList => {}
-                    PhysicalType::Struct => {}
-                    PhysicalType::Union => {}
-                    PhysicalType::Map => {}
-                    PhysicalType::Dictionary(_) => {}
+                    _ => {
+                        panic!("unimplemented physical type sort");
+                    } // PhysicalType::Null => {}
+                      // PhysicalType::Primitive(_) => {}
+                      // PhysicalType::Binary => {}
+                      // PhysicalType::FixedSizeBinary => {}
+                      // PhysicalType::LargeBinary => {}
+                      // PhysicalType::Utf8 => {}
+                      // PhysicalType::LargeUtf8 => {}
+                      // PhysicalType::List => {}
+                      // PhysicalType::FixedSizeList => {}
+                      // PhysicalType::LargeList => {}
+                      // PhysicalType::Struct => {}
+                      // PhysicalType::Union => {}
+                      // PhysicalType::Map => {}
+                      // PhysicalType::Dictionary(_) => {}
                 }
-
-                maxes.push(Some(x));
             } else {
-                maxes.push(None);
+                keys.push((
+                    name.to_owned(),
+                    DynColumnRef(
+                        col.0.clone(),
+                        Arc::new(NullArray::new(data.data_type().to_owned(), 2)),
+                    ),
+                ));
             }
         }
-
-        println!("Maxes: {:?}", maxes);
 
         let mut fake_part = Part {
             len: 1,

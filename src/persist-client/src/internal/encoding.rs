@@ -28,11 +28,12 @@ use crate::critical::CriticalReaderId;
 use crate::error::CodecMismatch;
 use crate::internal::paths::{PartialBatchKey, PartialRollupKey};
 use crate::internal::state::{
-    CriticalReaderState, HandleDebugState, HollowBatch, HollowBatchPart, IdempotencyToken,
-    LeasedReaderState, OpaqueState, ProtoCriticalReaderState, ProtoHandleDebugState,
-    ProtoHollowBatch, ProtoHollowBatchPart, ProtoLeasedReaderState, ProtoStateDiff,
-    ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs, ProtoStateRollup, ProtoTrace,
-    ProtoU64Antichain, ProtoU64Description, ProtoWriterState, State, StateCollections, WriterState,
+    BatchPartStats, CriticalReaderState, HandleDebugState, HollowBatch, HollowBatchPart,
+    IdempotencyToken, LeasedReaderState, OpaqueState, ProtoCriticalReaderState,
+    ProtoHandleDebugState, ProtoHollowBatch, ProtoHollowBatchPart, ProtoHollowBatchPartStats,
+    ProtoLeasedReaderState, ProtoStateDiff, ProtoStateField, ProtoStateFieldDiffType,
+    ProtoStateFieldDiffs, ProtoStateRollup, ProtoTrace, ProtoU64Antichain, ProtoU64Description,
+    ProtoWriterState, State, StateCollections, WriterState,
 };
 use crate::internal::state_diff::{
     ProtoStateFieldDiff, StateDiff, StateFieldDiff, StateFieldValDiff,
@@ -810,6 +811,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
                 .map(|key| HollowBatchPart {
                     key: PartialBatchKey(key),
                     encoded_size_bytes: 0,
+                    stats: None,
                 }),
         );
         Ok(HollowBatch {
@@ -821,11 +823,32 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
     }
 }
 
+impl RustType<ProtoHollowBatchPartStats> for BatchPartStats {
+    fn into_proto(&self) -> ProtoHollowBatchPartStats {
+        ProtoHollowBatchPartStats {
+            min_key: self.key_min.into_proto(),
+            max_key: self.key_max.into_proto(),
+            min_val: self.val_min.into_proto(),
+            max_val: self.val_max.into_proto(),
+        }
+    }
+
+    fn from_proto(proto: ProtoHollowBatchPartStats) -> Result<Self, TryFromProtoError> {
+        Ok(BatchPartStats {
+            key_min: proto.min_key.into_rust()?,
+            key_max: proto.max_key.into_rust()?,
+            val_min: proto.min_val.into_rust()?,
+            val_max: proto.max_val.into_rust()?,
+        })
+    }
+}
+
 impl RustType<ProtoHollowBatchPart> for HollowBatchPart {
     fn into_proto(&self) -> ProtoHollowBatchPart {
         ProtoHollowBatchPart {
             key: self.key.into_proto(),
             encoded_size_bytes: self.encoded_size_bytes.into_proto(),
+            stats: self.stats.into_proto(),
         }
     }
 
@@ -833,6 +856,7 @@ impl RustType<ProtoHollowBatchPart> for HollowBatchPart {
         Ok(HollowBatchPart {
             key: proto.key.into_rust()?,
             encoded_size_bytes: proto.encoded_size_bytes.into_rust()?,
+            stats: proto.stats.into_rust()?,
         })
     }
 }

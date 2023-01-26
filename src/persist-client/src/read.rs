@@ -689,6 +689,7 @@ where
             key: part.key,
             encoded_size_bytes: part.encoded_size_bytes,
             leased_seqno: Some(self.lease_seqno()),
+            stats: part.stats,
         })
     }
 
