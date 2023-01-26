@@ -11,16 +11,20 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
-use arrow2::array::{Array, PrimitiveArray, StructArray};
+use crate::Codec;
+use arrow2::array::{Array, BooleanArray, MutableBooleanArray, PrimitiveArray, StructArray};
 use arrow2::buffer::Buffer;
 use arrow2::chunk::Chunk;
-use arrow2::datatypes::{DataType as ArrowLogicalType, Field};
+use arrow2::compute::sort::SortColumn;
+use arrow2::datatypes::{DataType as ArrowLogicalType, Field, PhysicalType};
 use arrow2::io::parquet::write::Encoding;
+use arrow2::scalar::BooleanScalar;
 
 use crate::columnar::sealed::ColumnRef;
-use crate::columnar::{ColumnFormat, Data, DataType, Schema};
+use crate::columnar::{ColumnFormat, Data, DataType, PartEncoder, Schema};
 
 /// A columnar representation of one blob's worth of data.
 #[derive(Debug, Clone, Default)]
@@ -69,6 +73,102 @@ impl Part {
     /// WIP
     pub fn diff_ref<'a>(&'a self) -> &[i64] {
         self.diff.as_slice()
+    }
+
+    /// WIP
+    pub fn consolidate(self) -> () {
+        let mut columns = vec![];
+        for (_name, col) in self.key.iter() {
+            let col = col.to_arrow().1;
+            columns.push(col);
+        }
+
+        let mut sorted_columns = vec![];
+        for boxed in columns.iter() {
+            let col = SortColumn {
+                values: boxed.deref(),
+                options: None,
+            };
+            sorted_columns.push(col);
+        }
+
+        let sorted_index = arrow2::compute::sort::lexsort_to_indices::<u64>(&sorted_columns, None)
+            .expect("sorted order");
+        let mut sorted_index_iter = sorted_index.iter();
+
+        while let Some(Some(i)) = sorted_index_iter.next() {}
+        ()
+    }
+
+    /// WIP
+    pub fn compute_aggregates(
+        //<K, KS: Schema<K>, V, VS: Schema<V>>(
+        &self,
+    ) -> Part {
+        let mut maxes = vec![];
+
+        let mut keys = vec![];
+        let mut vals = vec![];
+        let ts = Buffer::from(vec![1]);
+        let diff = Buffer::from(vec![1]);
+
+        // WIP: this is a horrible hack to run aggregations over Arrow types, but it's not
+        // guaranteed to be 1:1 with the user type, e.g. DatumList implements Ord but can_max
+        // is false for any struct or list logical Arrow type. At the same time... do we want
+        // to be storing large, complex values in our part metadata? What does it even mean?
+        // you can't run sort aggregations over jsonb or a list type, so maybe limiting the
+        // # of things we can sort on is actually OK
+        for (_name, col) in self.key.iter() {
+            let (_encoding, data) = col.to_arrow();
+            if arrow2::compute::aggregate::can_max(data.data_type()) {
+                let x = arrow2::compute::aggregate::max(data.as_ref()).expect("WIP: maxable");
+
+                match x.data_type().to_physical_type() {
+                    PhysicalType::Null => {}
+                    PhysicalType::Boolean => {
+                        let x = x
+                            .as_any()
+                            .downcast_ref::<BooleanScalar>()
+                            .expect("WIP: abc");
+                        let mut bool_array = MutableBooleanArray::with_capacity(1);
+                        bool_array.push(x.value());
+                        let y: BooleanArray = bool_array.into();
+                        keys.push((_name.to_owned(), DynColumnRef(col.0.clone(), Arc::new(y))));
+                    }
+                    PhysicalType::Primitive(_) => {}
+                    PhysicalType::Binary => {}
+                    PhysicalType::FixedSizeBinary => {}
+                    PhysicalType::LargeBinary => {}
+                    PhysicalType::Utf8 => {}
+                    PhysicalType::LargeUtf8 => {}
+                    PhysicalType::List => {}
+                    PhysicalType::FixedSizeList => {}
+                    PhysicalType::LargeList => {}
+                    PhysicalType::Struct => {}
+                    PhysicalType::Union => {}
+                    PhysicalType::Map => {}
+                    PhysicalType::Dictionary(_) => {}
+                }
+
+                maxes.push(Some(x));
+            } else {
+                maxes.push(None);
+            }
+        }
+
+        println!("Maxes: {:?}", maxes);
+
+        let mut fake_part = Part {
+            len: 1,
+            key: keys,
+            val: vals,
+            ts,
+            diff,
+        };
+
+        println!("Fake part: {:?}", fake_part);
+
+        fake_part
     }
 
     pub(crate) fn to_arrow(&self) -> (Vec<Field>, Vec<Vec<Encoding>>, Chunk<Box<dyn Array>>) {

@@ -121,8 +121,8 @@ pub struct WriteHandle<K, V, T, D>
 where
     T: Timestamp + Lattice + Codec64,
     // These are only here so we can use them in the auto-expiring `Drop` impl.
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default,
+    V: Debug + Codec + Default,
     D: Semigroup + Codec64 + Send + Sync,
 {
     pub(crate) cfg: PersistConfig,
@@ -146,8 +146,8 @@ where
 
 impl<K, V, T, D> WriteHandle<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default, // WIP: remove Default
+    V: Debug + Codec + Default, // WIP: remove Default
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
@@ -722,8 +722,8 @@ where
 impl<K, V, T, D> Drop for WriteHandle<K, V, T, D>
 where
     T: Timestamp + Lattice + Codec64,
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default, // WIP: Remove Default
+    V: Debug + Codec + Default, // WIP: Remove Default
     D: Semigroup + Codec64 + Send + Sync,
 {
     fn drop(&mut self) {

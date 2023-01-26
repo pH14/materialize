@@ -526,7 +526,6 @@ where
                 return None;
             }
 
-            // WIP: account for index
             self.key_schema
                 .decoder(part.key_ref())
                 .expect("WIP")
@@ -597,6 +596,8 @@ where
     T: Timestamp + Lattice + Codec64,
 {
     pub(crate) fn new(key: &str, registered_desc: Description<T>, part: WrittenPart<T>) -> Self {
+        // WIP: do we have a need for an inline description on Part too?
+
         // There are two types of batches in persist:
         // - Batches written by a persist user (either directly or indirectly
         //   via BatchBuilder). These always have a since of the minimum

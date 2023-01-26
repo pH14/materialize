@@ -748,6 +748,7 @@ where
                     // for y in x {
                     //
                     // }
+
                     while let Some((k, v, mut t, d)) = part.next() {
                         t.advance_by(desc.since().borrow());
                         let d = D::decode(d);

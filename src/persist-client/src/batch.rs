@@ -25,13 +25,13 @@ use differential_dataflow::trace::Description;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tokio::task::JoinHandle;
-use tracing::{debug_span, instrument, trace_span, warn, Instrument};
+use tracing::{debug_span, info, instrument, trace_span, warn, Instrument};
 
 use mz_ore::cast::CastFrom;
 use mz_persist::indexed::columnar::{ColumnarRecords, ColumnarRecordsBuilder};
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Atomicity, Blob};
-use mz_persist_types::columnar::{PartEncoder, Schema};
+use mz_persist_types::columnar::{PartDecoder, PartEncoder, Schema};
 use mz_persist_types::part::{Part, PartBuilder};
 use mz_persist_types::{Codec, Codec64};
 
@@ -230,8 +230,8 @@ where
 
 impl<K, V, T, D> BatchBuilder<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Default, // WIP: remove Default
+    V: Debug + Codec + Default,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64,
 {
@@ -330,6 +330,20 @@ where
         }
 
         let remainder = self.buffer.drain();
+
+        match &remainder {
+            FilledPart::Row(_) => {}
+            FilledPart::Arrow(part) => {
+                let aggregate_part = part.compute_aggregates();
+                let mut k = K::default();
+                self.k_schema
+                    .decoder(aggregate_part.key_ref())
+                    .expect("WIP")
+                    .decode(0, &mut k);
+                info!("K of all the maxes: {:?}", k);
+            }
+        }
+
         self.flush_part(remainder).await;
 
         let parts = self.parts.finish().await;
@@ -578,6 +592,7 @@ where
                 self.v_schema.borrow(),
             );
             let finished_part = builder.finish().expect("dun");
+
             Some(FilledPart::Arrow(finished_part))
         } else {
             None

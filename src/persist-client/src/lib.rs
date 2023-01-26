@@ -740,8 +740,8 @@ impl PersistClient {
         val_schema: Arc<V::Schema>,
     ) -> Result<WriteHandle<K, V, T, D>, InvalidUsage<T>>
     where
-        K: Debug + Codec,
-        V: Debug + Codec,
+        K: Debug + Codec + Default,
+        V: Debug + Codec + Default,
         T: Timestamp + Lattice + Codec64,
         D: Semigroup + Codec64 + Send + Sync,
     {
