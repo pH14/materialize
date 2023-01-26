@@ -16,14 +16,15 @@ use std::sync::Arc;
 
 use crate::Codec;
 use arrow2::array::{
-    Array, BooleanArray, MutableBooleanArray, NullArray, PrimitiveArray, StructArray,
+    Array, BooleanArray, MutableBooleanArray, MutableUtf8Array, NullArray, PrimitiveArray,
+    StructArray, Utf8Array,
 };
 use arrow2::buffer::Buffer;
 use arrow2::chunk::Chunk;
 use arrow2::compute::sort::SortColumn;
 use arrow2::datatypes::{DataType as ArrowLogicalType, Field, PhysicalType};
 use arrow2::io::parquet::write::Encoding;
-use arrow2::scalar::BooleanScalar;
+use arrow2::scalar::{BooleanScalar, Utf8Scalar};
 
 use crate::columnar::sealed::ColumnRef;
 use crate::columnar::{ColumnFormat, Data, DataType, PartEncoder, Schema};
@@ -134,10 +135,29 @@ impl Part {
                             .as_any()
                             .downcast_ref::<BooleanScalar>()
                             .expect("WIP: abc");
-                        let mut array = MutableBooleanArray::with_capacity(1);
+                        let mut array = MutableBooleanArray::with_capacity(2);
                         array.push(min.value());
                         array.push(max.value());
                         let array: BooleanArray = array.into();
+                        keys.push((
+                            name.to_owned(),
+                            DynColumnRef(col.0.clone(), Arc::new(array)),
+                        ));
+                    }
+                    PhysicalType::Utf8 | PhysicalType::LargeUtf8 => {
+                        let min = min
+                            .as_any()
+                            .downcast_ref::<Utf8Scalar<i32>>()
+                            .expect("WIP: abc");
+                        let max = max
+                            .as_any()
+                            .downcast_ref::<Utf8Scalar<i32>>()
+                            .expect("WIP: abc");
+
+                        let mut array = MutableUtf8Array::with_capacity(2);
+                        array.push(min.value());
+                        array.push(max.value());
+                        let array: Utf8Array<i32> = array.into();
                         keys.push((
                             name.to_owned(),
                             DynColumnRef(col.0.clone(), Arc::new(array)),
