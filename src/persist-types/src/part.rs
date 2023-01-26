@@ -10,24 +10,20 @@
 //! A columnar representation of one blob's worth of data
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::ops::Deref;
+use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::Codec;
-use arrow2::array::{
-    Array, BooleanArray, MutableBooleanArray, MutableUtf8Array, NullArray, PrimitiveArray,
-    StructArray, Utf8Array,
-};
+use arrow2::array::{Array, PrimitiveArray, StructArray};
 use arrow2::buffer::Buffer;
 use arrow2::chunk::Chunk;
-use arrow2::compute::sort::SortColumn;
-use arrow2::datatypes::{DataType as ArrowLogicalType, Field, PhysicalType};
+use arrow2::datatypes::{DataType as ArrowLogicalType, Field};
 use arrow2::io::parquet::write::Encoding;
-use arrow2::scalar::{BooleanScalar, Utf8Scalar};
 
 use crate::columnar::sealed::ColumnRef;
-use crate::columnar::{ColumnFormat, Data, DataType, PartEncoder, Schema};
+use crate::columnar::{ColumnFormat, ColumnGet, ColumnPush, Data, DataType, Schema};
+use crate::ord::{ColOrd, ColsOrd, ColsOrdKey};
 
 /// A columnar representation of one blob's worth of data.
 #[derive(Debug, Clone, Default)]
@@ -66,142 +62,6 @@ impl Part {
                 .map(|(name, col)| (name.as_str(), col))
                 .collect(),
         }
-    }
-
-    /// WIP
-    pub fn ts_ref<'a>(&'a self) -> &[i64] {
-        self.ts.as_slice()
-    }
-
-    /// WIP
-    pub fn diff_ref<'a>(&'a self) -> &[i64] {
-        self.diff.as_slice()
-    }
-
-    /// WIP
-    pub fn consolidate(self) -> () {
-        let mut columns = vec![];
-        for (_name, col) in self.key.iter() {
-            let col = col.to_arrow().1;
-            columns.push(col);
-        }
-
-        let mut sorted_columns = vec![];
-        for boxed in columns.iter() {
-            let col = SortColumn {
-                values: boxed.deref(),
-                options: None,
-            };
-            sorted_columns.push(col);
-        }
-
-        let sorted_index = arrow2::compute::sort::lexsort_to_indices::<u64>(&sorted_columns, None)
-            .expect("sorted order");
-        let mut sorted_index_iter = sorted_index.iter();
-
-        while let Some(Some(i)) = sorted_index_iter.next() {}
-        ()
-    }
-
-    /// WIP
-    pub fn compute_aggregates(
-        //<K, KS: Schema<K>, V, VS: Schema<V>>(
-        &self,
-    ) -> Part {
-        let mut keys = vec![];
-        let mut vals = vec![];
-        let ts = Buffer::from(vec![1, 1]);
-        let diff = Buffer::from(vec![1, 1]);
-
-        // WIP: this is a horrible hack to run aggregations over Arrow types, but it's not
-        // guaranteed to be 1:1 with the user type, e.g. DatumList implements Ord but can_max
-        // is false for any struct or list logical Arrow type. At the same time... do we want
-        // to be storing large, complex values in our part metadata? What does it even mean?
-        // you can't run sort aggregations over jsonb or a list type, so maybe limiting the
-        // # of things we can sort on is actually OK
-        for (name, col) in self.key.iter() {
-            let (_encoding, data) = col.to_arrow();
-            if arrow2::compute::aggregate::can_max(data.data_type()) {
-                let min = arrow2::compute::aggregate::min(data.as_ref()).expect("WIP: minable");
-                let max = arrow2::compute::aggregate::max(data.as_ref()).expect("WIP: maxable");
-
-                match max.data_type().to_physical_type() {
-                    PhysicalType::Boolean => {
-                        let min = min
-                            .as_any()
-                            .downcast_ref::<BooleanScalar>()
-                            .expect("WIP: abc");
-                        let max = max
-                            .as_any()
-                            .downcast_ref::<BooleanScalar>()
-                            .expect("WIP: abc");
-                        let mut array = MutableBooleanArray::with_capacity(2);
-                        array.push(min.value());
-                        array.push(max.value());
-                        let array: BooleanArray = array.into();
-                        keys.push((
-                            name.to_owned(),
-                            DynColumnRef(col.0.clone(), Arc::new(array)),
-                        ));
-                    }
-                    PhysicalType::Utf8 | PhysicalType::LargeUtf8 => {
-                        let min = min
-                            .as_any()
-                            .downcast_ref::<Utf8Scalar<i32>>()
-                            .expect("WIP: abc");
-                        let max = max
-                            .as_any()
-                            .downcast_ref::<Utf8Scalar<i32>>()
-                            .expect("WIP: abc");
-
-                        let mut array = MutableUtf8Array::with_capacity(2);
-                        array.push(min.value());
-                        array.push(max.value());
-                        let array: Utf8Array<i32> = array.into();
-                        keys.push((
-                            name.to_owned(),
-                            DynColumnRef(col.0.clone(), Arc::new(array)),
-                        ));
-                    }
-                    _ => {
-                        panic!("unimplemented physical type sort");
-                    } // PhysicalType::Null => {}
-                      // PhysicalType::Primitive(_) => {}
-                      // PhysicalType::Binary => {}
-                      // PhysicalType::FixedSizeBinary => {}
-                      // PhysicalType::LargeBinary => {}
-                      // PhysicalType::Utf8 => {}
-                      // PhysicalType::LargeUtf8 => {}
-                      // PhysicalType::List => {}
-                      // PhysicalType::FixedSizeList => {}
-                      // PhysicalType::LargeList => {}
-                      // PhysicalType::Struct => {}
-                      // PhysicalType::Union => {}
-                      // PhysicalType::Map => {}
-                      // PhysicalType::Dictionary(_) => {}
-                }
-            } else {
-                keys.push((
-                    name.to_owned(),
-                    DynColumnRef(
-                        col.0.clone(),
-                        Arc::new(NullArray::new(data.data_type().to_owned(), 2)),
-                    ),
-                ));
-            }
-        }
-
-        let mut fake_part = Part {
-            len: 1,
-            key: keys,
-            val: vals,
-            ts,
-            diff,
-        };
-
-        println!("Fake part: {:?}", fake_part);
-
-        fake_part
     }
 
     pub(crate) fn to_arrow(&self) -> (Vec<Field>, Vec<Vec<Encoding>>, Chunk<Box<dyn Array>>) {
@@ -382,6 +242,96 @@ impl Part {
         Ok(part)
     }
 
+    /// Returns a sorted and consolidated copy of this Part.
+    ///
+    /// This is a full deep clone of the data. Sort ordering is `(K, V, T, D)`
+    /// where each column is ordered according to the parquet ordering
+    /// semantics.
+    pub fn consolidate(&self) -> Self {
+        let key_cols = self
+            .key
+            .iter()
+            .map(|(_, x)| x.to_col_ord())
+            .collect::<Vec<_>>();
+        let key_cols = ColsOrd::new(&key_cols);
+        let val_cols = self
+            .val
+            .iter()
+            .map(|(_, x)| x.to_col_ord())
+            .collect::<Vec<_>>();
+        let val_cols = ColsOrd::new(&val_cols);
+        let ts_col = [ColOrd::I64(&self.ts)];
+        let ts_col = ColsOrd::new(&ts_col);
+        let mut indexes = (0..self.len())
+            .map(|idx| (key_cols.key(idx), val_cols.key(idx), ts_col.key(idx)))
+            .collect::<Vec<_>>();
+        indexes.sort();
+        eprintln!(
+            "{:?}",
+            indexes
+                .iter()
+                .map(|(k, v, t)| (k.idx, v.idx, t.idx))
+                .collect::<Vec<_>>()
+        );
+        // WIP this probably wants to be a new method
+        let mut sorted = {
+            let key = self
+                .key
+                .iter()
+                .map(|(name, col)| (name.to_owned(), DynColumnMut::new_untyped(&col.0)))
+                .collect();
+            let val = self
+                .val
+                .iter()
+                .map(|(name, col)| (name.to_owned(), DynColumnMut::new_untyped(&col.0)))
+                .collect();
+            let ts = Vec::new();
+            let diff = Vec::new();
+            PartBuilder { key, val, ts, diff }
+        };
+        let mut prev: Option<((ColsOrdKey, ColsOrdKey, ColsOrdKey), i64)> = None;
+        for current in indexes {
+            if let Some((prev_key, prev_diff)) = prev.as_ref() {
+                if prev_key != &current {
+                    // WIP figure out how to have just one idx: usize
+                    let prev_idx = prev_key.0.idx;
+                    assert_eq!(prev_idx, prev_key.1.idx);
+                    assert_eq!(prev_idx, prev_key.2.idx);
+                    for ((_, src), (_, dst)) in self.key.iter().zip(sorted.key.iter_mut()) {
+                        dst.push_from(src, prev_idx).expect("WIP");
+                    }
+                    for ((_, src), (_, dst)) in self.val.iter().zip(sorted.val.iter_mut()) {
+                        dst.push_from(src, prev_idx).expect("WIP");
+                    }
+                    sorted.ts.push(self.ts[prev_idx]);
+                    sorted.diff.push(*prev_diff);
+                    let _ = prev.take();
+                }
+            }
+            let current_diff = self.diff[current.2.idx];
+            if let Some((_, diff)) = prev.as_mut() {
+                *diff = *diff + current_diff;
+            } else {
+                prev = Some((current, current_diff));
+            }
+        }
+        if let Some((prev_key, prev_diff)) = prev.as_ref() {
+            // WIP figure out how to have just one idx: usize
+            let prev_idx = prev_key.0.idx;
+            assert_eq!(prev_idx, prev_key.1.idx);
+            assert_eq!(prev_idx, prev_key.2.idx);
+            for ((_, src), (_, dst)) in self.key.iter().zip(sorted.key.iter_mut()) {
+                dst.push_from(src, prev_idx).expect("WIP");
+            }
+            for ((_, src), (_, dst)) in self.val.iter().zip(sorted.val.iter_mut()) {
+                dst.push_from(src, prev_idx).expect("WIP");
+            }
+            sorted.ts.push(self.ts[prev_idx]);
+            sorted.diff.push(*prev_diff);
+        }
+        sorted.finish().expect("WIP")
+    }
+
     fn validate(&self) -> Result<(), String> {
         for (name, col) in self.key.iter() {
             if self.len != col.len() {
@@ -422,6 +372,33 @@ impl Part {
     }
 }
 
+// WIP I couldn't figure out how to reuse the Formatter helpers here, so this
+// doesn't e.g. respect the pretty flag
+impl Debug for Part {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[")?;
+        for idx in 0..self.len() {
+            if idx > 0 {
+                f.write_str(",")?;
+            }
+            f.write_str("((")?;
+            for (_, col) in self.key.iter() {
+                col.fmt_debug(idx, f)?;
+            }
+            f.write_str("),(")?;
+            for (_, col) in self.val.iter() {
+                col.fmt_debug(idx, f)?;
+            }
+            f.write_str("),")?;
+            Debug::fmt(&self.ts[idx], f)?;
+            f.write_str(",")?;
+            Debug::fmt(&self.diff[idx], f)?;
+            f.write_str(")")?;
+        }
+        f.write_str("]")
+    }
+}
+
 /// An in-progress columnar constructor for one blob's worth of data.
 #[derive(Debug, Default)]
 pub struct PartBuilder {
@@ -448,8 +425,6 @@ impl PartBuilder {
         let diff = Vec::new();
         PartBuilder { key, val, ts, diff }
     }
-
-    // WIP: return key / val / ts / diff as mut in one go
 
     /// Returns a [ColumnsMut] for the key columns.
     pub fn key_mut<'a>(&'a mut self) -> ColumnsMut<'a> {
@@ -479,10 +454,6 @@ impl PartBuilder {
     pub fn push_ts_diff(&mut self, ts: i64, diff: i64) {
         self.ts.push(ts);
         self.diff.push(diff);
-    }
-
-    pub fn consolidate(self) {
-        ()
     }
 
     /// Completes construction of the [Part].
@@ -530,16 +501,39 @@ impl DynColumnRef {
         Ok(col)
     }
 
+    fn expect_downcast<T: Data>(&self) -> &T::Col {
+        self.1
+            .downcast_ref::<T::Col>()
+            .expect("DynColumnRef DataType should have internally consistent")
+    }
+
     pub fn len(&self) -> usize {
         struct LenDataFn<'a>(&'a DynColumnRef);
-        impl DataFn<Result<usize, String>> for LenDataFn<'_> {
-            fn call<T: Data>(self) -> Result<usize, String> {
-                self.0.downcast::<T>().map(|x| x.len())
+        impl DataFn<usize> for LenDataFn<'_> {
+            fn call<T: Data>(self) -> usize {
+                self.0.expect_downcast::<T>().len()
             }
         }
-        self.0
-            .data_fn(LenDataFn(self))
-            .expect("DynColumnRef DataType should have internally consistent")
+        self.0.data_fn(LenDataFn(self))
+    }
+
+    fn to_col_ord<'a>(&'a self) -> ColOrd<'a> {
+        match (self.0.optional, self.0.format) {
+            (false, ColumnFormat::I64) => ColOrd::I64(self.expect_downcast::<i64>()),
+            (false, ColumnFormat::String) => ColOrd::String(self.expect_downcast::<String>()),
+            _ => panic!("WIP"),
+        }
+    }
+
+    fn fmt_debug(&self, idx: usize, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct FmtDebugDataFn<'a, 'b, 'c>(&'a DynColumnRef, usize, &'b mut std::fmt::Formatter<'c>);
+        impl DataFn<std::fmt::Result> for FmtDebugDataFn<'_, '_, '_> {
+            fn call<T: Data>(self) -> std::fmt::Result {
+                let FmtDebugDataFn(col, idx, fmt) = self;
+                Debug::fmt(&col.expect_downcast::<T>().get(idx), fmt)
+            }
+        }
+        self.0.data_fn(FmtDebugDataFn(self, idx, fmt))
     }
 
     #[allow(clippy::borrowed_box)]
@@ -560,14 +554,12 @@ impl DynColumnRef {
 
     pub(crate) fn to_arrow(&self) -> (Encoding, Box<dyn Array>) {
         struct ToArrowDataFn<'a>(&'a DynColumnRef);
-        impl DataFn<Result<(Encoding, Box<dyn Array>), String>> for ToArrowDataFn<'_> {
-            fn call<T: Data>(self) -> Result<(Encoding, Box<dyn Array>), String> {
-                Ok(self.0.downcast::<T>()?.to_arrow())
+        impl DataFn<(Encoding, Box<dyn Array>)> for ToArrowDataFn<'_> {
+            fn call<T: Data>(self) -> (Encoding, Box<dyn Array>) {
+                self.0.expect_downcast::<T>().to_arrow()
             }
         }
-        self.0
-            .data_fn(ToArrowDataFn(self))
-            .expect("DynColumnRef DataType should have internally consistent")
+        self.0.data_fn(ToArrowDataFn(self))
     }
 }
 
@@ -623,6 +615,21 @@ impl DynColumnMut {
         assert_eq!(typ, col.0);
         col
     }
+
+    fn push_from(&mut self, src: &DynColumnRef, idx: usize) -> Result<(), String> {
+        let typ = self.0.clone();
+        struct PushFromDataFn<'a>(&'a mut DynColumnMut, &'a DynColumnRef, usize);
+        impl<'a> DataFn<Result<(), String>> for PushFromDataFn<'a> {
+            fn call<T: Data>(self) -> Result<(), String> {
+                let PushFromDataFn(dst, src, idx) = self;
+                let dst = dst.downcast::<T>()?;
+                let src = src.downcast::<T>()?;
+                dst.push(src.get(idx));
+                Ok(())
+            }
+        }
+        typ.data_fn(PushFromDataFn(self, src, idx))
+    }
 }
 
 /// A set of shared references to named columns.
@@ -632,7 +639,7 @@ impl DynColumnMut {
 /// called to verify that all columns have been accounted for.
 #[derive(Debug)]
 pub struct ColumnsRef<'a> {
-    cols: HashMap<&'a str, &'a DynColumnRef>,
+    cols: BTreeMap<&'a str, &'a DynColumnRef>,
 }
 
 impl<'a> ColumnsRef<'a> {
@@ -663,7 +670,7 @@ impl<'a> ColumnsRef<'a> {
 /// called to verify that all columns have been accounted for.
 #[derive(Debug)]
 pub struct ColumnsMut<'a> {
-    cols: HashMap<&'a str, &'a mut DynColumnMut>,
+    cols: BTreeMap<&'a str, &'a mut DynColumnMut>,
 }
 
 impl<'a> ColumnsMut<'a> {
@@ -728,6 +735,9 @@ impl DataType {
 mod tests {
     use std::marker::PhantomData;
 
+    use crate::codec_impls::{StringSchema, UnitSchema};
+    use crate::columnar::PartEncoder;
+
     use super::*;
 
     // Make sure that the API structs are Sync + Send, so that they can be used in async tasks.
@@ -740,5 +750,30 @@ mod tests {
 
         assert!(is_send_sync::<Part>(PhantomData));
         assert!(is_send_sync::<PartBuilder>(PhantomData));
+    }
+
+    #[test]
+    fn part_consolidate() {
+        let mut part = PartBuilder::new(&StringSchema, &UnitSchema);
+        {
+            let mut keys = StringSchema.encoder(part.key_mut()).unwrap();
+            keys.encode(&format!("foo"));
+            keys.encode(&format!("foo"));
+            keys.encode(&format!("foo"));
+            keys.encode(&format!("bar"));
+            keys.encode(&format!("foo"));
+            keys.encode(&format!("baz"));
+            keys.encode(&format!("foo"));
+        }
+        part.push_ts_diff(3, 1);
+        part.push_ts_diff(1, 1);
+        part.push_ts_diff(2, 1);
+        part.push_ts_diff(1, 1);
+        part.push_ts_diff(1, 1);
+        part.push_ts_diff(1, 1);
+        part.push_ts_diff(1, 1);
+        let part = part.finish().unwrap();
+        let consolidated = part.consolidate();
+        eprintln!("{:?}", consolidated);
     }
 }
