@@ -123,6 +123,7 @@ where
         chosen_worker,
         Arc::clone(&key_schema),
         Arc::clone(&val_schema),
+        Box::new(|(_kmin, _vmin), (_kmax, _vmax)| true),
     );
     let (parts, tokens) = shard_source_fetch(
         &descs, name, clients, location, shard_id, key_schema, val_schema,
@@ -159,6 +160,7 @@ pub(crate) fn shard_source_descs<K, V, D, G>(
     chosen_worker: usize,
     key_schema: Arc<K::Schema>,
     val_schema: Arc<V::Schema>,
+    filter: Box<dyn Fn((&K, &V), (&K, &V)) -> bool>,
 ) -> (Stream<G, (usize, SerdeLeasedBatchPart)>, ShutdownButton<()>)
 where
     K: Debug + Codec + Default,
@@ -238,6 +240,30 @@ where
                     // stop afterwards.
                     if PartialOrder::less_equal(&until, progress) {
                         done = true;
+                    }
+                }
+
+                if let ListenEvent::Updates(ref parts) = event {
+                    for part in parts {
+                        if let Some(stats) = &part.stats {
+                            let key_min = K::decode(&stats.key_min).expect("WIP");
+                            let key_max = K::decode(&stats.key_max).expect("WIP");
+                            let val_min = V::default();
+                            let val_max = V::default();
+
+                            let passes_filter =
+                                (filter)((&key_min, &val_min), (&key_max, &val_max));
+
+                            info!(
+                                "May fetch part with K min: {:?}, K max: {:?}, V min: {:?}, V max: {:?}. Passes filter: {}",
+                                key_min, key_max, val_min, val_max,
+                                passes_filter,
+                            );
+
+                            if !passes_filter {
+                                continue;
+                            }
+                        }
                     }
                 }
                 yield event;
@@ -482,13 +508,6 @@ where
 
                 for (_idx, part) in buffer.drain(..) {
                     let leased_batch_part = fetcher.leased_part_from_exchangeable(part);
-                    if let Some(stats) = &leased_batch_part.stats {
-                        info!(
-                            "About to fetch part with K min: {:?}, K max: {:?}",
-                            K::decode(&stats.key_min),
-                            K::decode(&stats.key_max),
-                        );
-                    }
                     let (token, fetched) = fetcher.fetch_leased_part(leased_batch_part).await;
                     let fetched = fetched.expect("shard_id should match across all workers");
                     {
