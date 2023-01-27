@@ -11,7 +11,6 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -26,7 +25,7 @@ use crate::columnar::{ColumnFormat, ColumnGet, ColumnPush, Data, DataType, Schem
 use crate::ord::{ColOrd, ColsOrd, ColsOrdKey};
 
 /// A columnar representation of one blob's worth of data.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct Part {
     len: usize,
     key: Vec<(String, DynColumnRef)>,
@@ -62,6 +61,16 @@ impl Part {
                 .map(|(name, col)| (name.as_str(), col))
                 .collect(),
         }
+    }
+
+    /// Returns a slice to the timestamp column.
+    pub fn ts_ref<'a>(&'a self) -> &[i64] {
+        self.ts.as_slice()
+    }
+
+    /// Returns a slice to the diff column.
+    pub fn diff_ref<'a>(&'a self) -> &[i64] {
+        self.diff.as_slice()
     }
 
     pub(crate) fn to_arrow(&self) -> (Vec<Field>, Vec<Vec<Encoding>>, Chunk<Box<dyn Array>>) {
@@ -247,7 +256,7 @@ impl Part {
     /// This is a full deep clone of the data. Sort ordering is `(K, V, T, D)`
     /// where each column is ordered according to the parquet ordering
     /// semantics.
-    pub fn consolidate(&self) -> Self {
+    pub fn consolidate(&self) -> Result<Self, String> {
         let key_cols = self
             .key
             .iter()
@@ -273,38 +282,26 @@ impl Part {
                 .map(|(k, v, t)| (k.idx, v.idx, t.idx))
                 .collect::<Vec<_>>()
         );
-        // WIP this probably wants to be a new method
-        let mut sorted = {
-            let key = self
-                .key
-                .iter()
-                .map(|(name, col)| (name.to_owned(), DynColumnMut::new_untyped(&col.0)))
-                .collect();
-            let val = self
-                .val
-                .iter()
-                .map(|(name, col)| (name.to_owned(), DynColumnMut::new_untyped(&col.0)))
-                .collect();
-            let ts = Vec::new();
-            let diff = Vec::new();
-            PartBuilder { key, val, ts, diff }
-        };
+        let mut sorted = PartBuilder::new_from_part(self);
         let mut prev: Option<((ColsOrdKey, ColsOrdKey, ColsOrdKey), i64)> = None;
         for current in indexes {
             if let Some((prev_key, prev_diff)) = prev.as_ref() {
                 if prev_key != &current {
-                    // WIP figure out how to have just one idx: usize
                     let prev_idx = prev_key.0.idx;
                     assert_eq!(prev_idx, prev_key.1.idx);
                     assert_eq!(prev_idx, prev_key.2.idx);
-                    for ((_, src), (_, dst)) in self.key.iter().zip(sorted.key.iter_mut()) {
-                        dst.push_from(src, prev_idx).expect("WIP");
+
+                    if *prev_diff != 0 {
+                        for ((_, src), (_, dst)) in self.key.iter().zip(sorted.key.iter_mut()) {
+                            dst.push_from(src, prev_idx)?;
+                        }
+                        for ((_, src), (_, dst)) in self.val.iter().zip(sorted.val.iter_mut()) {
+                            dst.push_from(src, prev_idx)?;
+                        }
+                        sorted.ts.push(self.ts[prev_idx]);
+                        sorted.diff.push(*prev_diff);
                     }
-                    for ((_, src), (_, dst)) in self.val.iter().zip(sorted.val.iter_mut()) {
-                        dst.push_from(src, prev_idx).expect("WIP");
-                    }
-                    sorted.ts.push(self.ts[prev_idx]);
-                    sorted.diff.push(*prev_diff);
+
                     let _ = prev.take();
                 }
             }
@@ -316,20 +313,21 @@ impl Part {
             }
         }
         if let Some((prev_key, prev_diff)) = prev.as_ref() {
-            // WIP figure out how to have just one idx: usize
             let prev_idx = prev_key.0.idx;
             assert_eq!(prev_idx, prev_key.1.idx);
             assert_eq!(prev_idx, prev_key.2.idx);
-            for ((_, src), (_, dst)) in self.key.iter().zip(sorted.key.iter_mut()) {
-                dst.push_from(src, prev_idx).expect("WIP");
+            if *prev_diff != 0 {
+                for ((_, src), (_, dst)) in self.key.iter().zip(sorted.key.iter_mut()) {
+                    dst.push_from(src, prev_idx)?;
+                }
+                for ((_, src), (_, dst)) in self.val.iter().zip(sorted.val.iter_mut()) {
+                    dst.push_from(src, prev_idx)?;
+                }
+                sorted.ts.push(self.ts[prev_idx]);
+                sorted.diff.push(*prev_diff);
             }
-            for ((_, src), (_, dst)) in self.val.iter().zip(sorted.val.iter_mut()) {
-                dst.push_from(src, prev_idx).expect("WIP");
-            }
-            sorted.ts.push(self.ts[prev_idx]);
-            sorted.diff.push(*prev_diff);
         }
-        sorted.finish().expect("WIP")
+        sorted.finish()
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -372,8 +370,7 @@ impl Part {
     }
 }
 
-// WIP I couldn't figure out how to reuse the Formatter helpers here, so this
-// doesn't e.g. respect the pretty flag
+// TODO: Reuse formatter helps so this can respect pretty flag
 impl Debug for Part {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[")?;
@@ -420,6 +417,23 @@ impl PartBuilder {
             .columns()
             .into_iter()
             .map(|(name, data_type)| (name, DynColumnMut::new_untyped(&data_type)))
+            .collect();
+        let ts = Vec::new();
+        let diff = Vec::new();
+        PartBuilder { key, val, ts, diff }
+    }
+
+    /// Returns a new PartBuilder with the schema of the given Part
+    pub fn new_from_part(part: &Part) -> Self {
+        let key = part
+            .key
+            .iter()
+            .map(|(name, col)| (name.to_owned(), DynColumnMut::new_untyped(&col.0)))
+            .collect();
+        let val = part
+            .val
+            .iter()
+            .map(|(name, col)| (name.to_owned(), DynColumnMut::new_untyped(&col.0)))
             .collect();
         let ts = Vec::new();
         let diff = Vec::new();
@@ -519,9 +533,36 @@ impl DynColumnRef {
 
     fn to_col_ord<'a>(&'a self) -> ColOrd<'a> {
         match (self.0.optional, self.0.format) {
+            (false, ColumnFormat::Bool) => ColOrd::Bool(self.expect_downcast::<bool>()),
+            (false, ColumnFormat::I8) => ColOrd::I8(self.expect_downcast::<i8>()),
+            (false, ColumnFormat::I16) => ColOrd::I16(self.expect_downcast::<i16>()),
+            (false, ColumnFormat::I32) => ColOrd::I32(self.expect_downcast::<i32>()),
             (false, ColumnFormat::I64) => ColOrd::I64(self.expect_downcast::<i64>()),
+            (false, ColumnFormat::U8) => ColOrd::U8(self.expect_downcast::<u8>()),
+            (false, ColumnFormat::U16) => ColOrd::U16(self.expect_downcast::<u16>()),
+            (false, ColumnFormat::U32) => ColOrd::U32(self.expect_downcast::<u32>()),
+            (false, ColumnFormat::U64) => ColOrd::U64(self.expect_downcast::<u64>()),
+            (false, ColumnFormat::F32) => ColOrd::F32(self.expect_downcast::<f32>()),
+            (false, ColumnFormat::F64) => ColOrd::F64(self.expect_downcast::<f64>()),
+            (false, ColumnFormat::Bytes) => ColOrd::Bytes(self.expect_downcast::<Vec<u8>>()),
             (false, ColumnFormat::String) => ColOrd::String(self.expect_downcast::<String>()),
-            _ => panic!("WIP"),
+            (true, ColumnFormat::Bool) => ColOrd::OptBool(self.expect_downcast::<Option<bool>>()),
+            (true, ColumnFormat::I8) => ColOrd::OptI8(self.expect_downcast::<Option<i8>>()),
+            (true, ColumnFormat::I16) => ColOrd::OptI16(self.expect_downcast::<Option<i16>>()),
+            (true, ColumnFormat::I32) => ColOrd::OptI32(self.expect_downcast::<Option<i32>>()),
+            (true, ColumnFormat::I64) => ColOrd::OptI64(self.expect_downcast::<Option<i64>>()),
+            (true, ColumnFormat::U8) => ColOrd::OptU8(self.expect_downcast::<Option<u8>>()),
+            (true, ColumnFormat::U16) => ColOrd::OptU16(self.expect_downcast::<Option<u16>>()),
+            (true, ColumnFormat::U32) => ColOrd::OptU32(self.expect_downcast::<Option<u32>>()),
+            (true, ColumnFormat::U64) => ColOrd::OptU64(self.expect_downcast::<Option<u64>>()),
+            (true, ColumnFormat::F32) => ColOrd::OptF32(self.expect_downcast::<Option<f32>>()),
+            (true, ColumnFormat::F64) => ColOrd::OptF64(self.expect_downcast::<Option<f64>>()),
+            (true, ColumnFormat::Bytes) => {
+                ColOrd::OptBytes(self.expect_downcast::<Option<Vec<u8>>>())
+            }
+            (true, ColumnFormat::String) => {
+                ColOrd::OptString(self.expect_downcast::<Option<String>>())
+            }
         }
     }
 
@@ -736,7 +777,7 @@ mod tests {
     use std::marker::PhantomData;
 
     use crate::codec_impls::{StringSchema, UnitSchema};
-    use crate::columnar::PartEncoder;
+    use crate::columnar::{PartDecoder, PartEncoder};
 
     use super::*;
 
@@ -753,17 +794,21 @@ mod tests {
     }
 
     #[test]
-    fn part_consolidate() {
-        let mut part = PartBuilder::new(&StringSchema, &UnitSchema);
+    fn part_consolidate() -> Result<(), String> {
+        let key_schema = StringSchema::default();
+        let val_schema = UnitSchema::default();
+        let mut part = PartBuilder::new(&key_schema, &val_schema);
         {
-            let mut keys = StringSchema.encoder(part.key_mut()).unwrap();
-            keys.encode(&format!("foo"));
-            keys.encode(&format!("foo"));
-            keys.encode(&format!("foo"));
-            keys.encode(&format!("bar"));
-            keys.encode(&format!("foo"));
-            keys.encode(&format!("baz"));
-            keys.encode(&format!("foo"));
+            let mut keys = key_schema.encoder(part.key_mut()).unwrap();
+            keys.encode(&"foo".to_string());
+            keys.encode(&"foo".to_string());
+            keys.encode(&"foo".to_string());
+            keys.encode(&"bar".to_string());
+            keys.encode(&"foo".to_string());
+            keys.encode(&"baz".to_string());
+            keys.encode(&"foo".to_string());
+            keys.encode(&"qux".to_string());
+            keys.encode(&"qux".to_string());
         }
         part.push_ts_diff(3, 1);
         part.push_ts_diff(1, 1);
@@ -772,8 +817,59 @@ mod tests {
         part.push_ts_diff(1, 1);
         part.push_ts_diff(1, 1);
         part.push_ts_diff(1, 1);
-        let part = part.finish().unwrap();
-        let consolidated = part.consolidate();
-        eprintln!("{:?}", consolidated);
+        part.push_ts_diff(1, 1);
+        part.push_ts_diff(1, -1);
+        let part = part.finish()?;
+        let consolidated = part.consolidate()?;
+
+        let mut key = String::new();
+        let mut val = ();
+        assert_eq!(
+            decode_rows(&part, &key_schema, &val_schema, &mut key, &mut val)?,
+            vec![
+                ("foo".to_string(), (), 3, 1),
+                ("foo".to_string(), (), 1, 1),
+                ("foo".to_string(), (), 2, 1),
+                ("bar".to_string(), (), 1, 1),
+                ("foo".to_string(), (), 1, 1),
+                ("baz".to_string(), (), 1, 1),
+                ("foo".to_string(), (), 1, 1),
+                ("qux".to_string(), (), 1, 1),
+                ("qux".to_string(), (), 1, -1)
+            ]
+        );
+
+        assert_eq!(
+            decode_rows(&consolidated, &key_schema, &val_schema, &mut key, &mut val)?,
+            vec![
+                ("bar".to_string(), (), 1, 1),
+                ("baz".to_string(), (), 1, 1),
+                ("foo".to_string(), (), 1, 3),
+                ("foo".to_string(), (), 2, 1),
+                ("foo".to_string(), (), 3, 1)
+            ]
+        );
+
+        Ok(())
+    }
+
+    fn decode_rows<K: Clone, KS: Schema<K>, V: Clone, VS: Schema<V>>(
+        part: &Part,
+        key_schema: &KS,
+        val_schema: &VS,
+        key: &mut K,
+        val: &mut V,
+    ) -> Result<Vec<(K, V, i64, i64)>, String> {
+        let mut updates = Vec::with_capacity(part.len);
+        let key_decoder = key_schema.decoder(part.key_ref())?;
+        let val_decoder = val_schema.decoder(part.val_ref())?;
+        let ts = part.ts_ref();
+        let diff = part.diff_ref();
+        for idx in 0..part.len {
+            key_decoder.decode(idx, key);
+            val_decoder.decode(idx, val);
+            updates.push((key.clone(), val.clone(), ts[idx], diff[idx]));
+        }
+        Ok(updates)
     }
 }

@@ -4239,6 +4239,7 @@ dependencies = [
  "anyhow",
  "arrow2",
  "bytes",
+ "ordered-float",
  "workspace-hack",
 ]
 
