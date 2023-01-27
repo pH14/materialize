@@ -530,6 +530,7 @@ where
                 return None;
             }
 
+            // WIP: could potentially push a Project into the decoder, to ignore certain cols
             self.key_schema
                 .decoder(part.key_ref())
                 .expect("WIP")
