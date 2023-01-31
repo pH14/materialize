@@ -245,25 +245,25 @@ where
 
                 if let ListenEvent::Updates(ref parts) = event {
                     for part in parts {
-                        if let Some(stats) = &part.stats {
-                            let key_min = K::decode(&stats.key_min).expect("WIP");
-                            let key_max = K::decode(&stats.key_max).expect("WIP");
-                            let val_min = V::default();
-                            let val_max = V::default();
-
-                            let passes_filter =
-                                (filter)((&key_min, &val_min), (&key_max, &val_max));
-
-                            info!(
-                                "May fetch part with K min: {:?}, K max: {:?}, V min: {:?}, V max: {:?}. Passes filter: {}",
-                                key_min, key_max, val_min, val_max,
-                                passes_filter,
-                            );
-
-                            if !passes_filter {
-                                continue;
-                            }
-                        }
+                        // if let Some(stats) = &part.stats {
+                        //     let key_min = K::decode(&stats.key_min).expect("WIP");
+                        //     let key_max = K::decode(&stats.key_max).expect("WIP");
+                        //     let val_min = V::default();
+                        //     let val_max = V::default();
+                        //
+                        //     let passes_filter =
+                        //         (filter)((&key_min, &val_min), (&key_max, &val_max));
+                        //
+                        //     info!(
+                        //         "May fetch part with K min: {:?}, K max: {:?}, V min: {:?}, V max: {:?}. Passes filter: {}",
+                        //         key_min, key_max, val_min, val_max,
+                        //         passes_filter,
+                        //     );
+                        //
+                        //     if !passes_filter {
+                        //         continue;
+                        //     }
+                        // }
                     }
                 }
                 yield event;

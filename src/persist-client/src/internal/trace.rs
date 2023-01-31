@@ -365,6 +365,7 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
             parts: vec![],
             len: 0,
             runs: vec![],
+            stats: vec![],
         }))
     }
 

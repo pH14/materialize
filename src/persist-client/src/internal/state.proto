@@ -21,17 +21,9 @@ message ProtoU64Description {
     ProtoU64Antichain since = 3;
 }
 
-message ProtoHollowBatchPartStats {
-    bytes min_key = 1;
-    bytes max_key = 2;
-    bytes min_val = 3;
-    bytes max_val = 4;
-}
-
 message ProtoHollowBatchPart {
     string key = 1;
     uint64 encoded_size_bytes = 2;
-    ProtoHollowBatchPartStats stats = 3;
 }
 
 message ProtoHollowBatch {
@@ -39,6 +31,7 @@ message ProtoHollowBatch {
     repeated ProtoHollowBatchPart parts = 4;
     uint64 len = 3;
     repeated uint64 runs = 5;
+    bytes stats = 6;
 
     repeated string deprecated_keys = 2;
 }

@@ -19,6 +19,7 @@ use differential_dataflow::trace::Description;
 use mz_ore::cast::CastFrom;
 use mz_ore::now::EpochMillis;
 use mz_persist::location::SeqNo;
+use mz_persist_types::part::Part;
 use mz_persist_types::{Codec, Codec64, Opaque};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -146,8 +147,6 @@ pub struct HollowBatchPart {
     pub key: PartialBatchKey,
     /// The encoded size of this part.
     pub encoded_size_bytes: usize,
-    /// WIP: Stats
-    pub stats: Option<BatchPartStats>,
 }
 
 /// A [Batch] but with the updates themselves stored externally.
@@ -169,6 +168,8 @@ pub struct HollowBatch<T> {
     ///     parts=[p1, p2, p3], runs=[1, 2] --> runs are [p1], [p2], [p3]
     /// ```
     pub runs: Vec<usize>,
+    /// Stats for each HollowBatchPart. WIP: explain format.
+    pub stats: Vec<u8>,
 }
 
 impl<T: Ord> PartialOrd for HollowBatch<T> {
@@ -186,12 +187,14 @@ impl<T: Ord> Ord for HollowBatch<T> {
             parts: self_parts,
             len: self_len,
             runs: self_runs,
+            stats: self_stats,
         } = self;
         let HollowBatch {
             desc: other_desc,
             parts: other_parts,
             len: other_len,
             runs: other_runs,
+            stats: other_stats,
         } = other;
         (
             self_desc.lower().elements(),
@@ -200,6 +203,7 @@ impl<T: Ord> Ord for HollowBatch<T> {
             self_parts,
             self_len,
             self_runs,
+            self_stats,
         )
             .cmp(&(
                 other_desc.lower().elements(),
@@ -208,6 +212,7 @@ impl<T: Ord> Ord for HollowBatch<T> {
                 other_parts,
                 other_len,
                 other_runs,
+                other_stats,
             ))
     }
 }
@@ -806,6 +811,7 @@ where
             parts: Vec::new(),
             runs: Vec::new(),
             len: 0,
+            stats: Vec::new(),
         }
     }
 

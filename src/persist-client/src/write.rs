@@ -455,6 +455,13 @@ where
             num_updates += batch.batch.len;
         }
 
+        let stats = batches
+            .first()
+            .expect("at least one batch")
+            .batch
+            .stats
+            .clone();
+
         let heartbeat_timestamp = (self.cfg.now)();
         let res = self
             .machine
@@ -463,7 +470,10 @@ where
                     desc: desc.clone(),
                     parts,
                     len: num_updates,
+                    // TODO: fix writing runs with multiple input batches
                     runs: vec![],
+                    // WIP: adapting this for multiple batches is tricky
+                    stats,
                 },
                 &self.writer_id,
                 heartbeat_timestamp,

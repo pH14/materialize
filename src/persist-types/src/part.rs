@@ -25,7 +25,7 @@ use crate::columnar::{ColumnFormat, ColumnGet, ColumnPush, Data, DataType, Schem
 use crate::ord::{ColOrd, ColsOrd, ColsOrdKey};
 
 /// A columnar representation of one blob's worth of data.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Part {
     len: usize,
     key: Vec<(String, DynColumnRef)>,
@@ -252,18 +252,21 @@ impl Part {
     }
 
     /// Flatmaps over the columns of this [Part]'s key and value, returning
-    /// a Vec with indices into each column's minimum and maximum element.
-    pub fn minmax(&self) -> Vec<(usize, usize)> {
-        let mut minmaxes = Vec::with_capacity(self.key.len() + self.val.len());
+    /// a Vecs with indices into each column's minimum and maximum elements.
+    pub fn minmax(&self) -> (Vec<usize>, Vec<usize>) {
+        let mut mins = Vec::with_capacity(self.key.len());
+        let mut maxs = Vec::with_capacity(self.val.len());
         for (_name, col) in self.key.iter() {
             let (min, max) = col.to_col_ord().minmax(col.len());
-            minmaxes.push((min, max));
+            mins.push(min);
+            maxs.push(max);
         }
         for (_name, col) in self.val.iter() {
             let (min, max) = col.to_col_ord().minmax(col.len());
-            minmaxes.push((min, max));
+            mins.push(min);
+            maxs.push(max);
         }
-        minmaxes
+        (mins, maxs)
     }
 
     /// Returns a sorted and consolidated copy of this Part.
@@ -476,6 +479,32 @@ impl PartBuilder {
             diff: &mut self.diff,
         };
         (keys, vals, ts_diff)
+    }
+
+    /// Pushes from the source, using `indices` to specify each column's value.
+    pub fn push_from(
+        &mut self,
+        src: &Part,
+        indices: Vec<usize>,
+        ts: i64,
+        diff: i64,
+    ) -> Result<(), String> {
+        assert_eq!(indices.len(), self.key.len() + self.val.len());
+
+        let mut i = 0;
+        for ((_, src), (_, dst)) in src.key.iter().zip(self.key.iter_mut()) {
+            dst.push_from(src, *indices.get(i).expect("bounds were checked"))?;
+            i += 1;
+        }
+        for ((_, src), (_, dst)) in src.val.iter().zip(self.val.iter_mut()) {
+            dst.push_from(src, *indices.get(i).expect("bounds were checked"))?;
+            i += 1;
+        }
+
+        assert_eq!(i, indices.len());
+        self.ts.push(ts);
+        self.diff.push(ts);
+        Ok(())
     }
 
     /// Completes construction of the [Part].
@@ -842,7 +871,41 @@ mod tests {
         }
         let part = part.finish()?;
 
-        assert_eq!(part.minmax(), vec![(1, 0), (0, 3)]);
+        assert_eq!(part.minmax(), (vec![1, 0], vec![0, 3]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn part_push_from() -> Result<(), String> {
+        let key_schema = StringSchema::default();
+        let val_schema = StringSchema::default();
+        let mut part = PartBuilder::new(&key_schema, &val_schema);
+        {
+            let (keys, vals, mut ts_diff) = part.mut_handles();
+            let mut keys = key_schema.encoder(keys).unwrap();
+            let mut vals = val_schema.encoder(vals).unwrap();
+            keys.encode(&"z".to_string());
+            keys.encode(&"a".to_string());
+
+            vals.encode(&"1".to_string());
+            vals.encode(&"2".to_string());
+
+            ts_diff.push(1, 1);
+            ts_diff.push(1, 1);
+        }
+        let part = part.finish()?;
+
+        let mut new_part = PartBuilder::new_from_part(&part);
+        new_part.push_from(&part, part.minmax().1, 1, 1)?;
+        let new_part = new_part.finish()?;
+
+        let mut key = String::new();
+        let mut val = String::new();
+        assert_eq!(
+            decode_rows(&new_part, &key_schema, &val_schema, &mut key, &mut val)?,
+            vec![("z".to_string(), "2".to_string(), 1, 1)]
+        );
 
         Ok(())
     }

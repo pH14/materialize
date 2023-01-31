@@ -468,6 +468,7 @@ where
                 parts: all_parts,
                 runs: all_runs,
                 len,
+                stats: vec![],
             },
         })
     }

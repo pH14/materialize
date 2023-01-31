@@ -12,8 +12,6 @@ use std::marker::PhantomData;
 
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
-use mz_persist_types::{Codec, Codec64};
-use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 use prost::Message;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -23,17 +21,18 @@ use tracing::debug;
 use uuid::Uuid;
 
 use mz_ore::halt;
+use mz_persist_types::{Codec, Codec64};
+use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 
 use crate::critical::CriticalReaderId;
 use crate::error::CodecMismatch;
 use crate::internal::paths::{PartialBatchKey, PartialRollupKey};
 use crate::internal::state::{
-    BatchPartStats, CriticalReaderState, HandleDebugState, HollowBatch, HollowBatchPart,
-    IdempotencyToken, LeasedReaderState, OpaqueState, ProtoCriticalReaderState,
-    ProtoHandleDebugState, ProtoHollowBatch, ProtoHollowBatchPart, ProtoHollowBatchPartStats,
-    ProtoLeasedReaderState, ProtoStateDiff, ProtoStateField, ProtoStateFieldDiffType,
-    ProtoStateFieldDiffs, ProtoStateRollup, ProtoTrace, ProtoU64Antichain, ProtoU64Description,
-    ProtoWriterState, State, StateCollections, WriterState,
+    CriticalReaderState, HandleDebugState, HollowBatch, HollowBatchPart, IdempotencyToken,
+    LeasedReaderState, OpaqueState, ProtoCriticalReaderState, ProtoHandleDebugState,
+    ProtoHollowBatch, ProtoHollowBatchPart, ProtoLeasedReaderState, ProtoStateDiff,
+    ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs, ProtoStateRollup, ProtoTrace,
+    ProtoU64Antichain, ProtoU64Description, ProtoWriterState, State, StateCollections, WriterState,
 };
 use crate::internal::state_diff::{
     ProtoStateFieldDiff, StateDiff, StateFieldDiff, StateFieldValDiff,
@@ -797,6 +796,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
             len: self.len.into_proto(),
             runs: self.runs.into_proto(),
             deprecated_keys: vec![],
+            stats: self.stats.into_proto(),
         }
     }
 
@@ -811,7 +811,6 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
                 .map(|key| HollowBatchPart {
                     key: PartialBatchKey(key),
                     encoded_size_bytes: 0,
-                    stats: None,
                 }),
         );
         Ok(HollowBatch {
@@ -819,26 +818,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
             parts,
             len: proto.len.into_rust()?,
             runs: proto.runs.into_rust()?,
-        })
-    }
-}
-
-impl RustType<ProtoHollowBatchPartStats> for BatchPartStats {
-    fn into_proto(&self) -> ProtoHollowBatchPartStats {
-        ProtoHollowBatchPartStats {
-            min_key: self.key_min.into_proto(),
-            max_key: self.key_max.into_proto(),
-            min_val: self.val_min.into_proto(),
-            max_val: self.val_max.into_proto(),
-        }
-    }
-
-    fn from_proto(proto: ProtoHollowBatchPartStats) -> Result<Self, TryFromProtoError> {
-        Ok(BatchPartStats {
-            key_min: proto.min_key.into_rust()?,
-            key_max: proto.max_key.into_rust()?,
-            val_min: proto.min_val.into_rust()?,
-            val_max: proto.max_val.into_rust()?,
+            stats: proto.stats.into_rust()?,
         })
     }
 }
@@ -848,7 +828,6 @@ impl RustType<ProtoHollowBatchPart> for HollowBatchPart {
         ProtoHollowBatchPart {
             key: self.key.into_proto(),
             encoded_size_bytes: self.encoded_size_bytes.into_proto(),
-            stats: self.stats.into_proto(),
         }
     }
 
@@ -856,7 +835,6 @@ impl RustType<ProtoHollowBatchPart> for HollowBatchPart {
         Ok(HollowBatchPart {
             key: proto.key.into_rust()?,
             encoded_size_bytes: proto.encoded_size_bytes.into_rust()?,
-            stats: proto.stats.into_rust()?,
         })
     }
 }

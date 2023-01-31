@@ -32,6 +32,7 @@ use mz_persist::indexed::columnar::{ColumnarRecords, ColumnarRecordsBuilder};
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Atomicity, Blob};
 use mz_persist_types::columnar::{PartDecoder, PartEncoder, Schema};
+use mz_persist_types::parquet::encode_part;
 use mz_persist_types::part::{Part, PartBuilder};
 use mz_persist_types::{Codec, Codec64};
 
@@ -223,6 +224,8 @@ where
     k_schema: Arc<K::Schema>,
     v_schema: Arc<V::Schema>,
 
+    min_max: PartBuilder,
+
     // These provide a bit more safety against appending a batch with the wrong
     // type to a shard.
     _phantom: PhantomData<(K, V, T, D)>,
@@ -288,6 +291,7 @@ where
             // to make a tighter bound, possibly by changing the part
             // description to be an _inclusive_ upper.
             inline_upper: inline_upper.unwrap_or_else(|| Antichain::new()),
+            min_max: PartBuilder::new::<K, K::Schema, V, V::Schema>(&k_schema, &v_schema),
             k_schema,
             v_schema,
             _phantom: PhantomData,
@@ -331,45 +335,12 @@ where
 
         let remainder = self.buffer.drain();
 
-        let mut key_stats = vec![];
-        match &remainder {
-            FilledPart::Row(_) => {}
-            FilledPart::Arrow(part) => {
-                // WIP: if we keep this fn, where should it go? seems like we probably want it
-                // to go in the encoding step so it uses the cpu heavy runtime
-                let aggregate_part = part.compute_aggregates();
-                let mut k = K::default();
-
-                let mut key_min = vec![];
-                self.k_schema
-                    .decoder(aggregate_part.key_ref())
-                    .expect("WIP")
-                    .decode(0, &mut k);
-                K::encode(&k, &mut key_min);
-                info!("K min: {:?}", k);
-
-                let mut key_max = vec![];
-                self.k_schema
-                    .decoder(aggregate_part.key_ref())
-                    .expect("WIP")
-                    .decode(1, &mut k);
-                K::encode(&k, &mut key_max);
-                info!("K max: {:?}", k);
-                key_stats.push(BatchPartStats {
-                    key_min,
-                    key_max,
-                    val_min: vec![],
-                    val_max: vec![],
-                });
-            }
-        }
-
         self.flush_part(remainder).await;
 
         let mut parts = self.parts.finish().await;
-        for (part, stats) in parts.iter_mut().zip(key_stats) {
-            part.stats = Some(stats);
-        }
+
+        let minmax = self.min_max.finish().expect("finished");
+        info!("{}: Minmax: {:?}", self.shard_id, minmax);
 
         let desc = Description::new(self.lower, registered_upper, self.since);
         let batch = Batch::new(
@@ -380,6 +351,11 @@ where
                 parts,
                 len: self.num_updates,
                 runs: self.runs,
+                stats: {
+                    let mut enc = Vec::new();
+                    encode_part(&mut enc, &minmax).expect("WIP");
+                    enc
+                },
             },
         );
 
@@ -419,8 +395,8 @@ where
     /// the updates. It is the caller's responsibility to chunk `current_part` to be no greater
     /// than [crate::PersistConfig::blob_target_size], and must absolutely be less than
     /// [mz_persist::indexed::columnar::KEY_VAL_DATA_MAX_LEN]
-    async fn flush_part(&mut self, part: FilledPart) {
-        let num_updates = match &part {
+    async fn flush_part(&mut self, mut part: FilledPart) {
+        let num_updates = match &mut part {
             FilledPart::Row(columnar) => {
                 let num_updates = columnar.len();
                 if num_updates == 0 {
@@ -471,9 +447,17 @@ where
                 num_updates
             }
             FilledPart::Arrow(part) => {
+                *part = part.consolidate().expect("WIP");
                 if part.len() == 0 {
                     return;
                 }
+
+                // WIP: determine runs with some fancy comparison fn that doesn't exist yet
+
+                let minmax = part.minmax();
+                self.min_max.push_from(&part, minmax.0, 0, 1).expect("min");
+                self.min_max.push_from(&part, minmax.1, 0, 1).expect("max");
+
                 part.len()
             }
         };
@@ -559,18 +543,13 @@ where
     }
 
     fn push<T: Codec64>(&mut self, key: &K, val: &V, ts: &T, diff: D) -> Option<FilledPart> {
-        // WIP: need a way to avoid rebuilding encoder for each KV. right now it hits
-        // multiple mut borrows of part_builder if we try to precompute
         if self.should_use_arrow {
-            self.k_schema
-                .encoder(self.part_builder.key_mut())
-                .expect("abc")
-                .encode(key);
-            self.v_schema
-                .encoder(self.part_builder.val_mut())
-                .expect("def")
-                .encode(val);
-            self.part_builder.push_ts_diff(
+            // WIP: avoid recreating the encoders per key. need to store these and figure out
+            // the appropriate lifetimes
+            let (keys, vals, mut ts_diff) = self.part_builder.mut_handles();
+            self.k_schema.encoder(keys).expect("abc").encode(key);
+            self.v_schema.encoder(vals).expect("def").encode(val);
+            ts_diff.push(
                 i64::decode(Codec64::encode(ts)),
                 i64::decode(D::encode(&diff)),
             );
@@ -614,7 +593,7 @@ where
                 self.k_schema.borrow(),
                 self.v_schema.borrow(),
             );
-            let finished_part = builder.finish().expect("dun");
+            let finished_part = builder.finish().expect("WIP: dun");
 
             Some(FilledPart::Arrow(finished_part))
         } else {
@@ -809,7 +788,6 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
             self.finished_parts.push(HollowBatchPart {
                 key,
                 encoded_size_bytes,
-                stats: None,
             });
         }
     }
@@ -826,7 +804,6 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
             parts.push(HollowBatchPart {
                 key,
                 encoded_size_bytes,
-                stats: None,
             });
         }
         parts
