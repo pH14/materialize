@@ -17,11 +17,14 @@ use std::time::{Duration, SystemTime};
 
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
+use differential_dataflow::logging::DifferentialEvent::Batch;
 use futures::Stream;
 use mz_ore::now::EpochMillis;
 use mz_ore::task::RuntimeExt;
 use mz_persist::location::{Blob, SeqNo};
 use mz_persist::retry::Retry;
+use mz_persist_types::columnar::{PartDecoder, Schema};
+use mz_persist_types::parquet::decode_part;
 use mz_persist_types::{Codec, Codec64};
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
@@ -38,6 +41,7 @@ use crate::fetch::{
 use crate::internal::machine::Machine;
 use crate::internal::metrics::{Metrics, MetricsRetryStream};
 use crate::internal::state::{HollowBatch, Since};
+use crate::stats::BatchStatsBuilder;
 use crate::{parse_id, GarbageCollector, PersistConfig};
 
 /// An opaque identifier for a reader of a persist durable TVC (aka shard).
@@ -624,12 +628,19 @@ where
             as_of: as_of.iter().map(T::encode).collect(),
         };
         let mut leased_parts = Vec::new();
-        for batch in batches {
+        let mut stats_builder = BatchStatsBuilder::<K, V>::new(
+            Arc::clone(&self.key_schema),
+            Arc::clone(&self.val_schema),
+        );
+        for mut batch in batches.into_iter() {
+            stats_builder.add_batch(&mut batch).expect("WIP");
             // Flatten the HollowBatch into one LeasedBatchPart per key. Each key
             // corresponds to a "part" or s3 object. This allows persist_source
             // to distribute work by parts (smallish, more even size) instead of
             // batches (arbitrarily large).
-            leased_parts.extend(self.lease_batch_parts(batch, metadata.clone()));
+            for leased_part in self.lease_batch_parts(batch, metadata.clone()) {
+                leased_parts.push(leased_part);
+            }
         }
         Ok(leased_parts)
     }

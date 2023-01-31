@@ -134,6 +134,7 @@ pub mod metrics {
 }
 pub mod internals_bench;
 pub mod read;
+pub mod stats;
 pub mod usage;
 pub mod write;
 

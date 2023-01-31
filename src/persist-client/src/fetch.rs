@@ -35,7 +35,6 @@ use crate::error::InvalidUsage;
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{Metrics, ReadMetrics};
 use crate::internal::paths::PartialBatchKey;
-use crate::internal::state::BatchPartStats;
 use crate::read::{LeasedReaderId, ReadHandle};
 use crate::ShardId;
 
@@ -383,6 +382,17 @@ where
     /// long as necessary to ensure the `SeqNo` isn't garbage collected while a
     /// read still depends on it.
     pub(crate) leased_seqno: Option<SeqNo>,
+}
+
+/// WIP: Stats
+#[derive(Debug)]
+pub struct BatchPartStats<K, V>
+where
+    K: Codec,
+    V: Codec,
+{
+    pub min: (K, V),
+    pub max: (K, V),
 }
 
 impl<T> LeasedBatchPart<T>

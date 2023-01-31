@@ -353,7 +353,9 @@ where
                 runs: self.runs,
                 stats: {
                     let mut enc = Vec::new();
-                    encode_part(&mut enc, &minmax).expect("WIP");
+                    if minmax.len() > 0 {
+                        encode_part(&mut enc, &minmax).expect("WIP");
+                    }
                     enc
                 },
             },
