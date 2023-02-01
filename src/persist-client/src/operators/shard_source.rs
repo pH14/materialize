@@ -319,6 +319,11 @@ where
                     Some(Ok(ListenEvent::Updates((mut parts, stats)))) => {
                         for part in parts {
                             if stats.get(&part.key, key_schema.as_ref(), val_schema.as_ref(), &mut min_key, &mut min_val, &mut max_key, &mut max_val) {
+                                // WIP: how do we model whether a column has no min/max value?
+                                // it depends a bit on the K / V types themselves, so it seems
+                                // like we want to pass something in schema or column terms
+                                // that indicates whether each col is valid. maybe something
+                                // along the lines of arrow2's validity bitmaps
                                 let passes_filter = (filter)((&min_key, &min_val), (&max_key, &max_val));
 
                                 info!(
