@@ -37,8 +37,15 @@ impl BatchStats {
         min_val: &mut V,
         max_key: &mut K,
         max_val: &mut V,
-    ) {
-        let (part_idx, row_idx) = self.keys.get(batch_part_key).expect("WIP: unknown key");
+    ) -> bool {
+        let Some((part_idx, row_idx)) = self.keys.get(batch_part_key) else {
+            return false;
+        };
+
+        info!(
+            "Stored indices: {:?}. Looking up ({}, {}) for {:?}",
+            self.keys, part_idx, row_idx, batch_part_key,
+        );
 
         let part: &Part = self.stats.get(*part_idx).expect("WIP");
 
@@ -50,6 +57,8 @@ impl BatchStats {
 
         key_decoder.decode(*row_idx + 1, max_key);
         val_decoder.decode(*row_idx + 1, max_val);
+
+        true
     }
 }
 
@@ -73,9 +82,8 @@ impl<K: Codec, V: Codec> BatchStatsBuilder<K, V> {
         }
     }
 
-    pub fn add_batch<T>(&mut self, batch: &mut HollowBatch<T>) -> Result<(), anyhow::Error> {
+    pub fn add_batch<T>(&mut self, batch: &HollowBatch<T>) -> Result<(), anyhow::Error> {
         if batch.stats.len() > 0 {
-            info!("Batch stats: {:?}", batch.stats);
             let parquet_stats = decode_part(
                 &mut std::io::Cursor::new(&batch.stats),
                 self.key_schema.as_ref(),
@@ -90,9 +98,9 @@ impl<K: Codec, V: Codec> BatchStatsBuilder<K, V> {
                     (self.current_batch_idx, 2 * row_idx),
                 );
             }
-        }
 
-        self.current_batch_idx += 1;
+            self.current_batch_idx += 1;
+        }
 
         Ok(())
     }

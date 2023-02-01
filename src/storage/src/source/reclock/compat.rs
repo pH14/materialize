@@ -111,11 +111,11 @@ pub struct PersistHandle<FromTime: SourceTimestamp, IntoTime: Timestamp + Lattic
         'static,
         ListenEvent<
             IntoTime,
-            (
+            Vec<(
                 (Result<SourceData, String>, Result<(), String>),
                 IntoTime,
                 Diff,
-            ),
+            )>,
         >,
     >,
     write_handle: WriteHandle<SourceData, (), IntoTime, Diff>,

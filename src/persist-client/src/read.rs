@@ -41,7 +41,7 @@ use crate::fetch::{
 use crate::internal::machine::Machine;
 use crate::internal::metrics::{Metrics, MetricsRetryStream};
 use crate::internal::state::{HollowBatch, Since};
-use crate::stats::BatchStatsBuilder;
+use crate::stats::{BatchStats, BatchStatsBuilder};
 use crate::{parse_id, GarbageCollector, PersistConfig};
 
 /// An opaque identifier for a reader of a persist durable TVC (aka shard).
@@ -102,7 +102,7 @@ where
     V: Debug + Codec + Default, // WIP: Remove Default
     D: Semigroup + Codec64 + Send + Sync,
 {
-    snapshot: Option<Vec<LeasedBatchPart<T>>>,
+    snapshot: Option<(Vec<LeasedBatchPart<T>>, BatchStats)>,
     listen: Listen<K, V, T, D>,
 }
 
@@ -113,9 +113,9 @@ where
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
-    fn new(snapshot_parts: Vec<LeasedBatchPart<T>>, listen: Listen<K, V, T, D>) -> Self {
+    fn new(snapshot: (Vec<LeasedBatchPart<T>>, BatchStats), listen: Listen<K, V, T, D>) -> Self {
         Subscribe {
-            snapshot: Some(snapshot_parts),
+            snapshot: Some(snapshot),
             listen,
         }
     }
@@ -128,15 +128,18 @@ where
     /// The returned `Antichain` represents the subscription progress as it will
     /// be _after_ the returned parts are fetched.
     #[instrument(level = "debug", skip_all, fields(shard = %self.listen.handle.machine.shard_id()))]
-    pub async fn next(&mut self) -> Vec<ListenEvent<T, LeasedBatchPart<T>>> {
+    pub async fn next(&mut self) -> Vec<ListenEvent<T, (Vec<LeasedBatchPart<T>>, BatchStats)>> {
         // This is odd, but we move our handle into a `Listen`.
         self.listen.handle.maybe_heartbeat_reader().await;
 
         match self.snapshot.take() {
-            Some(parts) => vec![ListenEvent::Updates(parts)],
+            Some(snapshot) => vec![ListenEvent::Updates(snapshot)],
             None => {
-                let (parts, upper) = self.listen.next().await;
-                vec![ListenEvent::Updates(parts), ListenEvent::Progress(upper)]
+                let ((parts, stats), upper) = self.listen.next().await;
+                vec![
+                    ListenEvent::Updates((parts, stats)),
+                    ListenEvent::Progress(upper),
+                ]
             }
         }
     }
@@ -146,19 +149,19 @@ where
     #[instrument(level = "debug", skip_all, fields(shard = %self.listen.handle.machine.shard_id()))]
     pub async fn fetch_next(
         &mut self,
-    ) -> Vec<ListenEvent<T, ((Result<K, String>, Result<V, String>), T, D)>> {
+    ) -> Vec<ListenEvent<T, Vec<((Result<K, String>, Result<V, String>), T, D)>>> {
         let events = self.next().await;
         let new_len = events
             .iter()
             .map(|event| match event {
-                ListenEvent::Updates(parts) => parts.len(),
+                ListenEvent::Updates((parts, _)) => parts.len(),
                 ListenEvent::Progress(_) => 1,
             })
             .sum();
         let mut ret = Vec::with_capacity(new_len);
         for event in events {
             match event {
-                ListenEvent::Updates(parts) => {
+                ListenEvent::Updates((parts, _)) => {
                     for part in parts {
                         let fetched_part = self.listen.fetch_batch_part(part).await;
                         let updates = fetched_part.collect::<Vec<_>>();
@@ -194,7 +197,7 @@ where
     fn drop(&mut self) {
         // Return all leased parts from the snapshot to ensure they don't panic
         // if dropped.
-        if let Some(parts) = self.snapshot.take() {
+        if let Some((parts, _stats)) = self.snapshot.take() {
             for part in parts {
                 self.return_leased_part(part)
             }
@@ -211,7 +214,7 @@ pub enum ListenEvent<T, D> {
     /// Progress of the shard.
     Progress(Antichain<T>),
     /// Data of the shard.
-    Updates(Vec<D>),
+    Updates(D),
 }
 
 /// An ongoing subscription of updates to a shard.
@@ -256,7 +259,8 @@ where
     /// Convert listener into futures::Stream
     pub fn into_stream(
         mut self,
-    ) -> impl Stream<Item = ListenEvent<T, ((Result<K, String>, Result<V, String>), T, D)>> {
+    ) -> impl Stream<Item = ListenEvent<T, Vec<((Result<K, String>, Result<V, String>), T, D)>>>
+    {
         async_stream::stream!({
             loop {
                 for msg in self.fetch_next().await {
@@ -278,7 +282,7 @@ where
     ///
     /// The returned `Antichain` represents the subscription progress as it will
     /// be _after_ the returned parts are fetched.
-    pub async fn next(&mut self) -> (Vec<LeasedBatchPart<T>>, Antichain<T>) {
+    pub async fn next(&mut self) -> ((Vec<LeasedBatchPart<T>>, BatchStats), Antichain<T>) {
         let batch = self.handle.next_listen_batch(&self.frontier).await;
 
         // A lot of things across mz have to line up to hold the following
@@ -341,13 +345,18 @@ where
             as_of: self.as_of.iter().map(T::encode).collect(),
             lower: self.frontier.iter().map(T::encode).collect(),
         };
+        let mut stats_builder = BatchStatsBuilder::<K, V>::new(
+            Arc::clone(&self.handle.key_schema),
+            Arc::clone(&self.handle.val_schema),
+        );
+        stats_builder.add_batch(&batch).expect("WIP");
         let parts = self.handle.lease_batch_parts(batch, metadata).collect();
 
         // NB: Keep this after we use self.frontier to join_assign self.since
         // and also after we construct metadata.
         self.frontier = new_frontier;
 
-        (parts, self.frontier.clone())
+        ((parts, stats_builder.finish()), self.frontier.clone())
     }
 
     /// Attempt to pull out the next values of this subscription.
@@ -363,8 +372,8 @@ where
     #[instrument(level = "debug", name = "listen::next", skip_all, fields(shard = %self.handle.machine.shard_id()))]
     pub async fn fetch_next(
         &mut self,
-    ) -> Vec<ListenEvent<T, ((Result<K, String>, Result<V, String>), T, D)>> {
-        let (parts, progress) = self.next().await;
+    ) -> Vec<ListenEvent<T, Vec<((Result<K, String>, Result<V, String>), T, D)>>> {
+        let ((parts, _stats), progress) = self.next().await;
         let mut ret = Vec::with_capacity(parts.len() + 1);
         for part in parts {
             let fetched_part = self.fetch_batch_part(part).await;
@@ -621,7 +630,7 @@ where
     pub async fn snapshot(
         &mut self,
         as_of: Antichain<T>,
-    ) -> Result<Vec<LeasedBatchPart<T>>, Since<T>> {
+    ) -> Result<(Vec<LeasedBatchPart<T>>, BatchStats), Since<T>> {
         let batches = self.machine.snapshot(&as_of).await?;
 
         let metadata = SerdeLeasedBatchPartMetadata::Snapshot {
@@ -642,7 +651,7 @@ where
                 leased_parts.push(leased_part);
             }
         }
-        Ok(leased_parts)
+        Ok((leased_parts, stats_builder.finish()))
     }
 
     /// Generates a [Self::snapshot], and fetches all of the batches
@@ -654,7 +663,7 @@ where
         let snap = self.snapshot(as_of).await?;
 
         let mut contents = Vec::new();
-        for part in snap {
+        for part in snap.0 {
             let (part, fetched_part) = fetch_leased_part(
                 part,
                 self.blob.as_ref(),
@@ -681,9 +690,9 @@ where
         mut self,
         as_of: Antichain<T>,
     ) -> Result<Subscribe<K, V, T, D>, Since<T>> {
-        let snapshot_parts = self.snapshot(as_of.clone()).await?;
+        let snapshot = self.snapshot(as_of.clone()).await?;
         let listen = self.listen(as_of.clone()).await?;
-        Ok(Subscribe::new(snapshot_parts, listen))
+        Ok(Subscribe::new(snapshot, listen))
     }
 
     fn lease_batch_parts(

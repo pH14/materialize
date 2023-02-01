@@ -340,7 +340,10 @@ where
         let mut parts = self.parts.finish().await;
 
         let minmax = self.min_max.finish().expect("finished");
-        info!("{}: Minmax: {:?}", self.shard_id, minmax);
+
+        if minmax.len() > 0 {
+            info!("{}: Minmax: {:?}", self.shard_id, minmax);
+        }
 
         let desc = Description::new(self.lower, registered_upper, self.since);
         let batch = Batch::new(

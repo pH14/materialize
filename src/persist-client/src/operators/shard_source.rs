@@ -176,6 +176,8 @@ where
     // This is a generator that sets up an async `Stream` that can be continuously polled to get the
     // values that are `yield`-ed from it's body.
     let name_owned = name.to_owned();
+    let key_schema_copy = Arc::clone(&key_schema);
+    let val_schema_copy = Arc::clone(&val_schema);
     let async_stream = async_stream::try_stream!({
         // Only one worker is responsible for distributing parts
         if worker_index != chosen_worker {
@@ -195,8 +197,8 @@ where
             .open_leased_reader::<K, V, G::Timestamp, D>(
                 shard_id,
                 &format!("shard_source({})", name_owned),
-                key_schema,
-                val_schema,
+                key_schema_copy,
+                val_schema_copy,
             )
             .await
             .expect("could not open persist shard");
@@ -243,26 +245,7 @@ where
                     }
                 }
 
-                if let ListenEvent::Updates(ref parts) = event {
-                    // for part in parts {
-                    //     if let Some(stats) = &part.stats {
-                    //         let passes_filter = (filter)(
-                    //             (&stats.min.0, &stats.min.1),
-                    //             (&stats.max.0, &stats.max.1),
-                    //         );
-                    //
-                    //         info!(
-                    //             "May fetch part with K min: {:?}, K max: {:?}, V min: {:?}, V max: {:?}. Passes filter: {}",
-                    //             stats.min.0, stats.min.1, stats.max.0, stats.max.1,
-                    //             passes_filter,
-                    //         );
-                    //
-                    //         if !passes_filter {
-                    //             continue;
-                    //         }
-                    //     }
-                    // }
-                }
+                if let ListenEvent::Updates(ref parts) = event {}
                 yield event;
             }
         }
@@ -322,14 +305,34 @@ where
 
         let max_inflight_bytes = flow_control_bytes.unwrap_or(usize::MAX);
 
+        let mut min_key = K::default();
+        let mut max_key = K::default();
+        let mut min_val = V::default();
+        let mut max_val = V::default();
+
         loop {
             // While we have budget left for fetching more parts, read from the
             // subscription and pass them on.
             let mut batch_parts = vec![];
             while inflight_bytes < max_inflight_bytes {
                 match pinned_stream.next().await {
-                    Some(Ok(ListenEvent::Updates(mut parts))) => {
-                        batch_parts.append(&mut parts);
+                    Some(Ok(ListenEvent::Updates((mut parts, stats)))) => {
+                        for part in parts {
+                            if stats.get(&part.key, key_schema.as_ref(), val_schema.as_ref(), &mut min_key, &mut min_val, &mut max_key, &mut max_val) {
+                                let passes_filter = (filter)((&min_key, &min_val), (&max_key, &max_val));
+
+                                info!(
+                                    "May fetch part with K min: {:?}, K max: {:?}, V min: {:?}, V max: {:?}. Passes filter: {}",
+                                    min_key, max_key, min_val, max_val,
+                                    passes_filter,
+                                );
+
+                                if !passes_filter {
+                                    continue;
+                                }
+                            }
+                            batch_parts.push(part);
+                        }
                     }
                     Some(Ok(ListenEvent::Progress(progress))) => {
                         let session_cap = cap_set.delayed(&current_ts);
