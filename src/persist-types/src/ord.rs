@@ -56,11 +56,11 @@ impl<'a> ColOrd<'a> {
         let mut min_idx = 0;
         let mut max_idx = 0;
         for idx in 0..len {
-            match self.cmp(min_idx, idx) {
+            match self.cmp(min_idx, &self, idx) {
                 Ordering::Less | Ordering::Equal => {}
                 Ordering::Greater => min_idx = idx,
             }
-            match self.cmp(max_idx, idx) {
+            match self.cmp(max_idx, &self, idx) {
                 Ordering::Less => max_idx = idx,
                 Ordering::Equal | Ordering::Greater => {}
             }
@@ -68,7 +68,14 @@ impl<'a> ColOrd<'a> {
         (min_idx, max_idx)
     }
 
-    fn cmp(&self, idx0: usize, idx1: usize) -> Ordering {
+    fn cmp(&self, idx0: usize, other: &ColOrd, idx1: usize) -> Ordering {
+        match (self, other) {
+            (ColOrd::Bool(x), ColOrd::Bool(y)) => {
+                ColumnGet::<bool>::get(*x, idx0).cmp(&ColumnGet::get(*y, idx1))
+            }
+            _ => Ordering::Equal,
+        };
+
         match *self {
             ColOrd::Bool(x) => ColumnGet::<bool>::get(x, idx0).cmp(&ColumnGet::get(x, idx1)),
             ColOrd::I8(x) => ColumnGet::<i8>::get(x, idx0).cmp(&ColumnGet::get(x, idx1)),
@@ -147,9 +154,9 @@ impl<'a> ColsOrd<'a> {
         }
     }
 
-    fn cmp(&self, idx0: usize, idx1: usize) -> Ordering {
-        for col in self.cols.iter() {
-            let cmp = col.cmp(idx0, idx1);
+    fn cmp(&self, idx0: usize, other: &ColsOrd, idx1: usize) -> Ordering {
+        for (col0, col1) in self.cols.iter().zip(other.cols.iter()) {
+            let cmp = col0.cmp(idx0, &col1, idx1);
             if cmp != Ordering::Equal {
                 return cmp;
             }
@@ -180,9 +187,9 @@ impl<'a> PartialOrd for ColsOrdKey<'a> {
 
 impl<'a> Ord for ColsOrdKey<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Important! Make sure this is used correctly (only ColsOrdKeys issues by
+        // Important! Make sure this is used correctly (only ColsOrdKeys issued for the same schemas)
         #![allow(clippy::as_conversions)]
         assert_eq!(self.cols_ord as *const _, other.cols_ord as *const _);
-        self.cols_ord.cmp(self.idx, other.idx)
+        self.cols_ord.cmp(self.idx, &other.cols_ord, other.idx)
     }
 }

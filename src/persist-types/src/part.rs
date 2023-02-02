@@ -269,6 +269,28 @@ impl Part {
         (mins, maxs)
     }
 
+    pub fn sortable_columns(&self) -> (ColsOrd<'_>, ColsOrd<'_>, ColsOrd<'_>) {
+        let key_cols = self
+            .key
+            .iter()
+            .map(|(_, x)| x.to_col_ord())
+            .collect::<Vec<_>>();
+        let key_cols = ColsOrd::new(&key_cols);
+        let val_cols = self
+            .val
+            .iter()
+            .map(|(_, x)| x.to_col_ord())
+            .collect::<Vec<_>>();
+        let val_cols = ColsOrd::new(&val_cols);
+        let ts_col = [ColOrd::I64(&self.ts)];
+        let ts_col = ColsOrd::new(&ts_col);
+
+        // create an iter helper that takes in the 3 ColsOrd
+        // peeks the top elem,
+
+        (key_cols, val_cols, ts_col)
+    }
+
     /// Returns a sorted and consolidated copy of this Part.
     ///
     /// This is a full deep clone of the data. Sort ordering is `(K, V, T, D)`
@@ -843,6 +865,52 @@ mod tests {
 
         assert!(is_send_sync::<Part>(PhantomData));
         assert!(is_send_sync::<PartBuilder>(PhantomData));
+    }
+
+    #[test]
+    fn part_cmp() -> Result<(), String> {
+        let key_schema = StringSchema::default();
+        let val_schema = StringSchema::default();
+        let mut part_one = PartBuilder::new(&key_schema, &val_schema);
+        {
+            let (keys, vals, mut ts_diff) = part_one.mut_handles();
+            let mut keys = key_schema.encoder(keys).unwrap();
+            let mut vals = val_schema.encoder(vals).unwrap();
+            keys.encode(&"a".to_string());
+            keys.encode(&"b".to_string());
+            keys.encode(&"c".to_string());
+
+            vals.encode(&"1".to_string());
+            vals.encode(&"2".to_string());
+            vals.encode(&"3".to_string());
+
+            ts_diff.push(1, 1);
+            ts_diff.push(1, 1);
+            ts_diff.push(1, 1);
+        }
+
+        let mut part_two = PartBuilder::new(&key_schema, &val_schema);
+        {
+            let (keys, vals, mut ts_diff) = part_two.mut_handles();
+            let mut keys = key_schema.encoder(keys).unwrap();
+            let mut vals = val_schema.encoder(vals).unwrap();
+            keys.encode(&"b".to_string());
+            keys.encode(&"c".to_string());
+            keys.encode(&"d".to_string());
+
+            vals.encode(&"2".to_string());
+            vals.encode(&"3".to_string());
+            vals.encode(&"4".to_string());
+
+            ts_diff.push(1, 1);
+            ts_diff.push(1, 1);
+            ts_diff.push(1, 1);
+        }
+
+        let part_one = part_one.finish()?;
+        let part_two = part_two.finish()?;
+
+        Ok(())
     }
 
     #[test]

@@ -487,6 +487,8 @@ impl<K: Codec, V: Codec, T, D> FetchedPart<K, V, T, D> {
             _phantom: PhantomData::default(),
         }
     }
+
+    pub fn next(&mut self, k: &mut K, v: &mut V) -> Option<(K, V, T, D)> {}
 }
 
 impl<K: Codec, V: Codec, T: Clone, D> Clone for FetchedPart<K, V, T, D> {
@@ -662,7 +664,12 @@ where
                 }
                 needs_truncation
             }
-            WrittenPart::Arrow(_) => false,
+            WrittenPart::Arrow(_) => {
+                // WIP: we need to write an inline descriptions into Part, or some wrapper type.
+                // should be able to do something similar to BlobTraceBatchPart where we serialize
+                // a metadata key in
+                false
+            }
         };
 
         EncodedPart {

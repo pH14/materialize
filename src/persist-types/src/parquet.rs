@@ -19,7 +19,7 @@ use anyhow::anyhow;
 use arrow2::datatypes::Schema as ArrowSchema;
 use arrow2::io::parquet::read::{infer_schema, read_metadata, FileReader};
 use arrow2::io::parquet::write::{
-    CompressionOptions, FileWriter, RowGroupIterator, Version, WriteOptions,
+    CompressionOptions, FileWriter, KeyValue, RowGroupIterator, Version, WriteOptions,
 };
 
 use crate::codec_impls::UnitSchema;
