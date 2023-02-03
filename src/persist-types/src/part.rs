@@ -269,28 +269,6 @@ impl Part {
         (mins, maxs)
     }
 
-    pub fn sortable_columns(&self) -> (ColsOrd<'_>, ColsOrd<'_>, ColsOrd<'_>) {
-        let key_cols = self
-            .key
-            .iter()
-            .map(|(_, x)| x.to_col_ord())
-            .collect::<Vec<_>>();
-        let key_cols = ColsOrd::new(&key_cols);
-        let val_cols = self
-            .val
-            .iter()
-            .map(|(_, x)| x.to_col_ord())
-            .collect::<Vec<_>>();
-        let val_cols = ColsOrd::new(&val_cols);
-        let ts_col = [ColOrd::I64(&self.ts)];
-        let ts_col = ColsOrd::new(&ts_col);
-
-        // create an iter helper that takes in the 3 ColsOrd
-        // peeks the top elem,
-
-        (key_cols, val_cols, ts_col)
-    }
-
     /// Returns a sorted and consolidated copy of this Part.
     ///
     /// This is a full deep clone of the data. Sort ordering is `(K, V, T, D)`

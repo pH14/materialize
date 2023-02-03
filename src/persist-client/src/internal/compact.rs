@@ -672,12 +672,6 @@ where
                 timings.part_fetching += start.elapsed();
                 let start = Instant::now();
 
-                // let mut fetched_part = FetchedPart {
-                //     metrics: Arc::clone(&metrics),
-                //     ts_filter:
-                //
-                // }
-
                 while let Some((k, v, mut t, d)) = part.next() {
                     t.advance_by(desc.since().borrow());
                     let d = D::decode(d);

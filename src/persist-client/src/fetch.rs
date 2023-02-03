@@ -681,6 +681,15 @@ where
         }
     }
 
+    // WIP: I think the rough idea we want here is for EncodedPart to have a corresponding iterator
+    // type that returns Ord keys over its data. For the existing encoding it'd be (&[u8], &[u8], T, [u8;8])
+    // as we currently have, and for the new encoding it'd be something like a ColsOrdKey. This way
+    // compaction can track each encoded part in a heap, without needing to decode the data itself.
+    // The keys could then be exchangeable for the underlying data, which when passed a K/V codec
+    // and schema should be able to return a (K, V, T, D).
+    //
+    // FetchedPart's iterator would be something like next(&self, &mut K, &mut V, &K::Schema, &V::Schema)
+    // calling the EncodedPart's iterator and exchanging/then decoding each key into its decoded types
     pub fn next<'a>(&'a mut self) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
         match &mut self.part {
             WrittenPart::Row(part) => {
