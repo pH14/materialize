@@ -43,7 +43,7 @@ use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::write::WriteHandle;
 use mz_persist_types::{Codec, Codec64};
 use mz_proto::{IntoRustIfSome, ProtoMapEntry, ProtoType, RustType, TryFromProtoError};
-use mz_repr::adt::numeric::{Numeric, NumericMaxScale};
+use mz_repr::adt::numeric::{Numeric, NumericMaxScale, NUMERIC_DATUM_WIDTH_USIZE};
 use mz_repr::{ColumnType, Datum, Diff, GlobalId, RelationDesc, RelationType, Row, ScalarType};
 use mz_timely_util::order::{Interval, Partitioned, RangeBound};
 
@@ -2562,7 +2562,7 @@ enum DatumEncoder<'a> {
     U32Opt(&'a mut <Option<u32> as Data>::Mut),
     U64(&'a mut <u64 as Data>::Mut),
     U64Opt(&'a mut <Option<u64> as Data>::Mut),
-    // Numeric(&'a mut <Vec<u8> as Data>::Mut),
+    Numeric(&'a mut <Vec<u8> as Data>::Mut),
     String(&'a mut <String as Data>::Mut),
     StringOpt(&'a mut <Option<String> as Data>::Mut),
 }
@@ -2635,6 +2635,18 @@ impl<'a> DatumEncoder<'a> {
             } else {
                 Some(datum.unwrap_uint64())
             }),
+            DatumEncoder::Numeric(col) => {
+                let mut x = datum.unwrap_numeric();
+                let (digits, exponent, bits, lsu) = x.0.to_raw_parts();
+                let mut v = Vec::with_capacity(4 + 4 + 1 + 13);
+                v.extend_from_slice(&digits.to_le_bytes());
+                v.extend_from_slice(&exponent.to_le_bytes());
+                v.push(bits);
+                for x in lsu {
+                    v.extend_from_slice(&x.to_le_bytes());
+                }
+                col.push(Some(v));
+            }
             DatumEncoder::String(col) => {
                 let x = match datum {
                     Datum::String(x) => x,
@@ -2683,7 +2695,7 @@ enum DatumDecoder<'a> {
     U32Opt(&'a <Option<u32> as Data>::Col),
     U64(&'a <u64 as Data>::Col),
     U64Opt(&'a <Option<u64> as Data>::Col),
-    // Numeric(&'a <Vec<u8> as Data>::Col),
+    Numeric(&'a <Vec<u8> as Data>::Col),
     String(&'a <String as Data>::Col),
     StringOpt(&'a <Option<String> as Data>::Col),
 }
@@ -2705,7 +2717,31 @@ impl<'a> DatumDecoder<'a> {
             DatumDecoder::U32Opt(col) => Datum::from(col.get(idx)),
             DatumDecoder::U64(col) => Datum::from(col.get(idx)),
             DatumDecoder::U64Opt(col) => Datum::from(col.get(idx)),
-            // DatumDecoder::Numeric(col) => Datum::from(col.get(idx)),
+            DatumDecoder::Numeric(col) => {
+                let x = ColumnGet::<Vec<u8>>::get(*col, idx);
+                let digits = u32::from_le_bytes(<[u8; 4]>::try_from(&x[0..4]).expect("4 bytes"));
+                let exponent = i32::from_le_bytes(<[u8; 4]>::try_from(&x[4..8]).expect("4 bytes"));
+                let bits = x[8];
+                let mut lsu: [u16; NUMERIC_DATUM_WIDTH_USIZE] = [0; NUMERIC_DATUM_WIDTH_USIZE];
+                // WIP: this is obviously jank
+                lsu[0] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[9..11]).expect("2 bytes"));
+                lsu[1] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[11..13]).expect("2 bytes"));
+                lsu[2] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[13..15]).expect("2 bytes"));
+                lsu[3] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[15..17]).expect("2 bytes"));
+                lsu[4] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[17..19]).expect("2 bytes"));
+                lsu[5] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[19..21]).expect("2 bytes"));
+                lsu[6] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[21..23]).expect("2 bytes"));
+                lsu[7] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[23..25]).expect("2 bytes"));
+                lsu[8] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[25..27]).expect("2 bytes"));
+                lsu[9] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[27..29]).expect("2 bytes"));
+                lsu[10] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[29..31]).expect("2 bytes"));
+                lsu[11] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[31..33]).expect("2 bytes"));
+                lsu[12] = u16::from_le_bytes(<[u8; 2]>::try_from(&x[33..35]).expect("2 bytes"));
+
+                Datum::Numeric(OrderedDecimal(Numeric::from_raw_parts(
+                    digits, exponent, bits, lsu,
+                )))
+            }
             DatumDecoder::String(col) => Datum::from(ColumnGet::<String>::get(*col, idx)),
             DatumDecoder::StringOpt(col) => {
                 Datum::from(ColumnGet::<Option<String>>::get(*col, idx))
@@ -2808,9 +2844,9 @@ impl Schema<SourceData> for RelationDesc {
                         part.col::<Option<u64>>(name.as_str())?,
                     ));
                 }
-                // (false, ScalarType::Numeric { .. }) => {
-                //     decoders.push(DatumDecoder::U64(part.col::<u64>(name.as_str())?));
-                // }
+                (_, ScalarType::Numeric { .. }) => {
+                    decoders.push(DatumDecoder::Numeric(part.col::<Vec<u8>>(name.as_str())?));
+                }
                 (false, ScalarType::String) => {
                     decoders.push(DatumDecoder::String(part.col::<String>(name.as_str())?));
                 }
@@ -2888,6 +2924,10 @@ impl Schema<SourceData> for RelationDesc {
                     encoders.push(DatumEncoder::U64Opt(
                         part.col::<Option<u64>>(name.as_str())?,
                     ));
+                }
+                // WIP: optional
+                (_, ScalarType::Numeric { .. }) => {
+                    encoders.push(DatumEncoder::Numeric(part.col::<Vec<u8>>(name.as_str())?));
                 }
                 (false, ScalarType::String) => {
                     encoders.push(DatumEncoder::String(part.col::<String>(name.as_str())?));
