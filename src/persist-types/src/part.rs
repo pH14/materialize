@@ -481,6 +481,29 @@ impl PartBuilder {
         (keys, vals, ts_diff)
     }
 
+    // WIP: we may not want this
+    pub fn push_part(&mut self, src: &Part, t: i64) {
+        assert_eq!(src.key.len(), self.key.len());
+        assert_eq!(src.val.len(), self.val.len());
+        let len = src.len();
+
+        for ((_, src), (_, dst)) in src.key.iter().zip(self.key.iter_mut()) {
+            for i in 0..len {
+                dst.push_from(src, i).expect("bounds were checked");
+            }
+        }
+        for ((_, src), (_, dst)) in src.val.iter().zip(self.val.iter_mut()) {
+            for i in 0..len {
+                dst.push_from(src, i).expect("bounds were checked");
+            }
+        }
+
+        for i in 0..len {
+            self.ts.push(i64::max(t, src.ts.get(i)));
+            self.diff.push(src.diff.get(i));
+        }
+    }
+
     /// Pushes from the source, using `indices` to specify each column's value.
     pub fn push_from(
         &mut self,
@@ -503,7 +526,9 @@ impl PartBuilder {
 
         assert_eq!(i, indices.len());
         self.ts.push(ts);
-        self.diff.push(ts);
+        // WIP: one horrible idea is to repurpose the diff col to be a validity bitmask over the
+        // columns to indicate which ones contain valid min/max values, if we want to pursue that
+        self.diff.push(diff);
         Ok(())
     }
 

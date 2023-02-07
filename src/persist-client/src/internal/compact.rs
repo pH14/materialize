@@ -27,17 +27,18 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot, TryAcquireError};
 use tokio::task::JoinHandle;
 use tracing::log::warn;
-use tracing::{debug, debug_span, trace, Instrument, Span};
+use tracing::{debug, debug_span, info, trace, Instrument, Span};
 
 use mz_ore::cast::CastFrom;
 use mz_ore::task::spawn;
 use mz_persist::location::Blob;
 use mz_persist_types::codec_impls::VecU8Schema;
 use mz_persist_types::columnar::Schema;
+use mz_persist_types::part::PartBuilder;
 use mz_persist_types::{Codec, Codec64};
 
 use crate::async_runtime::CpuHeavyRuntime;
-use crate::batch::BatchBuilder;
+use crate::batch::{BatchBuilder, FilledPart};
 use crate::fetch::{fetch_batch_part, EncodedPart};
 use crate::internal::machine::{retry_external, Machine};
 use crate::internal::state::{HollowBatch, HollowBatchPart};
@@ -650,6 +651,44 @@ where
             .all(|(_, x)| x.iter().all(|x| x.is_prefetched()));
         if !all_prefetched {
             metrics.compaction.not_all_prefetched.inc();
+        }
+
+        let should_use_arrow = key_schema.columns()[0].0.starts_with("arrow_");
+
+        if should_use_arrow {
+            let mut part_builder = PartBuilder::new(key_schema.as_ref(), val_schema.as_ref());
+            let t = i64::decode(T::encode(desc.since().get(0).expect("WIP")));
+            info!(
+                "{}: Arrow compaction with t={}, num parts={}",
+                shard_id,
+                t,
+                runs.iter().map(|(_x, y)| y.len()).sum::<usize>()
+            );
+
+            for (part_desc, mut parts) in runs.into_iter() {
+                while let Some(part) = parts.pop_front() {
+                    let part = part
+                        .join::<K, V>(
+                            shard_id,
+                            blob.as_ref(),
+                            &metrics,
+                            part_desc,
+                            key_schema.clone(),
+                            val_schema.clone(),
+                        )
+                        .await?;
+                    let part = part.get_arrow();
+                    part_builder.push_part(&part, t);
+                }
+            }
+
+            let part = part_builder.finish().expect("WIP");
+            batch.write_part(FilledPart::Arrow(part)).await;
+
+            let batch = batch.finish(desc.upper().clone()).await?;
+            let hollow_batch = batch.into_hollow_batch();
+
+            return Ok(hollow_batch);
         }
 
         // populate our heap with the updates from the first part of each run

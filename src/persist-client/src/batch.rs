@@ -187,9 +187,18 @@ pub enum Added {
     RecordAndParts,
 }
 
-pub(crate) enum FilledPart {
+pub enum FilledPart {
     Row(ColumnarRecords),
     Arrow(Part),
+}
+
+impl FilledPart {
+    pub fn len(&self) -> usize {
+        match self {
+            FilledPart::Row(row) => row.len(),
+            FilledPart::Arrow(arrow) => arrow.len(),
+        }
+    }
 }
 
 /// A builder for [Batches](Batch) that allows adding updates piece by piece and
@@ -296,6 +305,14 @@ where
             v_schema,
             _phantom: PhantomData,
         }
+    }
+
+    pub async fn write_part(&mut self, part: FilledPart) {
+        self.num_updates += part.len();
+        self.parts
+            .write(part, self.inline_upper.clone(), self.since.clone())
+            .await;
+        self.parts_written += 1;
     }
 
     /// Finish writing this batch and return a handle to the written batch.

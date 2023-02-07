@@ -487,8 +487,6 @@ impl<K: Codec, V: Codec, T, D> FetchedPart<K, V, T, D> {
             _phantom: PhantomData::default(),
         }
     }
-
-    pub fn next(&mut self, k: &mut K, v: &mut V) -> Option<(K, V, T, D)> {}
 }
 
 impl<K: Codec, V: Codec, T: Clone, D> Clone for FetchedPart<K, V, T, D> {
@@ -528,7 +526,7 @@ where
 
         loop {
             let WrittenPart::Arrow(part) = &mut self.part.part else {
-                info!("Part is not Arrow formatted: {:?}", self.part.part);
+                // info!("Part is not Arrow formatted: {:?}", self.part.part);
                 return None;
             };
             let mut k = K::default();
@@ -537,6 +535,13 @@ where
             if self.part.idx == part.len() {
                 info!("Part idx {} part len {}", self.part.idx, part.len());
                 return None;
+            }
+
+            let mut t = T::decode(i64::encode(part.ts_ref().get(self.part.idx).expect("WIP")));
+            if !self.ts_filter.filter_ts(&mut t) {
+                // WIP: still awful
+                self.part.idx += 1;
+                continue;
             }
 
             // WIP: could potentially push a Project into the decoder, to ignore certain cols
@@ -548,10 +553,10 @@ where
                 .decoder(part.val_ref())
                 .expect("WIP")
                 .decode(self.part.idx, &mut v);
-            let t = T::decode(i64::encode(part.ts_ref().get(self.part.idx).expect("WIP")));
             let d = D::decode(i64::encode(
                 part.diff_ref().get(self.part.idx).expect("WIP"),
             ));
+
             // WIP: this is awful
             self.part.idx += 1;
 
@@ -678,6 +683,13 @@ where
             part_idx: 0,
             idx: 0,
             needs_truncation,
+        }
+    }
+
+    pub fn get_arrow(self) -> Part {
+        match self.part {
+            WrittenPart::Row(_) => panic!("should not fetch row-based format"),
+            WrittenPart::Arrow(part) => part,
         }
     }
 
