@@ -2550,6 +2550,19 @@ impl Codec for SourceData {
 enum DatumEncoder<'a> {
     Bool(&'a mut <bool as Data>::Mut),
     BoolOpt(&'a mut <Option<bool> as Data>::Mut),
+    I16(&'a mut <i16 as Data>::Mut),
+    I16Opt(&'a mut <Option<i16> as Data>::Mut),
+    I32(&'a mut <i32 as Data>::Mut),
+    I32Opt(&'a mut <Option<i32> as Data>::Mut),
+    I64(&'a mut <i64 as Data>::Mut),
+    I64Opt(&'a mut <Option<i64> as Data>::Mut),
+    U16(&'a mut <u16 as Data>::Mut),
+    U16Opt(&'a mut <Option<u16> as Data>::Mut),
+    U32(&'a mut <u32 as Data>::Mut),
+    U32Opt(&'a mut <Option<u32> as Data>::Mut),
+    U64(&'a mut <u64 as Data>::Mut),
+    U64Opt(&'a mut <Option<u64> as Data>::Mut),
+    // Numeric(&'a mut <Vec<u8> as Data>::Mut),
     String(&'a mut <String as Data>::Mut),
     StringOpt(&'a mut <Option<String> as Data>::Mut),
 }
@@ -2574,6 +2587,54 @@ impl<'a> DatumEncoder<'a> {
                 };
                 col.push(x)
             }
+            DatumEncoder::I16(col) => {
+                col.push(datum.unwrap_int16());
+            }
+            DatumEncoder::I16Opt(col) => col.push(if datum.is_null() {
+                None
+            } else {
+                Some(datum.unwrap_int16())
+            }),
+            DatumEncoder::I32(col) => {
+                col.push(datum.unwrap_int32());
+            }
+            DatumEncoder::I32Opt(col) => col.push(if datum.is_null() {
+                None
+            } else {
+                Some(datum.unwrap_int32())
+            }),
+            DatumEncoder::I64(col) => {
+                col.push(datum.unwrap_int64());
+            }
+            DatumEncoder::I64Opt(col) => col.push(if datum.is_null() {
+                None
+            } else {
+                Some(datum.unwrap_int64())
+            }),
+            DatumEncoder::U16(col) => {
+                col.push(datum.unwrap_uint16());
+            }
+            DatumEncoder::U16Opt(col) => col.push(if datum.is_null() {
+                None
+            } else {
+                Some(datum.unwrap_uint16())
+            }),
+            DatumEncoder::U32(col) => {
+                col.push(datum.unwrap_uint32());
+            }
+            DatumEncoder::U32Opt(col) => col.push(if datum.is_null() {
+                None
+            } else {
+                Some(datum.unwrap_uint32())
+            }),
+            DatumEncoder::U64(col) => {
+                col.push(datum.unwrap_uint64());
+            }
+            DatumEncoder::U64Opt(col) => col.push(if datum.is_null() {
+                None
+            } else {
+                Some(datum.unwrap_uint64())
+            }),
             DatumEncoder::String(col) => {
                 let x = match datum {
                     Datum::String(x) => x,
@@ -2610,6 +2671,19 @@ impl<'a> mz_persist_types::columnar::PartEncoder<'a, SourceData> for RowEncoder<
 enum DatumDecoder<'a> {
     Bool(&'a <bool as Data>::Col),
     BoolOpt(&'a <Option<bool> as Data>::Col),
+    I16(&'a <i16 as Data>::Col),
+    I16Opt(&'a <Option<i16> as Data>::Col),
+    I32(&'a <i32 as Data>::Col),
+    I32Opt(&'a <Option<i32> as Data>::Col),
+    I64(&'a <i64 as Data>::Col),
+    I64Opt(&'a <Option<i64> as Data>::Col),
+    U16(&'a <u16 as Data>::Col),
+    U16Opt(&'a <Option<u16> as Data>::Col),
+    U32(&'a <u32 as Data>::Col),
+    U32Opt(&'a <Option<u32> as Data>::Col),
+    U64(&'a <u64 as Data>::Col),
+    U64Opt(&'a <Option<u64> as Data>::Col),
+    // Numeric(&'a <Vec<u8> as Data>::Col),
     String(&'a <String as Data>::Col),
     StringOpt(&'a <Option<String> as Data>::Col),
 }
@@ -2619,6 +2693,19 @@ impl<'a> DatumDecoder<'a> {
         match self {
             DatumDecoder::Bool(col) => Datum::from(col.get(idx)),
             DatumDecoder::BoolOpt(col) => Datum::from(col.get(idx)),
+            DatumDecoder::I16(col) => Datum::from(col.get(idx)),
+            DatumDecoder::I16Opt(col) => Datum::from(col.get(idx)),
+            DatumDecoder::I32(col) => Datum::from(col.get(idx)),
+            DatumDecoder::I32Opt(col) => Datum::from(col.get(idx)),
+            DatumDecoder::I64(col) => Datum::from(col.get(idx)),
+            DatumDecoder::I64Opt(col) => Datum::from(col.get(idx)),
+            DatumDecoder::U16(col) => Datum::from(col.get(idx)),
+            DatumDecoder::U16Opt(col) => Datum::from(col.get(idx)),
+            DatumDecoder::U32(col) => Datum::from(col.get(idx)),
+            DatumDecoder::U32Opt(col) => Datum::from(col.get(idx)),
+            DatumDecoder::U64(col) => Datum::from(col.get(idx)),
+            DatumDecoder::U64Opt(col) => Datum::from(col.get(idx)),
+            // DatumDecoder::Numeric(col) => Datum::from(col.get(idx)),
             DatumDecoder::String(col) => Datum::from(ColumnGet::<String>::get(*col, idx)),
             DatumDecoder::StringOpt(col) => {
                 Datum::from(ColumnGet::<Option<String>>::get(*col, idx))
@@ -2673,6 +2760,57 @@ impl Schema<SourceData> for RelationDesc {
                         part.col::<Option<bool>>(name.as_str())?,
                     ));
                 }
+                (false, ScalarType::Int16) => {
+                    decoders.push(DatumDecoder::I16(part.col::<i16>(name.as_str())?));
+                }
+                (true, ScalarType::Int16) => {
+                    decoders.push(DatumDecoder::I16Opt(
+                        part.col::<Option<i16>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::Int32) => {
+                    decoders.push(DatumDecoder::I32(part.col::<i32>(name.as_str())?));
+                }
+                (true, ScalarType::Int32) => {
+                    decoders.push(DatumDecoder::I32Opt(
+                        part.col::<Option<i32>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::Int64) => {
+                    decoders.push(DatumDecoder::I64(part.col::<i64>(name.as_str())?));
+                }
+                (true, ScalarType::Int64) => {
+                    decoders.push(DatumDecoder::I64Opt(
+                        part.col::<Option<i64>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::UInt16) => {
+                    decoders.push(DatumDecoder::U16(part.col::<u16>(name.as_str())?));
+                }
+                (true, ScalarType::UInt16) => {
+                    decoders.push(DatumDecoder::U16Opt(
+                        part.col::<Option<u16>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::UInt32) => {
+                    decoders.push(DatumDecoder::U32(part.col::<u32>(name.as_str())?));
+                }
+                (true, ScalarType::UInt32) => {
+                    decoders.push(DatumDecoder::U32Opt(
+                        part.col::<Option<u32>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::UInt64) => {
+                    decoders.push(DatumDecoder::U64(part.col::<u64>(name.as_str())?));
+                }
+                (true, ScalarType::UInt64) => {
+                    decoders.push(DatumDecoder::U64Opt(
+                        part.col::<Option<u64>>(name.as_str())?,
+                    ));
+                }
+                // (false, ScalarType::Numeric { .. }) => {
+                //     decoders.push(DatumDecoder::U64(part.col::<u64>(name.as_str())?));
+                // }
                 (false, ScalarType::String) => {
                     decoders.push(DatumDecoder::String(part.col::<String>(name.as_str())?));
                 }
@@ -2681,7 +2819,7 @@ impl Schema<SourceData> for RelationDesc {
                         part.col::<Option<String>>(name.as_str())?,
                     ));
                 }
-                _ => panic!("TODO: finish implementing all the Datum variants"),
+                _ => panic!("TODO: finish implementing all the Datum variants."),
             };
         }
         let () = part.finish()?;
@@ -2701,6 +2839,54 @@ impl Schema<SourceData> for RelationDesc {
                 (true, ScalarType::Bool) => {
                     encoders.push(DatumEncoder::BoolOpt(
                         part.col::<Option<bool>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::Int16) => {
+                    encoders.push(DatumEncoder::I16(part.col::<i16>(name.as_str())?));
+                }
+                (true, ScalarType::Int16) => {
+                    encoders.push(DatumEncoder::I16Opt(
+                        part.col::<Option<i16>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::Int32) => {
+                    encoders.push(DatumEncoder::I32(part.col::<i32>(name.as_str())?));
+                }
+                (true, ScalarType::Int32) => {
+                    encoders.push(DatumEncoder::I32Opt(
+                        part.col::<Option<i32>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::Int64) => {
+                    encoders.push(DatumEncoder::I64(part.col::<i64>(name.as_str())?));
+                }
+                (true, ScalarType::Int64) => {
+                    encoders.push(DatumEncoder::I64Opt(
+                        part.col::<Option<i64>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::UInt16) => {
+                    encoders.push(DatumEncoder::U16(part.col::<u16>(name.as_str())?));
+                }
+                (true, ScalarType::UInt16) => {
+                    encoders.push(DatumEncoder::U16Opt(
+                        part.col::<Option<u16>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::UInt32) => {
+                    encoders.push(DatumEncoder::U32(part.col::<u32>(name.as_str())?));
+                }
+                (true, ScalarType::UInt32) => {
+                    encoders.push(DatumEncoder::U32Opt(
+                        part.col::<Option<u32>>(name.as_str())?,
+                    ));
+                }
+                (false, ScalarType::UInt64) => {
+                    encoders.push(DatumEncoder::U64(part.col::<u64>(name.as_str())?));
+                }
+                (true, ScalarType::UInt64) => {
+                    encoders.push(DatumEncoder::U64Opt(
+                        part.col::<Option<u64>>(name.as_str())?,
                     ));
                 }
                 (false, ScalarType::String) => {
