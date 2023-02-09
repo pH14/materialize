@@ -2578,7 +2578,22 @@ impl<'a> DatumEncoder<'a> {
     fn encode(&mut self, datum: Datum) {
         match self {
             DatumEncoder::List(encoders) => {
-                for (datum, encoder) in datum.unwrap_list().iter().zip(encoders) {
+                if datum.is_null() {
+                    encoders[0].encode(Datum::False);
+                    for encoder in &mut encoders[1..] {
+                        encoder.encode(Datum::Null);
+                    }
+                    return;
+                }
+
+                // record is non-null
+                encoders[0].encode(Datum::True);
+
+                for (datum, encoder) in datum
+                    .unwrap_list()
+                    .iter()
+                    .zip(&mut encoders[1..].iter_mut())
+                {
                     encoder.encode(datum);
                 }
             }
@@ -2738,13 +2753,21 @@ impl<'a> DatumDecoder<'a> {
     fn decode<'d>(&'d self, idx: usize, temp_storage: &'d RowArena) -> Datum<'d> {
         match self {
             DatumDecoder::List(decoders) => {
+                let has_value = decoders[0].decode(idx, temp_storage).unwrap_bool();
+
                 let mut datums = vec![];
-                for decoder in decoders {
+                for decoder in &decoders[1..] {
                     datums.push(decoder.decode(idx, temp_storage));
                 }
-                temp_storage.make_datum(|packer| {
+                let datum = temp_storage.make_datum(|packer| {
                     packer.push_list(datums);
-                })
+                });
+
+                if has_value {
+                    datum
+                } else {
+                    Datum::Null
+                }
             }
             DatumDecoder::Bool(col) => Datum::from(col.get(idx)),
             DatumDecoder::BoolOpt(col) => Datum::from(col.get(idx)),
@@ -2836,6 +2859,12 @@ impl<'a> mz_persist_types::columnar::PartDecoder<'a, SourceData> for SourceDataD
     }
 }
 
+const STRUCT_NULLABILITY: &str = "mz_internal_super_secret_struct_nullability";
+const STRUCT_NULLABILITY_DATA_TYPE: mz_persist_types::columnar::DataType =
+    mz_persist_types::columnar::DataType {
+        optional: false,
+        format: mz_persist_types::columnar::ColumnFormat::Bool,
+    };
 const SOURCE_DATA_ERROR: &str = "mz_internal_super_secret_source_data_errors";
 
 impl Schema<SourceData> for RelationDesc {
@@ -2854,6 +2883,12 @@ impl Schema<SourceData> for RelationDesc {
         ) {
             match &typ.scalar_type {
                 ScalarType::Record { fields, .. } => {
+                    // we add an nullability bitmap for each record type, to differentiate
+                    // a null struct vs a struct with all null values
+                    cols.push((
+                        format!("{}:{}", STRUCT_NULLABILITY, *name),
+                        STRUCT_NULLABILITY_DATA_TYPE.clone(),
+                    ));
                     for (inner_name, inner_typ) in fields {
                         add_data_type(
                             cols,
@@ -2897,6 +2932,9 @@ impl Schema<SourceData> for RelationDesc {
             match &typ.scalar_type {
                 ScalarType::Record { fields, .. } => {
                     let mut inner_decoders = vec![];
+                    inner_decoders.push(DatumDecoder::Bool(
+                        part.col::<bool>(&format!("{}:{}", STRUCT_NULLABILITY, name))?,
+                    ));
                     for (inner_name, inner_type) in fields {
                         let new_name = ColumnName::from(format!("{}:{}", name, inner_name));
                         add_decoder(&mut inner_decoders, &new_name, inner_type, part)?;
@@ -2979,6 +3017,9 @@ impl Schema<SourceData> for RelationDesc {
             match &typ.scalar_type {
                 ScalarType::Record { fields, .. } => {
                     let mut inner_encoders = vec![];
+                    inner_encoders.push(DatumEncoder::Bool(
+                        part.col::<bool>(&format!("{}:{}", STRUCT_NULLABILITY, name))?,
+                    ));
                     for (inner_name, inner_type) in fields {
                         let new_name = ColumnName::from(format!("{}:{}", name, inner_name));
                         add_encoder(&mut inner_encoders, &new_name, inner_type, part)?;
