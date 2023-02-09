@@ -37,7 +37,8 @@ pub struct Part {
 impl Part {
     /// The number of updates contained.
     pub fn len(&self) -> usize {
-        debug_assert_eq!(self.validate(), Ok(()));
+        // WIP: this can infinite loop since validate calls into len
+        // debug_assert_eq!(self.validate(), Ok(()));
         self.len
     }
 
@@ -585,10 +586,14 @@ impl DynColumnRef {
     }
 
     pub fn downcast<T: Data>(&self) -> Result<&T::Col, String> {
-        let col = self
-            .1
-            .downcast_ref::<T::Col>()
-            .ok_or_else(|| format!("expected {} col", std::any::type_name::<T::Col>()))?;
+        let self_str = format!("{:?}", self);
+        let col = self.1.downcast_ref::<T::Col>().ok_or_else(|| {
+            format!(
+                "expected {} col. {}",
+                std::any::type_name::<T::Col>(),
+                self_str
+            )
+        })?;
         Ok(col)
     }
 
@@ -701,10 +706,14 @@ impl DynColumnMut {
     }
 
     pub fn downcast<T: Data>(&mut self) -> Result<&mut T::Mut, String> {
-        let col = self
-            .1
-            .downcast_mut::<T::Mut>()
-            .ok_or_else(|| format!("expected {} col", std::any::type_name::<T::Col>()))?;
+        let self_str = format!("{:?}", self);
+        let col = self.1.downcast_mut::<T::Mut>().ok_or_else(|| {
+            format!(
+                "expected {} col. {}",
+                std::any::type_name::<T::Col>(),
+                self_str,
+            )
+        })?;
         Ok(col)
     }
 

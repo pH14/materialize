@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Add, AddAssign, Deref, DerefMut};
 use std::rc::Rc;
 use std::str::FromStr;
+use std::string::ToString;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,20 +38,25 @@ use timely::progress::{PathSummary, Timestamp};
 use timely::scheduling::ActivateOnDrop;
 use uuid::Uuid;
 
+use mz_expr::MirScalarExpr::Column;
 use mz_expr::{MirScalarExpr, PartitionId};
 use mz_ore::now::NowFn;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::write::WriteHandle;
+use mz_persist_types::parquet::validate_roundtrip;
 use mz_persist_types::{Codec, Codec64};
 use mz_proto::{IntoRustIfSome, ProtoMapEntry, ProtoType, RustType, TryFromProtoError};
 use mz_repr::adt::numeric::{Numeric, NumericMaxScale, NUMERIC_DATUM_WIDTH_USIZE};
-use mz_repr::{ColumnType, Datum, Diff, GlobalId, RelationDesc, RelationType, Row, ScalarType};
+use mz_repr::{
+    ColumnName, ColumnType, Datum, DatumList, Diff, GlobalId, RelationDesc, RelationType, Row,
+    RowArena, RowPacker, ScalarType,
+};
 use mz_timely_util::order::{Interval, Partitioned, RangeBound};
 
 use crate::controller::{CollectionMetadata, ResumptionFrontierCalculator};
 use crate::types::connections::aws::AwsConfig;
 use crate::types::connections::{KafkaConnection, PostgresConnection};
-use crate::types::errors::DataflowError;
+use crate::types::errors::{DataflowError, ProtoDataflowError};
 use crate::types::instances::StorageInstanceId;
 use crate::util::antichain::OffsetAntichain;
 
@@ -2565,11 +2571,17 @@ enum DatumEncoder<'a> {
     Numeric(&'a mut <Vec<u8> as Data>::Mut),
     String(&'a mut <String as Data>::Mut),
     StringOpt(&'a mut <Option<String> as Data>::Mut),
+    List(Vec<DatumEncoder<'a>>),
 }
 
 impl<'a> DatumEncoder<'a> {
     fn encode(&mut self, datum: Datum) {
         match self {
+            DatumEncoder::List(encoders) => {
+                for (datum, encoder) in datum.unwrap_list().iter().zip(encoders) {
+                    encoder.encode(datum);
+                }
+            }
             DatumEncoder::Bool(col) => {
                 let x = match datum {
                     Datum::True => true,
@@ -2668,14 +2680,35 @@ impl<'a> DatumEncoder<'a> {
 
 /// An implementation of [PartEncoder] for [Row].
 #[derive(Debug)]
-pub struct RowEncoder<'a>(Vec<DatumEncoder<'a>>);
+pub struct SourceDataEncoder<'a>(Vec<DatumEncoder<'a>>);
 
-impl<'a> mz_persist_types::columnar::PartEncoder<'a, SourceData> for RowEncoder<'a> {
+impl<'a> mz_persist_types::columnar::PartEncoder<'a, SourceData> for SourceDataEncoder<'a> {
     fn encode(&mut self, val: &SourceData) {
-        let val = val.as_ref().expect("WIP: no errors");
-        for (encoder, datum) in self.0.iter_mut().zip(val.iter()) {
-            encoder.encode(datum);
+        match val.as_ref() {
+            Ok(row) => {
+                for (encoder, datum) in self.0.iter_mut().zip(row.iter()) {
+                    encoder.encode(datum);
+                }
+                // last one for errors
+                self.0.last_mut().expect("WIP").encode(Datum::Null);
+            }
+            Err(err) => {
+                let last = self.0.len() - 1;
+                for (i, encoder) in self.0.iter_mut().enumerate() {
+                    if i < last {
+                        encoder.encode(Datum::Null);
+                    } else {
+                        let mut b = vec![];
+                        let _ = err.into_proto().encode(&mut b);
+                        encoder.encode(Datum::Bytes(&b));
+                    }
+                }
+            }
         }
+        // let val = val.as_ref().expect("WIP: no errors");
+        // for (encoder, datum) in self.0.iter_mut().zip(val.iter()) {
+        //     encoder.encode(datum);
+        // }
     }
 }
 
@@ -2698,11 +2731,21 @@ enum DatumDecoder<'a> {
     Numeric(&'a <Vec<u8> as Data>::Col),
     String(&'a <String as Data>::Col),
     StringOpt(&'a <Option<String> as Data>::Col),
+    List(Vec<DatumDecoder<'a>>),
 }
 
 impl<'a> DatumDecoder<'a> {
-    fn decode(&self, idx: usize) -> Datum<'a> {
+    fn decode<'d>(&'d self, idx: usize, temp_storage: &'d RowArena) -> Datum<'d> {
         match self {
+            DatumDecoder::List(decoders) => {
+                let mut datums = vec![];
+                for decoder in decoders {
+                    datums.push(decoder.decode(idx, temp_storage));
+                }
+                temp_storage.make_datum(|packer| {
+                    packer.push_list(datums);
+                })
+            }
             DatumDecoder::Bool(col) => Datum::from(col.get(idx)),
             DatumDecoder::BoolOpt(col) => Datum::from(col.get(idx)),
             DatumDecoder::I16(col) => Datum::from(col.get(idx)),
@@ -2752,33 +2795,91 @@ impl<'a> DatumDecoder<'a> {
 
 /// An implementation of [PartDecoder] for [Row].
 #[derive(Debug)]
-pub struct RowDecoder<'a>(Vec<DatumDecoder<'a>>);
+pub struct SourceDataDecoder<'a>(Vec<DatumDecoder<'a>>);
 
-impl<'a> mz_persist_types::columnar::PartDecoder<'a, SourceData> for RowDecoder<'a> {
+impl<'a> mz_persist_types::columnar::PartDecoder<'a, SourceData> for SourceDataDecoder<'a> {
+    // WIP: should this return a Result?
     fn decode(&self, idx: usize, val: &mut SourceData) {
+        let err_decoder = self.0.last().expect("WIP");
+        let temp_storage = RowArena::new();
+
+        match err_decoder.decode(idx, &temp_storage) {
+            Datum::Bytes(b) => {
+                let err: DataflowError = ProtoDataflowError::decode(b)
+                    .expect("WIP")
+                    .into_rust()
+                    .expect("WIP");
+                let x = SourceData(Err(err));
+                *val = x;
+
+                // maybe invariant check that all other cols are null here
+
+                return;
+            }
+            Datum::Null => {}
+            x @ _ => panic!("unknown error datum: {:?}", x),
+        }
+
         let mut val = val.as_mut().expect("WIP: no errors");
         let mut packer = val.packer();
-        for decoder in self.0.iter() {
-            packer.push(decoder.decode(idx));
+        let last = self.0.len() - 1;
+        for (i, decoder) in self.0.iter().enumerate() {
+            if i == last {
+                break;
+            }
+
+            // WIP: enrich with column information here `SourceDataDecoder(Vec<DatumDecoder>, Vec<Columns>)`
+            // and bubble up nullability violations
+
+            packer.push(decoder.decode(idx, &temp_storage));
         }
     }
 }
 
+const SOURCE_DATA_ERROR: &str = "mz_internal_super_secret_source_data_errors";
+
 impl Schema<SourceData> for RelationDesc {
-    type Encoder<'a> = RowEncoder<'a>;
-    type Decoder<'a> = RowDecoder<'a>;
+    type Encoder<'a> = SourceDataEncoder<'a>;
+    type Decoder<'a> = SourceDataDecoder<'a>;
 
     fn columns(&self) -> Vec<(String, mz_persist_types::columnar::DataType)> {
-        // WIP: no such thing as errors
-        self.iter()
-            .map(|(name, typ)| {
-                let data_type = mz_persist_types::columnar::DataType {
-                    optional: typ.nullable,
-                    format: mz_persist_types::columnar::ColumnFormat::from(&typ.scalar_type),
-                };
-                (name.as_str().to_owned(), data_type)
-            })
-            .collect()
+        let error_column = mz_persist_types::columnar::DataType {
+            optional: true,
+            format: mz_persist_types::columnar::ColumnFormat::String,
+        };
+
+        fn add_data_type(
+            cols: &mut Vec<(String, mz_persist_types::columnar::DataType)>,
+            (name, typ): (&ColumnName, &ColumnType),
+        ) {
+            match &typ.scalar_type {
+                ScalarType::Record { fields, .. } => {
+                    for (inner_name, inner_typ) in fields {
+                        add_data_type(
+                            cols,
+                            (
+                                &ColumnName::from(format!("{}:{}", name, inner_name)),
+                                inner_typ,
+                            ),
+                        );
+                    }
+                }
+                _ => {
+                    let data_type = mz_persist_types::columnar::DataType {
+                        optional: true,
+                        format: mz_persist_types::columnar::ColumnFormat::from(&typ.scalar_type),
+                    };
+                    cols.push((name.as_str().to_owned(), data_type))
+                }
+            }
+        }
+
+        let mut cols = vec![];
+        for field in self.iter() {
+            add_data_type(&mut cols, field);
+        }
+        cols.push((SOURCE_DATA_ERROR.to_string(), error_column));
+        cols
     }
 
     fn decoder<'a>(
@@ -2786,80 +2887,81 @@ impl Schema<SourceData> for RelationDesc {
         mut part: mz_persist_types::part::ColumnsRef<'a>,
     ) -> Result<Self::Decoder<'a>, String> {
         let mut decoders = Vec::new();
-        for (name, typ) in self.iter() {
-            match (typ.nullable, &typ.scalar_type) {
-                (false, ScalarType::Bool) => {
-                    decoders.push(DatumDecoder::Bool(part.col::<bool>(name.as_str())?));
+
+        fn add_decoder<'a>(
+            decoders: &mut Vec<DatumDecoder<'a>>,
+            name: &ColumnName,
+            typ: &ColumnType,
+            part: &mut mz_persist_types::part::ColumnsRef<'a>,
+        ) -> Result<(), String> {
+            match &typ.scalar_type {
+                ScalarType::Record { fields, .. } => {
+                    let mut inner_decoders = vec![];
+                    for (inner_name, inner_type) in fields {
+                        let new_name = ColumnName::from(format!("{}:{}", name, inner_name));
+                        add_decoder(&mut inner_decoders, &new_name, inner_type, part)?;
+                    }
+                    decoders.push(DatumDecoder::List(inner_decoders));
                 }
-                (true, ScalarType::Bool) => {
+                ScalarType::Bool => {
                     decoders.push(DatumDecoder::BoolOpt(
                         part.col::<Option<bool>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::Int16) => {
-                    decoders.push(DatumDecoder::I16(part.col::<i16>(name.as_str())?));
-                }
-                (true, ScalarType::Int16) => {
+                ScalarType::Int16 => {
                     decoders.push(DatumDecoder::I16Opt(
                         part.col::<Option<i16>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::Int32) => {
-                    decoders.push(DatumDecoder::I32(part.col::<i32>(name.as_str())?));
-                }
-                (true, ScalarType::Int32) => {
+                ScalarType::Int32 => {
                     decoders.push(DatumDecoder::I32Opt(
                         part.col::<Option<i32>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::Int64) => {
-                    decoders.push(DatumDecoder::I64(part.col::<i64>(name.as_str())?));
-                }
-                (true, ScalarType::Int64) => {
+                ScalarType::Int64 => {
                     decoders.push(DatumDecoder::I64Opt(
                         part.col::<Option<i64>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::UInt16) => {
-                    decoders.push(DatumDecoder::U16(part.col::<u16>(name.as_str())?));
-                }
-                (true, ScalarType::UInt16) => {
+                ScalarType::UInt16 => {
                     decoders.push(DatumDecoder::U16Opt(
                         part.col::<Option<u16>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::UInt32) => {
-                    decoders.push(DatumDecoder::U32(part.col::<u32>(name.as_str())?));
-                }
-                (true, ScalarType::UInt32) => {
+                ScalarType::UInt32 => {
                     decoders.push(DatumDecoder::U32Opt(
                         part.col::<Option<u32>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::UInt64) => {
-                    decoders.push(DatumDecoder::U64(part.col::<u64>(name.as_str())?));
-                }
-                (true, ScalarType::UInt64) => {
+                ScalarType::UInt64 => {
                     decoders.push(DatumDecoder::U64Opt(
                         part.col::<Option<u64>>(name.as_str())?,
                     ));
                 }
-                (_, ScalarType::Numeric { .. }) => {
+                ScalarType::Numeric { .. } => {
                     decoders.push(DatumDecoder::Numeric(part.col::<Vec<u8>>(name.as_str())?));
                 }
-                (false, ScalarType::String) => {
-                    decoders.push(DatumDecoder::String(part.col::<String>(name.as_str())?));
-                }
-                (true, ScalarType::String) => {
+                ScalarType::String => {
                     decoders.push(DatumDecoder::StringOpt(
                         part.col::<Option<String>>(name.as_str())?,
                     ));
                 }
                 _ => panic!("TODO: finish implementing all the Datum variants."),
             };
+            Ok(())
         }
+
+        for (name, typ) in self.iter() {
+            add_decoder(&mut decoders, name, typ, &mut part);
+        }
+
+        // Error column
+        decoders.push(DatumDecoder::StringOpt(
+            part.col::<Option<String>>(SOURCE_DATA_ERROR)?,
+        ));
+
         let () = part.finish()?;
-        Ok(RowDecoder(decoders))
+        Ok(SourceDataDecoder(decoders))
     }
 
     fn encoder<'a>(
@@ -2867,81 +2969,83 @@ impl Schema<SourceData> for RelationDesc {
         mut part: mz_persist_types::part::ColumnsMut<'a>,
     ) -> Result<Self::Encoder<'a>, String> {
         let mut encoders = Vec::new();
-        for (name, typ) in self.iter() {
-            match (typ.nullable, &typ.scalar_type) {
-                (false, ScalarType::Bool) => {
-                    encoders.push(DatumEncoder::Bool(part.col::<bool>(name.as_str())?));
+
+        fn add_encoder<'a>(
+            encoders: &mut Vec<DatumEncoder<'a>>,
+            name: &ColumnName,
+            typ: &ColumnType,
+            part: &mut mz_persist_types::part::ColumnsMut<'a>,
+        ) -> Result<(), String> {
+            match &typ.scalar_type {
+                ScalarType::Record { fields, .. } => {
+                    let mut inner_encoders = vec![];
+                    for (inner_name, inner_type) in fields {
+                        let new_name = ColumnName::from(format!("{}:{}", name, inner_name));
+                        add_encoder(&mut inner_encoders, &new_name, inner_type, part)?;
+                    }
+                    encoders.push(DatumEncoder::List(inner_encoders));
                 }
-                (true, ScalarType::Bool) => {
+                ScalarType::Bool => {
                     encoders.push(DatumEncoder::BoolOpt(
                         part.col::<Option<bool>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::Int16) => {
-                    encoders.push(DatumEncoder::I16(part.col::<i16>(name.as_str())?));
-                }
-                (true, ScalarType::Int16) => {
+                ScalarType::Int16 => {
                     encoders.push(DatumEncoder::I16Opt(
                         part.col::<Option<i16>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::Int32) => {
-                    encoders.push(DatumEncoder::I32(part.col::<i32>(name.as_str())?));
-                }
-                (true, ScalarType::Int32) => {
+                ScalarType::Int32 => {
                     encoders.push(DatumEncoder::I32Opt(
                         part.col::<Option<i32>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::Int64) => {
-                    encoders.push(DatumEncoder::I64(part.col::<i64>(name.as_str())?));
-                }
-                (true, ScalarType::Int64) => {
+                ScalarType::Int64 => {
                     encoders.push(DatumEncoder::I64Opt(
                         part.col::<Option<i64>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::UInt16) => {
-                    encoders.push(DatumEncoder::U16(part.col::<u16>(name.as_str())?));
-                }
-                (true, ScalarType::UInt16) => {
+                ScalarType::UInt16 => {
                     encoders.push(DatumEncoder::U16Opt(
                         part.col::<Option<u16>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::UInt32) => {
-                    encoders.push(DatumEncoder::U32(part.col::<u32>(name.as_str())?));
-                }
-                (true, ScalarType::UInt32) => {
+                ScalarType::UInt32 => {
                     encoders.push(DatumEncoder::U32Opt(
                         part.col::<Option<u32>>(name.as_str())?,
                     ));
                 }
-                (false, ScalarType::UInt64) => {
-                    encoders.push(DatumEncoder::U64(part.col::<u64>(name.as_str())?));
-                }
-                (true, ScalarType::UInt64) => {
+                ScalarType::UInt64 => {
                     encoders.push(DatumEncoder::U64Opt(
                         part.col::<Option<u64>>(name.as_str())?,
                     ));
                 }
                 // WIP: optional
-                (_, ScalarType::Numeric { .. }) => {
+                ScalarType::Numeric { .. } => {
                     encoders.push(DatumEncoder::Numeric(part.col::<Vec<u8>>(name.as_str())?));
                 }
-                (false, ScalarType::String) => {
-                    encoders.push(DatumEncoder::String(part.col::<String>(name.as_str())?));
-                }
-                (true, ScalarType::String) => {
+                ScalarType::String => {
                     encoders.push(DatumEncoder::StringOpt(
                         part.col::<Option<String>>(name.as_str())?,
                     ));
                 }
                 _ => panic!("TODO: finish implementing all the Datum variants"),
             }
+
+            Ok(())
         }
+
+        for (name, typ) in self.iter() {
+            add_encoder(&mut encoders, name, typ, &mut part)?;
+        }
+
+        // Error column
+        encoders.push(DatumEncoder::StringOpt(
+            part.col::<Option<String>>(SOURCE_DATA_ERROR)?,
+        ));
+
         let () = part.finish()?;
-        Ok(RowEncoder(encoders))
+        Ok(SourceDataEncoder(encoders))
     }
 }
 
@@ -2963,4 +3067,113 @@ fn test_timeline_parsing() {
     assert!("Umike".parse::<Timeline>().is_err());
     assert!("Dance".parse::<Timeline>().is_err());
     assert!("".parse::<Timeline>().is_err());
+}
+
+#[test]
+fn test_source_data_columnar() {
+    let mut row = Row::default();
+    let mut packer = row.packer();
+
+    packer.push(Datum::String("abc"));
+    packer.push(Datum::Null);
+    packer.push_list_with(|p| {
+        p.push(Datum::UInt64(1337));
+        p.push(Datum::True);
+        p.push_list_with(|p| {
+            p.push(Datum::Int16(i16::MIN));
+            p.push(Datum::Int16(i16::MIN + 1));
+            p.push(Datum::Int16(i16::MAX));
+            p.push(Datum::Int16(i16::MAX - 1));
+        })
+    });
+    packer.push(Datum::False);
+
+    let schema = RelationDesc::from_names_and_types(vec![
+        (
+            "a",
+            ColumnType {
+                nullable: false,
+                scalar_type: ScalarType::String,
+            },
+        ),
+        (
+            "b",
+            ColumnType {
+                nullable: false,
+                scalar_type: ScalarType::Bool,
+            },
+        ),
+        (
+            "c",
+            ColumnType {
+                nullable: true,
+                scalar_type: ScalarType::Record {
+                    fields: vec![
+                        (
+                            ColumnName::from("a"),
+                            ColumnType {
+                                nullable: true,
+                                scalar_type: ScalarType::UInt64,
+                            },
+                        ),
+                        (
+                            ColumnName::from("b"),
+                            ColumnType {
+                                nullable: false,
+                                scalar_type: ScalarType::Bool,
+                            },
+                        ),
+                        (
+                            ColumnName::from("c"),
+                            ColumnType {
+                                nullable: false,
+                                scalar_type: ScalarType::Record {
+                                    fields: vec![
+                                        (
+                                            ColumnName::from("1"),
+                                            ColumnType {
+                                                nullable: true,
+                                                scalar_type: ScalarType::Int16,
+                                            },
+                                        ),
+                                        (
+                                            ColumnName::from("2"),
+                                            ColumnType {
+                                                nullable: true,
+                                                scalar_type: ScalarType::Int16,
+                                            },
+                                        ),
+                                        (
+                                            ColumnName::from("3"),
+                                            ColumnType {
+                                                nullable: true,
+                                                scalar_type: ScalarType::Int16,
+                                            },
+                                        ),
+                                        (
+                                            ColumnName::from("4"),
+                                            ColumnType {
+                                                nullable: true,
+                                                scalar_type: ScalarType::Int16,
+                                            },
+                                        ),
+                                    ],
+                                    custom_id: None,
+                                },
+                            },
+                        ),
+                    ],
+                    custom_id: None,
+                },
+            },
+        ),
+        (
+            "a:a",
+            ColumnType {
+                nullable: true,
+                scalar_type: ScalarType::Bool,
+            },
+        ),
+    ]);
+    validate_roundtrip(&schema, &SourceData(Ok(row))).expect("WIP");
 }
