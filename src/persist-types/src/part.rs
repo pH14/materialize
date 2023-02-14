@@ -257,8 +257,14 @@ impl Part {
     pub fn minmax(&self) -> (Vec<usize>, Vec<usize>) {
         let mut mins = Vec::with_capacity(self.key.len());
         let mut maxs = Vec::with_capacity(self.val.len());
+        // WIP: if we push complexity into Schema, we may want to broaden the minmax
+        // calculation to take groupings of columns, so we can lexicographically sort
+        // subsets of columns that may be related (e.g. record fields) rather than
+        // finding the minmax of each column in isolation. There are also some cols
+        // that might not need anything (nullability of records).
         for (_name, col) in self.key.iter() {
             let (min, max) = col.to_col_ord().minmax(col.len());
+
             mins.push(min);
             maxs.push(max);
         }
@@ -628,6 +634,7 @@ impl DynColumnRef {
             (false, ColumnFormat::F64) => ColOrd::F64(self.expect_downcast::<f64>()),
             (false, ColumnFormat::Bytes) => ColOrd::Bytes(self.expect_downcast::<Vec<u8>>()),
             (false, ColumnFormat::String) => ColOrd::String(self.expect_downcast::<String>()),
+            (false, ColumnFormat::Numeric) => ColOrd::Bytes(self.expect_downcast::<String>()),
             (true, ColumnFormat::Bool) => ColOrd::OptBool(self.expect_downcast::<Option<bool>>()),
             (true, ColumnFormat::I8) => ColOrd::OptI8(self.expect_downcast::<Option<i8>>()),
             (true, ColumnFormat::I16) => ColOrd::OptI16(self.expect_downcast::<Option<i16>>()),
@@ -644,6 +651,9 @@ impl DynColumnRef {
             }
             (true, ColumnFormat::String) => {
                 ColOrd::OptString(self.expect_downcast::<Option<String>>())
+            }
+            (true, ColumnFormat::Numeric) => {
+                ColOrd::OptBytes(self.expect_downcast::<Option<Vec<u8>>>())
             }
         }
     }

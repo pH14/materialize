@@ -22,6 +22,7 @@ use arrow2::datatypes::DataType as ArrowLogicalType;
 use arrow2::io::parquet::write::Encoding;
 use arrow2::types::NativeType;
 use bytes::BufMut;
+use dec::{Decimal, OrderedDecimal};
 
 use crate::columnar::sealed::ColumnRef;
 use crate::columnar::{
@@ -327,6 +328,28 @@ data_primitive!(i32, ColumnFormat::I32);
 data_primitive!(i64, ColumnFormat::I64);
 data_primitive!(f32, ColumnFormat::F32);
 data_primitive!(f64, ColumnFormat::F64);
+
+impl Data for OrderedDecimal<Decimal<13>> {
+    const TYPE: DataType = DataType {
+        optional: false,
+        format: ColumnFormat::Bytes,
+    };
+    type Ref<'a> = &'a [u8];
+    type Col = BinaryArray<i32>;
+    type Mut = MutableBinaryArray<i32>;
+}
+
+impl ColumnGet<OrderedDecimal<dec::Decimal<13>>> for BinaryArray<i32> {
+    fn get<'a>(&'a self, idx: usize) -> &'a [u8] {
+        self.value(idx)
+    }
+}
+
+impl ColumnPush<OrderedDecimal<dec::Decimal<13>>> for MutableBinaryArray<i32> {
+    fn push<'a>(&mut self, val: &'a [u8]) {
+        self.push(Some(val))
+    }
+}
 
 impl Data for Vec<u8> {
     const TYPE: DataType = DataType {

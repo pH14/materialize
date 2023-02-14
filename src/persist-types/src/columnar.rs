@@ -177,6 +177,9 @@ pub enum ColumnFormat {
     Bytes,
     /// A column of type [String].
     String,
+    /// A column of type [OrderedDecimal<Decimal<13>>]
+    /// WIP
+    Numeric,
     // TODO: FixedSizedBytes for UUIDs?
     // TODO: Struct?
 }

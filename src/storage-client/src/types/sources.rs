@@ -2753,6 +2753,8 @@ impl<'a> DatumDecoder<'a> {
     fn decode<'d>(&'d self, idx: usize, temp_storage: &'d RowArena) -> Datum<'d> {
         match self {
             DatumDecoder::List(decoders) => {
+                // WIP: only needed if nullable
+                // WIP: this doesn't work for ScalarType::Array|List, what's here is very hardcoded for Records
                 let has_value = decoders[0].decode(idx, temp_storage).unwrap_bool();
 
                 let mut datums = vec![];
@@ -2770,6 +2772,8 @@ impl<'a> DatumDecoder<'a> {
                 }
             }
             DatumDecoder::Bool(col) => Datum::from(col.get(idx)),
+            // WIP: add in schema information so we can assert nullability. everything user-level
+            // goes through BoolOpt, so we should error if we try to encode a null value
             DatumDecoder::BoolOpt(col) => Datum::from(col.get(idx)),
             DatumDecoder::I16(col) => Datum::from(col.get(idx)),
             DatumDecoder::I16Opt(col) => Datum::from(col.get(idx)),
@@ -2866,6 +2870,32 @@ const STRUCT_NULLABILITY_DATA_TYPE: mz_persist_types::columnar::DataType =
         format: mz_persist_types::columnar::ColumnFormat::Bool,
     };
 const SOURCE_DATA_ERROR: &str = "mz_internal_super_secret_source_data_errors";
+
+/**
+Each ScalarType and whether there's a corresponding type within persist that sorts the same way:
+
+False, True => yes, bool datatype
+Int16(i16), Int32(i32), Int64(i64) => yes, equivalent datatypes
+UInt8(u8), UInt16(u16), UInt32(u32), UInt64(u64) => yes, equivalent datatypes
+Float32(OrderedFloat<f32>), Float64(OrderedFloat<f64>) => yes, equivalent datatypes
+Date(Date) => yes, i32 or Vec<u8>
+Time(NaiveTime) => yes, i64 or Vec<u8>
+Timestamp(CheckedTimestamp<NaiveDateTime>) => yes, Vec<u8>
+TimestampTz(CheckedTimestamp<DateTime<Utc>>) => yes, Vec<u8>
+Interval(Interval) => yes, Vec<u8>
+Bytes(&'a [u8]) => yes
+String(&'a str) => yes, assuming everything is UTF8
+Array(Array<'a>) => depends on inner scalar types
+List(DatumList<'a>) => depends on inner scalar types
+Map(DatumMap<'a>) => depends on inner scalar types
+Numeric(OrderedDecimal<Numeric>) => no equivalent. could be Vec<u8> but will not sort equivalently
+JsonNull => yes, bool
+Uuid(Uuid) => yes, String or Vec<u8>
+MzTimestamp(crate::Timestamp) => yes, u64
+Range(Range<DatumNested<'a>>) => depends on inner scalar types
+Dummy => not relevant
+Null => not relevant
+**/
 
 impl Schema<SourceData> for RelationDesc {
     type Encoder<'a> = SourceDataEncoder<'a>;
@@ -3017,6 +3047,8 @@ impl Schema<SourceData> for RelationDesc {
             match &typ.scalar_type {
                 ScalarType::Record { fields, .. } => {
                     let mut inner_encoders = vec![];
+                    // add a bitmap to cover struct nullability
+                    // WIP: this only needs to be used if the column is nullable, if it's non-null we can skip this
                     inner_encoders.push(DatumEncoder::Bool(
                         part.col::<bool>(&format!("{}:{}", STRUCT_NULLABILITY, name))?,
                     ));
