@@ -192,14 +192,14 @@ impl Schema<Row> for RelationDesc {
     type Encoder<'a> = RowEncoder<'a>;
     type Decoder<'a> = RowDecoder<'a>;
 
-    fn columns(&self) -> Vec<(String, DataType)> {
+    fn columns(&self) -> Vec<(String, DataType, bool)> {
         self.iter()
             .map(|(name, typ)| {
                 let data_type = DataType {
                     optional: typ.nullable,
                     format: ColumnFormat::from(&typ.scalar_type),
                 };
-                (name.0.clone(), data_type)
+                (name.0.clone(), data_type, true)
             })
             .collect()
     }

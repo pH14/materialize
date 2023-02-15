@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::iter::Peekable;
 use std::marker::PhantomData;
@@ -470,6 +470,7 @@ where
                 runs: all_runs,
                 len,
                 stats: vec![],
+                stats_v2: vec![],
             },
         })
     }

@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 
 use differential_dataflow::lattice::Lattice;
@@ -28,11 +28,12 @@ use crate::critical::CriticalReaderId;
 use crate::error::CodecMismatch;
 use crate::internal::paths::{PartialBatchKey, PartialRollupKey};
 use crate::internal::state::{
-    CriticalReaderState, HandleDebugState, HollowBatch, HollowBatchPart, IdempotencyToken,
-    LeasedReaderState, OpaqueState, ProtoCriticalReaderState, ProtoHandleDebugState,
-    ProtoHollowBatch, ProtoHollowBatchPart, ProtoLeasedReaderState, ProtoStateDiff,
-    ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs, ProtoStateRollup, ProtoTrace,
-    ProtoU64Antichain, ProtoU64Description, ProtoWriterState, State, StateCollections, WriterState,
+    CriticalReaderState, HandleDebugState, HollowBatch, HollowBatchPart, HollowBatchStats,
+    IdempotencyToken, LeasedReaderState, OpaqueState, ProtoCriticalReaderState,
+    ProtoHandleDebugState, ProtoHollowBatch, ProtoHollowBatchPart, ProtoHollowBatchStats,
+    ProtoLeasedReaderState, ProtoStateDiff, ProtoStateField, ProtoStateFieldDiffType,
+    ProtoStateFieldDiffs, ProtoStateRollup, ProtoTrace, ProtoU64Antichain, ProtoU64Description,
+    ProtoWriterState, State, StateCollections, WriterState,
 };
 use crate::internal::state_diff::{
     ProtoStateFieldDiff, StateDiff, StateFieldDiff, StateFieldValDiff,
@@ -788,6 +789,30 @@ impl RustType<ProtoHandleDebugState> for HandleDebugState {
     }
 }
 
+impl RustType<ProtoHollowBatchStats> for HollowBatchStats {
+    fn into_proto(&self) -> ProtoHollowBatchStats {
+        ProtoHollowBatchStats {
+            column_name: self.column_name.into_proto(),
+            mins: self.mins.into_proto(),
+            min_validity: self.min_validity.into_proto(),
+            maxes: self.maxes.into_proto(),
+            max_validity: self.max_validity.into_proto(),
+            nulls: self.nulls.into_proto(),
+        }
+    }
+
+    fn from_proto(proto: ProtoHollowBatchStats) -> Result<Self, TryFromProtoError> {
+        Ok(HollowBatchStats {
+            column_name: proto.column_name.into_rust()?,
+            mins: proto.mins.into_rust()?,
+            min_validity: proto.min_validity.into_rust()?,
+            maxes: proto.maxes.into_rust()?,
+            max_validity: proto.max_validity.into_rust()?,
+            nulls: proto.nulls.into_rust()?,
+        })
+    }
+}
+
 impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
     fn into_proto(&self) -> ProtoHollowBatch {
         ProtoHollowBatch {
@@ -797,6 +822,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
             runs: self.runs.into_proto(),
             deprecated_keys: vec![],
             stats: self.stats.into_proto(),
+            stats_v2: self.stats_v2.into_proto(),
         }
     }
 
@@ -819,6 +845,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
             len: proto.len.into_rust()?,
             runs: proto.runs.into_rust()?,
             stats: proto.stats.into_rust()?,
+            stats_v2: proto.stats_v2.into_rust()?,
         })
     }
 }

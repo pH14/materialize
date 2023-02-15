@@ -47,7 +47,7 @@ impl Schema<()> for UnitSchema {
     type Encoder<'a> = Self;
     type Decoder<'a> = Self;
 
-    fn columns(&self) -> Vec<(String, DataType)> {
+    fn columns(&self) -> Vec<(String, DataType, bool)> {
         Vec::new()
     }
 
@@ -121,12 +121,12 @@ impl Schema<String> for StringSchema {
 
     type Decoder<'a> = SimpleDecoder<'a, String>;
 
-    fn columns(&self) -> Vec<(String, DataType)> {
+    fn columns(&self) -> Vec<(String, DataType, bool)> {
         let data_type = DataType {
             optional: false,
             format: ColumnFormat::String,
         };
-        vec![("".to_owned(), data_type)]
+        vec![("".to_owned(), data_type, true)]
     }
 
     fn decoder<'a>(&self, mut cols: ColumnsRef<'a>) -> Result<Self::Decoder<'a>, String> {
@@ -181,12 +181,12 @@ impl Schema<Vec<u8>> for VecU8Schema {
 
     type Decoder<'a> = SimpleDecoder<'a, Vec<u8>>;
 
-    fn columns(&self) -> Vec<(String, DataType)> {
+    fn columns(&self) -> Vec<(String, DataType, bool)> {
         let data_type = DataType {
             optional: false,
             format: ColumnFormat::Bytes,
         };
-        vec![("".to_owned(), data_type)]
+        vec![("".to_owned(), data_type, true)]
     }
 
     fn decoder<'a>(&self, mut cols: ColumnsRef<'a>) -> Result<Self::Decoder<'a>, String> {
@@ -670,7 +670,7 @@ impl<T: Debug + Send + Sync> Schema<T> for TodoSchema<T> {
     type Encoder<'a> = Self;
     type Decoder<'a> = Self;
 
-    fn columns(&self) -> Vec<(String, DataType)> {
+    fn columns(&self) -> Vec<(String, DataType, bool)> {
         panic!("TODO")
     }
 

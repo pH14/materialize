@@ -10,6 +10,7 @@
 //! Write capabilities and handles
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -448,10 +449,11 @@ where
         let since = Antichain::from_elem(T::minimum());
         let desc = Description::new(lower, upper, since);
 
-        let (mut parts, mut num_updates) = (Vec::new(), 0);
+        let (mut parts, mut num_updates, mut stats_v2) = (Vec::new(), 0, Vec::new());
         for batch in batches.iter() {
             let () = validate_truncate_batch(&batch.batch.desc, &desc)?;
             parts.extend_from_slice(&batch.batch.parts);
+            stats_v2.extend_from_slice(&batch.batch.stats_v2);
             num_updates += batch.batch.len;
         }
 
@@ -474,6 +476,7 @@ where
                     runs: vec![],
                     // WIP: adapting this for multiple batches is tricky
                     stats,
+                    stats_v2,
                 },
                 &self.writer_id,
                 heartbeat_timestamp,

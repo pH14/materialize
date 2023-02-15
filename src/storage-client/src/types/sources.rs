@@ -2901,15 +2901,16 @@ impl Schema<SourceData> for RelationDesc {
     type Encoder<'a> = SourceDataEncoder<'a>;
     type Decoder<'a> = SourceDataDecoder<'a>;
 
-    fn columns(&self) -> Vec<(String, mz_persist_types::columnar::DataType)> {
+    fn columns(&self) -> Vec<(String, mz_persist_types::columnar::DataType, bool)> {
         let error_column = mz_persist_types::columnar::DataType {
             optional: true,
             format: mz_persist_types::columnar::ColumnFormat::String,
         };
 
         fn add_data_type(
-            cols: &mut Vec<(String, mz_persist_types::columnar::DataType)>,
+            cols: &mut Vec<(String, mz_persist_types::columnar::DataType, bool)>,
             (name, typ): (&ColumnName, &ColumnType),
+            collect_stats: bool,
         ) {
             match &typ.scalar_type {
                 ScalarType::Record { fields, .. } => {
@@ -2918,6 +2919,7 @@ impl Schema<SourceData> for RelationDesc {
                     cols.push((
                         format!("{}:{}", STRUCT_NULLABILITY, *name),
                         STRUCT_NULLABILITY_DATA_TYPE.clone(),
+                        false,
                     ));
                     for (inner_name, inner_typ) in fields {
                         add_data_type(
@@ -2926,6 +2928,7 @@ impl Schema<SourceData> for RelationDesc {
                                 &ColumnName::from(format!("{}:{}", name, inner_name)),
                                 inner_typ,
                             ),
+                            false,
                         );
                     }
                 }
@@ -2934,16 +2937,16 @@ impl Schema<SourceData> for RelationDesc {
                         optional: true,
                         format: mz_persist_types::columnar::ColumnFormat::from(&typ.scalar_type),
                     };
-                    cols.push((name.as_str().to_owned(), data_type))
+                    cols.push((name.as_str().to_owned(), data_type, collect_stats))
                 }
             }
         }
 
         let mut cols = vec![];
         for field in self.iter() {
-            add_data_type(&mut cols, field);
+            add_data_type(&mut cols, field, true);
         }
-        cols.push((SOURCE_DATA_ERROR.to_string(), error_column));
+        cols.push((SOURCE_DATA_ERROR.to_string(), error_column, false));
         cols
     }
 

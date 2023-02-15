@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::{ControlFlow, ControlFlow::Break, ControlFlow::Continue};
@@ -170,6 +170,20 @@ pub struct HollowBatch<T> {
     pub runs: Vec<usize>,
     /// Stats for each HollowBatchPart. WIP: explain format.
     pub stats: Vec<u8>,
+    /// WIP
+    pub stats_v2: Vec<HollowBatchStats>,
+}
+
+/// WIP
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HollowBatchStats {
+    pub column_name: String,
+    // all same len, one entry per batch part
+    pub mins: Vec<u64>,
+    pub min_validity: Vec<bool>,
+    pub maxes: Vec<u64>,
+    pub max_validity: Vec<bool>,
+    pub nulls: Vec<u64>,
 }
 
 impl<T: Ord> PartialOrd for HollowBatch<T> {
@@ -188,6 +202,7 @@ impl<T: Ord> Ord for HollowBatch<T> {
             len: self_len,
             runs: self_runs,
             stats: self_stats,
+            stats_v2: _self_stats_v2,
         } = self;
         let HollowBatch {
             desc: other_desc,
@@ -195,6 +210,7 @@ impl<T: Ord> Ord for HollowBatch<T> {
             len: other_len,
             runs: other_runs,
             stats: other_stats,
+            stats_v2: _other_stats_v2,
         } = other;
         (
             self_desc.lower().elements(),
@@ -812,6 +828,7 @@ where
             runs: Vec::new(),
             len: 0,
             stats: Vec::new(),
+            stats_v2: Vec::new(),
         }
     }
 

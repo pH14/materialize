@@ -182,7 +182,7 @@ impl Part {
                     assert!(key_array.validity().is_none());
                     assert_eq!(key_schema.len(), key_array.values().len());
                     let mut key = Vec::new();
-                    for ((name, typ), array) in key_schema.iter().zip(key_array.values()) {
+                    for ((name, typ, _), array) in key_schema.iter().zip(key_array.values()) {
                         let col = DynColumnRef::from_arrow(typ, array)?;
                         key.push((name.clone(), col));
                     }
@@ -203,7 +203,7 @@ impl Part {
                     assert!(val_array.validity().is_none());
                     assert_eq!(val_schema.len(), val_array.values().len());
                     let mut val = Vec::new();
-                    for ((name, typ), array) in val_schema.iter().zip(val_array.values()) {
+                    for ((name, typ, _), array) in val_schema.iter().zip(val_array.values()) {
                         let col = DynColumnRef::from_arrow(typ, array)?;
                         val.push((name.clone(), col));
                     }
@@ -250,6 +250,38 @@ impl Part {
         };
         let () = part.validate()?;
         Ok(part)
+    }
+
+    /// WIP
+    pub fn get<T: Data>(&self, idx: usize, col_name: &str) -> Option<T::Ref<'_>> {
+        for (name, col) in &self.key {
+            if name == col_name {
+                let x: &T::Col = col.downcast::<T>().expect("abc");
+                return Some(x.get(idx).clone());
+            }
+        }
+
+        for (name, col) in &self.val {
+            if name == col_name {
+                let x: &T::Col = col.downcast::<T>().expect("abc");
+                return Some(x.get(idx).clone());
+            }
+        }
+
+        None
+    }
+
+    /// Flatmaps over the columns of this [Part]'s key and value, returning
+    /// a Vecs with indices into each column's minimum and maximum elements.
+    pub fn minmax_col<T: Data>(&self, colname: &str) -> (Option<T::Ref<'_>>, Option<T::Ref<'_>>) {
+        for (name, col) in &self.key {
+            if name == colname {
+                let (min, max) = col.to_col_ord().minmax(col.len());
+                return (self.get::<T>(min, colname), self.get::<T>(max, colname));
+            }
+        }
+        // WIP: also check &self.val
+        (None, None)
     }
 
     /// Flatmaps over the columns of this [Part]'s key and value, returning
@@ -436,12 +468,12 @@ impl PartBuilder {
         let key = key_schema
             .columns()
             .into_iter()
-            .map(|(name, data_type)| (name, DynColumnMut::new_untyped(&data_type)))
+            .map(|(name, data_type, _)| (name, DynColumnMut::new_untyped(&data_type)))
             .collect();
         let val = val_schema
             .columns()
             .into_iter()
-            .map(|(name, data_type)| (name, DynColumnMut::new_untyped(&data_type)))
+            .map(|(name, data_type, _)| (name, DynColumnMut::new_untyped(&data_type)))
             .collect();
         let ts = Vec::new();
         let diff = Vec::new();
@@ -634,7 +666,7 @@ impl DynColumnRef {
             (false, ColumnFormat::F64) => ColOrd::F64(self.expect_downcast::<f64>()),
             (false, ColumnFormat::Bytes) => ColOrd::Bytes(self.expect_downcast::<Vec<u8>>()),
             (false, ColumnFormat::String) => ColOrd::String(self.expect_downcast::<String>()),
-            (false, ColumnFormat::Numeric) => ColOrd::Bytes(self.expect_downcast::<String>()),
+            // (false, ColumnFormat::Numeric) => ColOrd::Bytes(self.expect_downcast::<String>()),
             (true, ColumnFormat::Bool) => ColOrd::OptBool(self.expect_downcast::<Option<bool>>()),
             (true, ColumnFormat::I8) => ColOrd::OptI8(self.expect_downcast::<Option<i8>>()),
             (true, ColumnFormat::I16) => ColOrd::OptI16(self.expect_downcast::<Option<i16>>()),
@@ -651,10 +683,9 @@ impl DynColumnRef {
             }
             (true, ColumnFormat::String) => {
                 ColOrd::OptString(self.expect_downcast::<Option<String>>())
-            }
-            (true, ColumnFormat::Numeric) => {
-                ColOrd::OptBytes(self.expect_downcast::<Option<Vec<u8>>>())
-            }
+            } // (true, ColumnFormat::Numeric) => {
+              //     ColOrd::OptBytes(self.expect_downcast::<Option<Vec<u8>>>())
+              // }
         }
     }
 

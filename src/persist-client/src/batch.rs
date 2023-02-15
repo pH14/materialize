@@ -10,7 +10,7 @@
 //! A handle to a batch of updates
 
 use std::borrow::Borrow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -31,7 +31,7 @@ use mz_ore::cast::CastFrom;
 use mz_persist::indexed::columnar::{ColumnarRecords, ColumnarRecordsBuilder};
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Atomicity, Blob};
-use mz_persist_types::columnar::{PartDecoder, PartEncoder, Schema};
+use mz_persist_types::columnar::{ColumnFormat, PartDecoder, PartEncoder, Schema};
 use mz_persist_types::parquet::encode_part;
 use mz_persist_types::part::{Part, PartBuilder};
 use mz_persist_types::{Codec, Codec64};
@@ -41,7 +41,7 @@ use crate::error::InvalidUsage;
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{BatchWriteMetrics, Metrics};
 use crate::internal::paths::{PartId, PartialBatchKey};
-use crate::internal::state::{BatchPartStats, HollowBatch, HollowBatchPart};
+use crate::internal::state::{BatchPartStats, HollowBatch, HollowBatchPart, HollowBatchStats};
 use crate::write::WriterEnrichedHollowBatch;
 use crate::{PersistConfig, ShardId, WriterId};
 
@@ -234,6 +234,7 @@ where
     v_schema: Arc<V::Schema>,
 
     min_max: PartBuilder,
+    min_max_v2: HashMap<String, HollowBatchStats>,
 
     // These provide a bit more safety against appending a batch with the wrong
     // type to a shard.
@@ -301,6 +302,7 @@ where
             // description to be an _inclusive_ upper.
             inline_upper: inline_upper.unwrap_or_else(|| Antichain::new()),
             min_max: PartBuilder::new::<K, K::Schema, V, V::Schema>(&k_schema, &v_schema),
+            min_max_v2: HashMap::new(),
             k_schema,
             v_schema,
             _phantom: PhantomData,
@@ -378,6 +380,7 @@ where
                     }
                     enc
                 },
+                stats_v2: vec![],
             },
         );
 
@@ -475,6 +478,48 @@ where
                 }
 
                 // WIP: determine runs with some fancy comparison fn that doesn't exist yet
+
+                for (colname, datatype, collect_stats) in self.k_schema.columns() {
+                    if !collect_stats {
+                        continue;
+                    }
+
+                    let mut column_stats = self.min_max_v2.entry(colname.clone()).or_default();
+                    column_stats.column_name = column_stats.column_name.clone();
+
+                    // WIP: I really hope no one reads this code. for now: we care that things are 8
+                    // bytes, not that they encode to u64
+                    let (min, max) = match datatype.format {
+                        ColumnFormat::Bool => (None, None),
+                        ColumnFormat::I8 => {
+                            let (min, max) = part.minmax_col::<Option<i8>>(&colname);
+                            let min = min.flatten().map(|m| {
+                                u64::from_le_bytes(
+                                    <[u8; 8]>::try_from(m.to_le_bytes().as_slice())
+                                        .expect("to bytes"),
+                                )
+                            });
+                            let max = max.flatten().map(|m| {
+                                u64::from_le_bytes(
+                                    <[u8; 8]>::try_from(m.to_le_bytes().as_slice())
+                                        .expect("to bytes"),
+                                )
+                            });
+                            (min, max)
+                        }
+                        ColumnFormat::I16 => {}
+                        ColumnFormat::I32 => {}
+                        ColumnFormat::I64 => {}
+                        ColumnFormat::U8 => {}
+                        ColumnFormat::U16 => {}
+                        ColumnFormat::U32 => {}
+                        ColumnFormat::U64 => {}
+                        ColumnFormat::F32 => {}
+                        ColumnFormat::F64 => {}
+                        ColumnFormat::Bytes => {}
+                        ColumnFormat::String => {}
+                    }
+                }
 
                 let minmax = part.minmax();
                 self.min_max.push_from(&part, minmax.0, 0, 1).expect("min");

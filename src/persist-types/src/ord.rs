@@ -29,7 +29,7 @@ pub enum ColOrd<'a> {
     F64(&'a <f64 as Data>::Col),
     Bytes(&'a <Vec<u8> as Data>::Col),
     String(&'a <String as Data>::Col),
-    Numeric(&'a <Vec<u8> as Data>::Col),
+    // Numeric(&'a <Vec<u8> as Data>::Col),
     OptBool(&'a <Option<bool> as Data>::Col),
     OptI8(&'a <Option<i8> as Data>::Col),
     OptI16(&'a <Option<i16> as Data>::Col),
@@ -43,7 +43,7 @@ pub enum ColOrd<'a> {
     OptF64(&'a <Option<f64> as Data>::Col),
     OptBytes(&'a <Option<Vec<u8>> as Data>::Col),
     OptString(&'a <Option<String> as Data>::Col),
-    OptNumeric(&'a <Option<Vec<u8>> as Data>::Col),
+    // OptNumeric(&'a <Option<Vec<u8>> as Data>::Col),
 }
 
 impl<'a> ColOrd<'a> {
@@ -73,6 +73,8 @@ impl<'a> ColOrd<'a> {
 
     fn cmp(&self, idx0: usize, other: &ColOrd, idx1: usize) -> Ordering {
         // WIP: complete all the pairwise mappings so we can cmp between parts
+        // WIP: to add separate null counts, we need to update the logic here to separate out null/
+        // None values and the cmp the nonnulls
         match (self, other) {
             (ColOrd::Bool(x), ColOrd::Bool(y)) => {
                 ColumnGet::<bool>::get(*x, idx0).cmp(&ColumnGet::get(*y, idx1))
@@ -81,12 +83,6 @@ impl<'a> ColOrd<'a> {
         };
 
         match *self {
-            ColOrd::Numeric(x) => {
-                let x1 = ColumnGet::<Vec<u8>>::get(x, idx0);
-                let x2 = ColumnGet::<Vec<u8>>::get(x, idx1);
-
-                dec::Decimal::<13>::from_packed_bcd()
-            }
             ColOrd::Bool(x) => ColumnGet::<bool>::get(x, idx0).cmp(&ColumnGet::get(x, idx1)),
             ColOrd::I8(x) => ColumnGet::<i8>::get(x, idx0).cmp(&ColumnGet::get(x, idx1)),
             ColOrd::I16(x) => ColumnGet::<i16>::get(x, idx0).cmp(&ColumnGet::get(x, idx1)),

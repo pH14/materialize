@@ -84,7 +84,7 @@ pub trait Data: Debug + Send + Sync + Sized + 'static {
     /// TODO: We may want to eventually separate this into In and Out types
     /// because one wants to be covariant and the other wants to be
     /// contravariant.
-    type Ref<'a>: Debug
+    type Ref<'a>: Debug + Clone
     where
         Self: 'a;
 
@@ -177,9 +177,9 @@ pub enum ColumnFormat {
     Bytes,
     /// A column of type [String].
     String,
-    /// A column of type [OrderedDecimal<Decimal<13>>]
-    /// WIP
-    Numeric,
+    // A column of type [OrderedDecimal<Decimal<13>>]
+    // WIP
+    // Numeric,
     // TODO: FixedSizedBytes for UUIDs?
     // TODO: Struct?
 }
@@ -219,7 +219,7 @@ pub trait Schema<T>: Debug + Send + Sync {
     /// object with a method like `fn add<T: Data>(name: String)`. If we decide
     /// to support struct columns, a hypothetical StructSchemaBuilder would look
     /// very much like this. Decide if this is better/worth it.
-    fn columns(&self) -> Vec<(String, DataType)>;
+    fn columns(&self) -> Vec<(String, DataType, bool)>;
 
     /// Returns a [Self::Decoder<'a>] for the given columns.
     fn decoder<'a>(&self, cols: ColumnsRef<'a>) -> Result<Self::Decoder<'a>, String>;
