@@ -178,12 +178,16 @@ pub struct HollowBatch<T> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HollowBatchStats {
     pub column_name: String,
-    // all same len, one entry per batch part
-    pub mins: Vec<u64>,
-    pub min_validity: Vec<bool>,
-    pub maxes: Vec<u64>,
-    pub max_validity: Vec<bool>,
-    pub nulls: Vec<u64>,
+    // bytes is columnar stored
+    // indices are per row, lack of an index means the value is null
+    // lens are length of data at of row at idx in data_bytes
+    pub min_data_bytes: Vec<u8>,
+    pub min_data_indices: Vec<u64>,
+    pub min_data_lens: Vec<u64>,
+    //
+    pub max_data_bytes: Vec<u8>,
+    pub max_data_indices: Vec<u64>,
+    pub max_data_lens: Vec<u64>,
 }
 
 impl<T: Ord> PartialOrd for HollowBatch<T> {

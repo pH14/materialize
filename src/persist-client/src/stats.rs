@@ -19,7 +19,7 @@ use mz_persist_types::part::Part;
 use mz_persist_types::Codec;
 
 use crate::internal::paths::PartialBatchKey;
-use crate::internal::state::HollowBatch;
+use crate::internal::state::{HollowBatch, HollowBatchStats};
 
 #[derive(Debug)]
 pub struct BatchStats {
@@ -66,6 +66,7 @@ impl BatchStats {
 pub struct BatchStatsBuilder<K: Codec, V: Codec> {
     stats: Vec<Part>,
     keys: HashMap<PartialBatchKey, (usize, usize)>,
+    // keys_v2: HashMap<String, HollowBatchStats>,
     current_batch_idx: usize,
     key_schema: Arc<K::Schema>,
     val_schema: Arc<V::Schema>,

@@ -28,11 +28,12 @@ message ProtoHollowBatchPart {
 
 message ProtoHollowBatchStats {
     string column_name = 1;
-    repeated uint64 mins = 2;
-    repeated bool min_validity = 3;
-    repeated uint64 maxes = 4;
-    repeated bool max_validity = 5;
-    repeated uint64 nulls = 6;
+    bytes min_data_bytes = 2;
+    repeated uint64 min_data_indices = 3;
+    repeated uint64 min_data_lens = 4;
+    bytes max_data_bytes = 5;
+    repeated uint64 max_data_indices = 6;
+    repeated uint64 max_data_lens = 7;
 }
 
 message ProtoHollowBatch {

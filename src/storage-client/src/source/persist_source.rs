@@ -21,6 +21,7 @@ use timely::dataflow::operators::OkErr;
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
 use tokio::sync::Mutex;
+use tracing::info;
 
 use mz_expr::MfpPlan;
 use mz_persist_client::cache::PersistClientCache;
@@ -119,6 +120,9 @@ where
     YFn: Fn(Instant, usize) -> bool + 'static,
 {
     let name = source_id.to_string();
+    info!("MFP: {:?}", map_filter_project);
+    // First, given our validity checks, we see whether we CAN satisfy any individual expressions
+    // for a given part. THEN we
     let (fetched, token) = shard_source(
         scope,
         &name,

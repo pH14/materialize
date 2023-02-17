@@ -793,22 +793,24 @@ impl RustType<ProtoHollowBatchStats> for HollowBatchStats {
     fn into_proto(&self) -> ProtoHollowBatchStats {
         ProtoHollowBatchStats {
             column_name: self.column_name.into_proto(),
-            mins: self.mins.into_proto(),
-            min_validity: self.min_validity.into_proto(),
-            maxes: self.maxes.into_proto(),
-            max_validity: self.max_validity.into_proto(),
-            nulls: self.nulls.into_proto(),
+            min_data_bytes: self.min_data_bytes.into_proto(),
+            min_data_indices: self.min_data_indices.into_proto(),
+            min_data_lens: self.min_data_lens.into_proto(),
+            max_data_bytes: self.max_data_bytes.into_proto(),
+            max_data_indices: self.max_data_indices.into_proto(),
+            max_data_lens: self.max_data_lens.into_proto(),
         }
     }
 
     fn from_proto(proto: ProtoHollowBatchStats) -> Result<Self, TryFromProtoError> {
         Ok(HollowBatchStats {
             column_name: proto.column_name.into_rust()?,
-            mins: proto.mins.into_rust()?,
-            min_validity: proto.min_validity.into_rust()?,
-            maxes: proto.maxes.into_rust()?,
-            max_validity: proto.max_validity.into_rust()?,
-            nulls: proto.nulls.into_rust()?,
+            min_data_bytes: proto.min_data_bytes.into_rust()?,
+            min_data_indices: proto.min_data_indices.into_rust()?,
+            min_data_lens: proto.min_data_lens.into_rust()?,
+            max_data_bytes: proto.max_data_bytes.into_rust()?,
+            max_data_indices: proto.max_data_indices.into_rust()?,
+            max_data_lens: proto.max_data_lens.into_rust()?,
         })
     }
 }
