@@ -322,6 +322,8 @@ where
         // let mut max_key = K::default();
         // let mut min_val = V::default();
         // let mut max_val = V::default();
+        let mut total_parts_fetched = 0;
+        let mut total_parts_skippable = 0;
 
         loop {
             // While we have budget left for fetching more parts, read from the
@@ -332,7 +334,10 @@ where
                     Some(Ok(ListenEvent::Updates((mut parts, stats)))) => {
                         for part in parts {
                             let stats = stats.get(&part.key);
-                            should_filter_out::<K, V>(stats.0, key_schema.as_ref(), val_schema.as_ref(), stats.1, mfp.as_ref());
+                            if should_filter_out::<K, V>(stats.0, key_schema.as_ref(), val_schema.as_ref(), stats.1, mfp.as_ref()) {
+                                total_parts_skippable += 1;
+                            }
+                            total_parts_fetched += 1;
                             // if stats.get(&part.key, key_schema.as_ref(), val_schema.as_ref(), &mut min_key, &mut min_val, &mut max_key, &mut max_val).is_some() {
                             //     // WIP: how do we model whether a column has no min/max value?
                             //     // it depends a bit on the K / V types themselves, so it seems
@@ -400,6 +405,7 @@ where
                                 current_ts = ts;
                             }
                             None => {
+                                info!("Dataflow complete. Parts fetched: {}, skippable: {}", total_parts_fetched, total_parts_skippable);
                                 cap_set.downgrade(&[]);
                                 return;
                             }
@@ -412,6 +418,7 @@ where
                     // `pinned_stream`, so propagate that information
                     // downstream.
                     None => {
+                        info!("Dataflow complete. Parts fetched: {}, skippable: {}", total_parts_fetched, total_parts_skippable);
                         cap_set.downgrade(&[]);
                         return;
                     }
@@ -484,15 +491,21 @@ fn should_filter_out<K: Codec, V: Codec>(
     // wip: horrible hack to track defined vs generated cols
     let mut top_level_columns = 0;
     let mut min_datums = vec![];
+    let mut max_datums = vec![];
     for (colname, typ, has_stats) in key_schema.columns() {
         if !has_stats {
             continue;
         }
 
         if let Some(column_stats) = stats.get(&colname) {
-            if column_stats.min_data_lens.is_empty() {
-                info!("no column stats for {}, null len", colname);
+            // wip: is it always true that if min is null then max is null?
+            if column_stats.min_data_lens.is_empty() || column_stats.min_data_lens[row_idx] == 0 {
+                info!(
+                    "no column stats for {}, null len or zero bytes for part",
+                    colname
+                );
                 min_datums.push(Datum::Null);
+                max_datums.push(Datum::Null);
                 continue;
             }
 
@@ -501,6 +514,8 @@ fn should_filter_out<K: Codec, V: Codec>(
 
             let byte_range = usize::cast_from(column_stats.min_data_lens[row_idx]);
             let offset = usize::cast_from(column_stats.min_data_indices[row_idx]);
+            let max_byte_range = usize::cast_from(column_stats.max_data_lens[row_idx]);
+            let max_offset = usize::cast_from(column_stats.max_data_indices[row_idx]);
 
             info!(
                 "have column stats for {}: {:?}. offset: {}, len: {}, row: {}",
@@ -517,14 +532,23 @@ fn should_filter_out<K: Codec, V: Codec>(
                         )
                         .expect("WIP"),
                     );
-                    info!("Column {} has val: {}", colname, i64);
+                    info!("Column {} has min val: {}", colname, i64);
                     min_datums.push(Datum::Int64(i64));
+                    let i64 = i64::from_le_bytes(
+                        <[u8; 8]>::try_from(
+                            &column_stats.max_data_bytes[max_offset..max_offset + max_byte_range],
+                        )
+                        .expect("WIP"),
+                    );
+                    info!("Column {} has max val: {}", colname, i64);
+                    max_datums.push(Datum::Int64(i64));
                 }
                 _ => {}
             }
         } else {
             info!("no column stats for {}", colname);
             min_datums.push(Datum::Null);
+            max_datums.push(Datum::Null);
         }
     }
 
@@ -536,7 +560,7 @@ fn should_filter_out<K: Codec, V: Codec>(
     let arena = mz_repr::RowArena::new();
     let mut row_builder = Row::default();
 
-    let results: Vec<
+    let min_results: Vec<
         Result<(Row, mz_repr::Timestamp, Diff), (MfpPushdownError, mz_repr::Timestamp, Diff)>,
     > = mfp
         .evaluate(
@@ -548,18 +572,42 @@ fn should_filter_out<K: Codec, V: Codec>(
             &mut row_builder,
         )
         .collect();
-    info!("MFP num results: {}", results.len());
+    let max_results: Vec<
+        Result<(Row, mz_repr::Timestamp, Diff), (MfpPushdownError, mz_repr::Timestamp, Diff)>,
+    > = mfp
+        .evaluate(
+            &mut max_datums,
+            &arena,
+            mz_repr::Timestamp::minimum(),
+            1,
+            |_time| true,
+            &mut row_builder,
+        )
+        .collect();
 
-    for result in results {
-        match result {
-            Ok((row, time, diff)) => {
-                info!("Row passed mfp: {:?}", row);
-            }
-            Err((err, time, diff)) => {
-                info!("Row errored on mfp: {:?}", err);
-            }
-        }
+    info!(
+        "MFP num results: min={}, max={}",
+        min_results.len(),
+        max_results.len()
+    );
+
+    // both min and max did not pass our MFP
+    if min_results.is_empty() && max_results.is_empty() {
+        return true;
     }
+
+    // WIP: want to check for eval errors?
+
+    // for result in min_results {
+    //     match result {
+    //         Ok((row, time, diff)) => {
+    //             info!("Row passed mfp: {:?}", row);
+    //         }
+    //         Err((err, time, diff)) => {
+    //             info!("Row errored on mfp: {:?}", err);
+    //         }
+    //     }
+    // }
 
     false
 }
