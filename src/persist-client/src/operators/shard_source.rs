@@ -12,7 +12,8 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::fmt::Debug;
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -24,14 +25,14 @@ use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::arrange::ShutdownButton;
 use differential_dataflow::Hashable;
 use futures::StreamExt;
-use mz_expr::MfpPlan;
+use mz_expr::{EvalError, MfpPlan};
 use mz_ore::cast::CastFrom;
 use mz_ore::collections::CollectionExt;
 use mz_ore::vec::VecExt;
 use mz_persist::location::ExternalError;
 use mz_persist_types::columnar::{ColumnFormat, Schema};
 use mz_persist_types::{Codec, Codec64};
-use mz_repr::{Datum, Row, RowPacker};
+use mz_repr::{Datum, Diff, Row, RowPacker};
 use mz_timely_util::builder_async::{Event, OperatorBuilder as AsyncOperatorBuilder};
 use timely::dataflow::channels::pact::{Exchange, Pipeline};
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
@@ -473,9 +474,6 @@ fn should_filter_out<K: Codec, V: Codec>(
     row_idx: usize,
     mfp: Option<&MfpPlan>,
 ) -> bool {
-    let mut row = Row::default();
-    let mut packer = row.packer();
-
     let Some(mfp) = mfp else {
         return false;
     };
@@ -485,6 +483,7 @@ fn should_filter_out<K: Codec, V: Codec>(
 
     // wip: horrible hack to track defined vs generated cols
     let mut top_level_columns = 0;
+    let mut min_datums = vec![];
     for (colname, typ, has_stats) in key_schema.columns() {
         if !has_stats {
             continue;
@@ -493,7 +492,7 @@ fn should_filter_out<K: Codec, V: Codec>(
         if let Some(column_stats) = stats.get(&colname) {
             if column_stats.min_data_lens.is_empty() {
                 info!("no column stats for {}, null len", colname);
-                packer.push(Datum::Null);
+                min_datums.push(Datum::Null);
                 continue;
             }
 
@@ -519,23 +518,72 @@ fn should_filter_out<K: Codec, V: Codec>(
                         .expect("WIP"),
                     );
                     info!("Column {} has val: {}", colname, i64);
-                    packer.push(Datum::Int64(i64));
+                    min_datums.push(Datum::Int64(i64));
                 }
                 _ => {}
             }
         } else {
             info!("no column stats for {}", colname);
-            packer.push(Datum::Null);
+            min_datums.push(Datum::Null);
         }
     }
 
     let is_subset = required_columns.is_subset(&columns_with_stats);
     info!(
-        "MFP required cols: {:?}, read cols from stats: {:?}. is subset: {}",
-        required_columns, columns_with_stats, is_subset
+        "MFP required cols: {:?}, read cols from stats: {:?}. is subset: {}. min datums: {:?}",
+        required_columns, columns_with_stats, is_subset, min_datums,
     );
+    let arena = mz_repr::RowArena::new();
+    let mut row_builder = Row::default();
+
+    let results: Vec<
+        Result<(Row, mz_repr::Timestamp, Diff), (MfpPushdownError, mz_repr::Timestamp, Diff)>,
+    > = mfp
+        .evaluate(
+            &mut min_datums,
+            &arena,
+            mz_repr::Timestamp::minimum(),
+            1,
+            |_time| true,
+            &mut row_builder,
+        )
+        .collect();
+    info!("MFP num results: {}", results.len());
+
+    for result in results {
+        match result {
+            Ok((row, time, diff)) => {
+                info!("Row passed mfp: {:?}", row);
+            }
+            Err((err, time, diff)) => {
+                info!("Row errored on mfp: {:?}", err);
+            }
+        }
+    }
 
     false
+}
+
+///
+#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum MfpPushdownError {
+    EvalError(Box<EvalError>),
+}
+
+impl Display for MfpPushdownError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MfpPushdownError::EvalError(e) => write!(f, "Eval error: {}", e),
+        }
+    }
+}
+
+impl Error for MfpPushdownError {}
+
+impl From<EvalError> for MfpPushdownError {
+    fn from(value: EvalError) -> Self {
+        Self::EvalError(Box::new(value))
+    }
 }
 
 pub(crate) fn shard_source_fetch<K, V, T, D, G>(
