@@ -131,15 +131,6 @@ pub struct HandleDebugState {
     pub purpose: String,
 }
 
-/// WIP:
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct BatchPartStats {
-    pub key_min: Vec<u8>,
-    pub key_max: Vec<u8>,
-    pub val_min: Vec<u8>,
-    pub val_max: Vec<u8>,
-}
-
 /// A subset of a [HollowBatch] corresponding 1:1 to a blob.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HollowBatchPart {

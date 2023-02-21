@@ -41,7 +41,7 @@ use crate::error::InvalidUsage;
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{BatchWriteMetrics, Metrics};
 use crate::internal::paths::{PartId, PartialBatchKey};
-use crate::internal::state::{BatchPartStats, HollowBatch, HollowBatchPart, HollowBatchStats};
+use crate::internal::state::{HollowBatch, HollowBatchPart, HollowBatchStats};
 use crate::write::WriterEnrichedHollowBatch;
 use crate::{PersistConfig, ShardId, WriterId};
 
@@ -364,6 +364,17 @@ where
             info!("{}: Minmax: {:?}", self.shard_id, minmax);
         }
 
+        let minmax_v2 = self
+            .min_max_v2
+            .into_values()
+            .collect::<Vec<HollowBatchStats>>();
+        for stats in &minmax_v2 {
+            // assert_eq!(stats.min_data_lens.len(), parts.len());
+            // assert_eq!(stats.min_data_indices.len(), parts.len());
+            // assert_eq!(stats.max_data_lens.len(), parts.len());
+            // assert_eq!(stats.max_data_indices.len(), parts.len());
+        }
+
         let desc = Description::new(self.lower, registered_upper, self.since);
         let batch = Batch::new(
             self.blob,
@@ -380,7 +391,7 @@ where
                     // }
                     enc
                 },
-                stats_v2: self.min_max_v2.into_values().collect(),
+                stats_v2: minmax_v2,
             },
         );
 
@@ -485,7 +496,7 @@ where
                     }
 
                     let mut column_stats = self.min_max_v2.entry(colname.clone()).or_default();
-                    column_stats.column_name = column_stats.column_name.clone();
+                    column_stats.column_name = colname.clone();
 
                     fn add_min<T>(
                         stats: &mut HollowBatchStats,
@@ -495,13 +506,16 @@ where
                         T: IntoIterator<Item = u8>,
                     {
                         match min {
-                            None => {}
+                            None => {
+                                stats.min_data_lens.push(0);
+                                stats.min_data_indices.push(0);
+                            }
                             Some(x) => {
                                 let before = stats.min_data_bytes.len();
                                 stats.min_data_bytes.extend(x.into_iter());
                                 let after = stats.min_data_bytes.len();
                                 stats.min_data_lens.push(u64::cast_from(after - before));
-                                stats.min_data_indices.push(u64::cast_from(parts_written));
+                                stats.min_data_indices.push(u64::cast_from(before));
                             }
                         }
                     }
@@ -514,13 +528,16 @@ where
                         T: IntoIterator<Item = u8>,
                     {
                         match max {
-                            None => {}
+                            None => {
+                                stats.max_data_lens.push(0);
+                                stats.max_data_indices.push(u64::cast_from(parts_written));
+                            }
                             Some(x) => {
                                 let before = stats.max_data_bytes.len();
                                 stats.max_data_bytes.extend(x.into_iter());
                                 let after = stats.max_data_bytes.len();
                                 stats.max_data_lens.push(u64::cast_from(after - before));
-                                stats.max_data_indices.push(u64::cast_from(parts_written));
+                                stats.max_data_indices.push(u64::cast_from(before));
                             }
                         }
                     }

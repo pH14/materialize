@@ -24,6 +24,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use mz_expr::MfpPlan;
+use mz_ore::option::OptionExt;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::fetch::FetchedPart;
 use mz_repr::{Diff, GlobalId, Row, Timestamp};
@@ -108,7 +109,7 @@ pub fn persist_source_core<G, YFn>(
     metadata: CollectionMetadata,
     as_of: Option<Antichain<Timestamp>>,
     until: Antichain<Timestamp>,
-    map_filter_project: Option<&mut MfpPlan>,
+    mut map_filter_project: Option<&mut MfpPlan>,
     flow_control: Option<FlowControl<G>>,
     yield_fn: YFn,
 ) -> (
@@ -121,8 +122,9 @@ where
 {
     let name = source_id.to_string();
     info!("MFP: {:?}", map_filter_project);
-    // First, given our validity checks, we see whether we CAN satisfy any individual expressions
-    // for a given part. THEN we
+    let mut mfp = map_filter_project.as_mut().map(|mfp| mfp.take());
+    let mut mfp_source = mfp.clone();
+    let mut mfp_decode = mfp.clone();
     let (fetched, token) = shard_source(
         scope,
         &name,
@@ -134,8 +136,9 @@ where
         flow_control,
         Arc::new(metadata.relation_desc),
         Arc::new(UnitSchema),
+        mfp_source.as_mut(),
     );
-    let rows = decode_and_mfp(&fetched, &name, until, map_filter_project, yield_fn);
+    let rows = decode_and_mfp(&fetched, &name, until, mfp_decode.as_mut(), yield_fn);
     (rows, token)
 }
 

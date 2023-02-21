@@ -384,17 +384,6 @@ where
     pub(crate) leased_seqno: Option<SeqNo>,
 }
 
-/// WIP: Stats
-#[derive(Debug)]
-pub struct BatchPartStats<K, V>
-where
-    K: Codec,
-    V: Codec,
-{
-    pub min: (K, V),
-    pub max: (K, V),
-}
-
 impl<T> LeasedBatchPart<T>
 where
     T: Timestamp + Codec64,

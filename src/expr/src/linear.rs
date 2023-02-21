@@ -1424,8 +1424,9 @@ pub mod util {
 }
 
 pub mod plan {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::iter;
+    use std::ops::Deref;
 
     use proptest::prelude::*;
     use proptest_derive::Arbitrary;
@@ -1434,6 +1435,7 @@ pub mod plan {
     use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
     use mz_repr::{Datum, Diff, Row, RowArena};
 
+    use crate::visit::Visit;
     use crate::{
         func, BinaryFunc, EvalError, MapFilterProject, MirScalarExpr, ProtoMfpPlan,
         ProtoSafeMfpPlan, UnaryFunc, UnmaterializableFunc,
@@ -1594,6 +1596,21 @@ pub mod plan {
     }
 
     impl MfpPlan {
+        pub fn column_access(&self) -> HashSet<usize> {
+            let mfp = &self.mfp;
+            let (_map, filters, _projects) = mfp.as_map_filter_project();
+            let mut columns = HashSet::new();
+            for expr in filters {
+                expr.visit_pre(&mut |e| match e {
+                    MirScalarExpr::Column(i) => {
+                        columns.insert(*i);
+                    }
+                    _ => {}
+                })
+                .expect("WIP");
+            }
+            columns
+        }
         /// Partitions `predicates` into non-temporal, and lower and upper temporal bounds.
         ///
         /// The first returned list is of predicates that do not contain `mz_now`.

@@ -10,8 +10,11 @@
 //! A source that reads from a persist shard.
 
 use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,11 +24,14 @@ use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::arrange::ShutdownButton;
 use differential_dataflow::Hashable;
 use futures::StreamExt;
+use mz_expr::MfpPlan;
 use mz_ore::cast::CastFrom;
 use mz_ore::collections::CollectionExt;
 use mz_ore::vec::VecExt;
 use mz_persist::location::ExternalError;
+use mz_persist_types::columnar::{ColumnFormat, Schema};
 use mz_persist_types::{Codec, Codec64};
+use mz_repr::{Datum, Row, RowPacker};
 use mz_timely_util::builder_async::{Event, OperatorBuilder as AsyncOperatorBuilder};
 use timely::dataflow::channels::pact::{Exchange, Pipeline};
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
@@ -39,6 +45,7 @@ use tracing::{info, trace};
 
 use crate::cache::PersistClientCache;
 use crate::fetch::{FetchedPart, SerdeLeasedBatchPart};
+use crate::internal::state::HollowBatchStats;
 use crate::read::ListenEvent;
 use crate::{PersistLocation, ShardId};
 
@@ -75,6 +82,7 @@ pub fn shard_source<K, V, D, G>(
     flow_control: Option<FlowControl<G>>,
     key_schema: Arc<K::Schema>,
     val_schema: Arc<V::Schema>,
+    map_filter_project: Option<&mut MfpPlan>,
 ) -> (Stream<G, FetchedPart<K, V, G::Timestamp, D>>, Rc<dyn Any>)
 where
     K: Debug + Codec + Default,
@@ -124,6 +132,7 @@ where
         Arc::clone(&key_schema),
         Arc::clone(&val_schema),
         Box::new(|(_kmin, _vmin), (_kmax, _vmax)| true),
+        map_filter_project,
     );
     let (parts, tokens) = shard_source_fetch(
         &descs, name, clients, location, shard_id, key_schema, val_schema,
@@ -161,6 +170,7 @@ pub(crate) fn shard_source_descs<K, V, D, G>(
     key_schema: Arc<K::Schema>,
     val_schema: Arc<V::Schema>,
     filter: Box<dyn Fn((&K, &V), (&K, &V)) -> bool>,
+    map_filter_project: Option<&mut MfpPlan>,
 ) -> (Stream<G, (usize, SerdeLeasedBatchPart)>, ShutdownButton<()>)
 where
     K: Debug + Codec + Default,
@@ -296,6 +306,8 @@ where
         vec![Antichain::new()],
     );
 
+    let mfp: Option<MfpPlan> = map_filter_project.cloned();
+
     let shutdown_button = builder.build(move |caps| async move {
         let mut cap_set = CapabilitySet::from_elem(caps.into_element());
 
@@ -305,10 +317,10 @@ where
 
         let max_inflight_bytes = flow_control_bytes.unwrap_or(usize::MAX);
 
-        let mut min_key = K::default();
-        let mut max_key = K::default();
-        let mut min_val = V::default();
-        let mut max_val = V::default();
+        // let mut min_key = K::default();
+        // let mut max_key = K::default();
+        // let mut min_val = V::default();
+        // let mut max_val = V::default();
 
         loop {
             // While we have budget left for fetching more parts, read from the
@@ -318,24 +330,26 @@ where
                 match pinned_stream.next().await {
                     Some(Ok(ListenEvent::Updates((mut parts, stats)))) => {
                         for part in parts {
-                            if stats.get(&part.key, key_schema.as_ref(), val_schema.as_ref(), &mut min_key, &mut min_val, &mut max_key, &mut max_val) {
-                                // WIP: how do we model whether a column has no min/max value?
-                                // it depends a bit on the K / V types themselves, so it seems
-                                // like we want to pass something in schema or column terms
-                                // that indicates whether each col is valid. maybe something
-                                // along the lines of arrow2's validity bitmaps
-                                let passes_filter = (filter)((&min_key, &min_val), (&max_key, &max_val));
-
-                                info!(
-                                    "May fetch part with K min: {:?}, K max: {:?}, V min: {:?}, V max: {:?}. Passes filter: {}",
-                                    min_key, max_key, min_val, max_val,
-                                    passes_filter,
-                                );
-
-                                if !passes_filter {
-                                    continue;
-                                }
-                            }
+                            let stats = stats.get(&part.key);
+                            should_filter_out::<K, V>(stats.0, key_schema.as_ref(), val_schema.as_ref(), stats.1, mfp.as_ref());
+                            // if stats.get(&part.key, key_schema.as_ref(), val_schema.as_ref(), &mut min_key, &mut min_val, &mut max_key, &mut max_val).is_some() {
+                            //     // WIP: how do we model whether a column has no min/max value?
+                            //     // it depends a bit on the K / V types themselves, so it seems
+                            //     // like we want to pass something in schema or column terms
+                            //     // that indicates whether each col is valid. maybe something
+                            //     // along the lines of arrow2's validity bitmaps
+                            //     let passes_filter = (filter)((&min_key, &min_val), (&max_key, &max_val));
+                            // 
+                            //     info!(
+                            //         "May fetch part with K min: {:?}, K max: {:?}, V min: {:?}, V max: {:?}. Passes filter: {}",
+                            //         min_key, max_key, min_val, max_val,
+                            //         passes_filter,
+                            //     );
+                            // 
+                            //     if !passes_filter {
+                            //         continue;
+                            //     }
+                            // }
                             batch_parts.push(part);
                         }
                     }
@@ -441,6 +455,87 @@ where
     });
 
     (descs_stream, shutdown_button)
+}
+
+pub struct BatchPartStats<'a, K: Codec> {
+    stats: &'a HashMap<String, HollowBatchStats>,
+    key_schema: &'a K::Schema,
+    row_idx: usize,
+    _phantom: PhantomData<K>,
+}
+
+impl<'a, K: Codec> BatchPartStats<'a, K> {}
+
+fn should_filter_out<K: Codec, V: Codec>(
+    stats: &HashMap<String, HollowBatchStats>,
+    key_schema: &K::Schema,
+    val_schema: &V::Schema,
+    row_idx: usize,
+    mfp: Option<&MfpPlan>,
+) -> bool {
+    let mut row = Row::default();
+    let mut packer = row.packer();
+
+    let Some(mfp) = mfp else {
+        return false;
+    };
+
+    let required_columns = mfp.column_access();
+    let mut columns_with_stats = HashSet::new();
+
+    // wip: horrible hack to track defined vs generated cols
+    let mut top_level_columns = 0;
+    for (colname, typ, has_stats) in key_schema.columns() {
+        if !has_stats {
+            continue;
+        }
+
+        if let Some(column_stats) = stats.get(&colname) {
+            if column_stats.min_data_lens.is_empty() {
+                info!("no column stats for {}, null len", colname);
+                packer.push(Datum::Null);
+                continue;
+            }
+
+            columns_with_stats.insert(top_level_columns);
+            top_level_columns += 1;
+
+            let byte_range = usize::cast_from(column_stats.min_data_lens[row_idx]);
+            let offset = usize::cast_from(column_stats.min_data_indices[row_idx]);
+
+            info!(
+                "have column stats for {}: {:?}. offset: {}, len: {}, row: {}",
+                colname, column_stats, offset, byte_range, row_idx
+            );
+
+            // WIP: I wonder if there's a way to reuse DatumDecoder here. Think a bit more about
+            // how principled the byte representation of a stat should be
+            match typ.format {
+                ColumnFormat::I64 => {
+                    let i64 = i64::from_le_bytes(
+                        <[u8; 8]>::try_from(
+                            &column_stats.min_data_bytes[offset..offset + byte_range],
+                        )
+                        .expect("WIP"),
+                    );
+                    info!("Column {} has val: {}", colname, i64);
+                    packer.push(Datum::Int64(i64));
+                }
+                _ => {}
+            }
+        } else {
+            info!("no column stats for {}", colname);
+            packer.push(Datum::Null);
+        }
+    }
+
+    let is_subset = required_columns.is_subset(&columns_with_stats);
+    info!(
+        "MFP required cols: {:?}, read cols from stats: {:?}. is subset: {}",
+        required_columns, columns_with_stats, is_subset
+    );
+
+    false
 }
 
 pub(crate) fn shard_source_fetch<K, V, T, D, G>(
