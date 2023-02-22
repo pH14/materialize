@@ -147,8 +147,8 @@ where
 
 impl<K, V, T, D> WriteHandle<K, V, T, D>
 where
-    K: Debug + Codec + Default, // WIP: remove Default
-    V: Debug + Codec + Default, // WIP: remove Default
+    K: Debug + Codec + Default + Send, // WIP: remove Default
+    V: Debug + Codec + Default + Send, // WIP: remove Default
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {

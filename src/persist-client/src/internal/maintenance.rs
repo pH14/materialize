@@ -220,8 +220,8 @@ where
         gc: &GarbageCollector<K, V, T, D>,
         compactor: Option<&Compactor<K, V, T, D>>,
     ) where
-        K: Debug + Codec,
-        V: Debug + Codec,
+        K: Debug + Codec + Send,
+        V: Debug + Codec + Send,
         D: Semigroup + Codec64 + Send + Sync,
     {
         let _ = self.perform_in_background(machine, gc, compactor);
@@ -238,8 +238,8 @@ where
         gc: &GarbageCollector<K, V, T, D>,
         compactor: Option<&Compactor<K, V, T, D>>,
     ) where
-        K: Debug + Codec,
-        V: Debug + Codec,
+        K: Debug + Codec + Send,
+        V: Debug + Codec + Send,
         D: Semigroup + Codec64 + Send + Sync,
     {
         for future in self.perform_in_background(machine, gc, compactor) {
@@ -258,8 +258,8 @@ where
         compactor: Option<&Compactor<K, V, T, D>>,
     ) -> Vec<BoxFuture<'static, ()>>
     where
-        K: Debug + Codec,
-        V: Debug + Codec,
+        K: Debug + Codec + Send,
+        V: Debug + Codec + Send,
         D: Semigroup + Codec64 + Send + Sync,
     {
         let mut futures = self.routine.perform_in_background(machine, gc);

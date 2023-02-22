@@ -88,8 +88,8 @@ pub struct Compactor<K, V, T, D> {
 
 impl<K, V, T, D> Compactor<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Send,
+    V: Debug + Codec + Send,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
@@ -397,6 +397,7 @@ where
         let mut all_parts = vec![];
         let mut all_runs = vec![];
         let mut len = 0;
+        let mut all_stats = vec![];
 
         for (runs, run_chunk_max_memory_usage) in
             Self::chunk_runs(&req, &cfg, metrics.as_ref(), run_reserved_memory_bytes)
@@ -460,6 +461,7 @@ where
             }
             all_runs.extend(runs.iter().map(|run_start| run_start + run_offset));
             all_parts.extend(parts);
+            all_stats.extend(batch.stats_v2);
             len += updates;
         }
 
@@ -470,7 +472,7 @@ where
                 runs: all_runs,
                 len,
                 stats: vec![],
-                stats_v2: vec![],
+                stats_v2: all_stats,
             },
         })
     }
@@ -620,6 +622,8 @@ where
 
         let mut timings = Timings::default();
 
+        let cpu_heavy_runtime_clone = Arc::clone(&cpu_heavy_runtime);
+        let writer_id_clone = writer_id.clone();
         let mut batch = BatchBuilder::new(
             cfg.clone(),
             Arc::clone(&metrics),
@@ -635,6 +639,21 @@ where
             // TODO: thread full schemes down
             Arc::new(VecU8Schema),
             Arc::new(VecU8Schema),
+        );
+        let mut arrow_batch = BatchBuilder::<K, V, T, D>::new(
+            cfg.clone(),
+            Arc::clone(&metrics),
+            metrics.compaction.batch.clone(),
+            desc.lower().clone(),
+            Arc::clone(&blob),
+            cpu_heavy_runtime_clone,
+            shard_id.clone(),
+            writer_id_clone,
+            desc.since().clone(),
+            Some(desc.upper().clone()),
+            true,
+            Arc::clone(&key_schema),
+            Arc::clone(&val_schema),
         );
 
         start_prefetches::<K, V, T>(
@@ -684,9 +703,9 @@ where
             }
 
             let part = part_builder.finish().expect("WIP");
-            batch.write_part(FilledPart::Arrow(part)).await;
+            arrow_batch.write_part(FilledPart::Arrow(part)).await;
 
-            let batch = batch.finish(desc.upper().clone()).await?;
+            let batch = arrow_batch.finish(desc.upper().clone()).await?;
             let hollow_batch = batch.into_hollow_batch();
 
             return Ok(hollow_batch);
@@ -922,7 +941,7 @@ impl<'a, T: Timestamp + Lattice + Codec64> CompactionPart<'a, T> {
         }
     }
 
-    async fn join<K: Codec, V: Codec>(
+    async fn join<K: Codec + Send, V: Codec + Send>(
         self,
         shard_id: &ShardId,
         blob: &(dyn Blob + Send + Sync),

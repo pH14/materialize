@@ -243,8 +243,8 @@ where
 
 impl<K, V, T, D> BatchBuilder<K, V, T, D>
 where
-    K: Debug + Codec + Default, // WIP: remove Default
-    V: Debug + Codec + Default,
+    K: Debug + Codec,
+    V: Debug + Codec,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64,
 {
@@ -309,7 +309,16 @@ where
         }
     }
 
+    /// WIP
     pub async fn write_part(&mut self, part: FilledPart) {
+        if let FilledPart::Arrow(part) = &part {
+            self.write_stats(part);
+        } else {
+            panic!("WIP");
+        }
+
+        info!("Stats after writing arrow part: {:?}", self.min_max_v2);
+
         self.num_updates += part.len();
         self.parts
             .write(part, self.inline_upper.clone(), self.since.clone())
@@ -386,9 +395,9 @@ where
                 runs: self.runs,
                 stats: {
                     let mut enc = Vec::new();
-                    // if minmax.len() > 0 {
-                    //     encode_part(&mut enc, &minmax).expect("WIP");
-                    // }
+                    if minmax.len() > 0 {
+                        encode_part(&mut enc, &minmax).expect("WIP");
+                    }
                     enc
                 },
                 stats_v2: minmax_v2,
@@ -489,100 +498,7 @@ where
                 }
 
                 // WIP: determine runs with some fancy comparison fn that doesn't exist yet
-
-                for (colname, datatype, collect_stats) in self.k_schema.columns() {
-                    if !collect_stats {
-                        continue;
-                    }
-
-                    let mut column_stats = self.min_max_v2.entry(colname.clone()).or_default();
-                    column_stats.column_name = colname.clone();
-
-                    fn add_min<T>(
-                        stats: &mut HollowBatchStats,
-                        min: Option<T>,
-                        parts_written: usize,
-                    ) where
-                        T: IntoIterator<Item = u8>,
-                    {
-                        match min {
-                            None => {
-                                stats.min_data_lens.push(0);
-                                stats.min_data_indices.push(0);
-                            }
-                            Some(x) => {
-                                let before = stats.min_data_bytes.len();
-                                stats.min_data_bytes.extend(x.into_iter());
-                                let after = stats.min_data_bytes.len();
-                                stats.min_data_lens.push(u64::cast_from(after - before));
-                                stats.min_data_indices.push(u64::cast_from(before));
-                            }
-                        }
-                    }
-
-                    fn add_max<T>(
-                        stats: &mut HollowBatchStats,
-                        max: Option<T>,
-                        parts_written: usize,
-                    ) where
-                        T: IntoIterator<Item = u8>,
-                    {
-                        match max {
-                            None => {
-                                stats.max_data_lens.push(0);
-                                stats.max_data_indices.push(u64::cast_from(parts_written));
-                            }
-                            Some(x) => {
-                                let before = stats.max_data_bytes.len();
-                                stats.max_data_bytes.extend(x.into_iter());
-                                let after = stats.max_data_bytes.len();
-                                stats.max_data_lens.push(u64::cast_from(after - before));
-                                stats.max_data_indices.push(u64::cast_from(before));
-                            }
-                        }
-                    }
-
-                    // WIP: I really hope no one reads this code
-                    match datatype.format {
-                        ColumnFormat::Bool => {}
-                        ColumnFormat::I8 => {
-                            let (min, max) = part.minmax_col::<Option<i8>>(&colname);
-                            let min = min.flatten().map(|m| m.to_le_bytes());
-                            let max = max.flatten().map(|m| m.to_le_bytes());
-                            add_min(&mut column_stats, min, self.parts_written);
-                            add_max(&mut column_stats, max, self.parts_written);
-                        }
-                        ColumnFormat::I16 => {}
-                        ColumnFormat::I32 => {}
-                        ColumnFormat::I64 => {
-                            let (min, max) = part.minmax_col::<Option<i64>>(&colname);
-                            let min = min.flatten().map(|m| m.to_le_bytes());
-                            let max = max.flatten().map(|m| m.to_le_bytes());
-                            add_min(&mut column_stats, min, self.parts_written);
-                            add_max(&mut column_stats, max, self.parts_written);
-                        }
-                        ColumnFormat::U8 => {}
-                        ColumnFormat::U16 => {}
-                        ColumnFormat::U32 => {
-                            let (min, max) = part.minmax_col::<Option<u32>>(&colname);
-                            let min = min.flatten().map(|m| m.to_le_bytes());
-                            let max = max.flatten().map(|m| m.to_le_bytes());
-                            add_min(&mut column_stats, min, self.parts_written);
-                            add_max(&mut column_stats, max, self.parts_written);
-                        }
-                        ColumnFormat::U64 => {
-                            let (min, max) = part.minmax_col::<Option<u64>>(&colname);
-                            let min = min.flatten().map(|m| m.to_le_bytes());
-                            let max = max.flatten().map(|m| m.to_le_bytes());
-                            add_min(&mut column_stats, min, self.parts_written);
-                            add_max(&mut column_stats, max, self.parts_written);
-                        }
-                        ColumnFormat::F32 => {}
-                        ColumnFormat::F64 => {}
-                        ColumnFormat::Bytes => {}
-                        ColumnFormat::String => {}
-                    }
-                }
+                self.write_stats(part);
 
                 let minmax = part.minmax();
                 self.min_max.push_from(&part, minmax.0, 0, 1).expect("min");
@@ -604,6 +520,96 @@ where
 
         self.parts_written += 1;
         self.num_updates += num_updates;
+    }
+
+    fn write_stats(&mut self, part: &Part) {
+        for (colname, datatype, collect_stats) in self.k_schema.columns() {
+            if !collect_stats {
+                continue;
+            }
+
+            let mut column_stats = self.min_max_v2.entry(colname.clone()).or_default();
+            column_stats.column_name = colname.clone();
+
+            fn add_min<T>(stats: &mut HollowBatchStats, min: Option<T>)
+            where
+                T: IntoIterator<Item = u8>,
+            {
+                match min {
+                    None => {
+                        stats.min_data_lens.push(0);
+                        stats.min_data_indices.push(0);
+                    }
+                    Some(x) => {
+                        let before = stats.min_data_bytes.len();
+                        stats.min_data_bytes.extend(x.into_iter());
+                        let after = stats.min_data_bytes.len();
+                        stats.min_data_lens.push(u64::cast_from(after - before));
+                        stats.min_data_indices.push(u64::cast_from(before));
+                    }
+                }
+            }
+
+            fn add_max<T>(stats: &mut HollowBatchStats, max: Option<T>)
+            where
+                T: IntoIterator<Item = u8>,
+            {
+                match max {
+                    None => {
+                        stats.max_data_lens.push(0);
+                        stats.max_data_indices.push(0);
+                    }
+                    Some(x) => {
+                        let before = stats.max_data_bytes.len();
+                        stats.max_data_bytes.extend(x.into_iter());
+                        let after = stats.max_data_bytes.len();
+                        stats.max_data_lens.push(u64::cast_from(after - before));
+                        stats.max_data_indices.push(u64::cast_from(before));
+                    }
+                }
+            }
+
+            // WIP: I really hope no one reads this code
+            match datatype.format {
+                ColumnFormat::Bool => {}
+                ColumnFormat::I8 => {
+                    let (min, max) = part.minmax_col::<Option<i8>>(&colname);
+                    let min = min.flatten().map(|m| m.to_le_bytes());
+                    let max = max.flatten().map(|m| m.to_le_bytes());
+                    add_min(&mut column_stats, min);
+                    add_max(&mut column_stats, max);
+                }
+                ColumnFormat::I16 => {}
+                ColumnFormat::I32 => {}
+                ColumnFormat::I64 => {
+                    let (min, max) = part.minmax_col::<Option<i64>>(&colname);
+                    let min = min.flatten().map(|m| m.to_le_bytes());
+                    let max = max.flatten().map(|m| m.to_le_bytes());
+                    add_min(&mut column_stats, min);
+                    add_max(&mut column_stats, max);
+                }
+                ColumnFormat::U8 => {}
+                ColumnFormat::U16 => {}
+                ColumnFormat::U32 => {
+                    let (min, max) = part.minmax_col::<Option<u32>>(&colname);
+                    let min = min.flatten().map(|m| m.to_le_bytes());
+                    let max = max.flatten().map(|m| m.to_le_bytes());
+                    add_min(&mut column_stats, min);
+                    add_max(&mut column_stats, max);
+                }
+                ColumnFormat::U64 => {
+                    let (min, max) = part.minmax_col::<Option<u64>>(&colname);
+                    let min = min.flatten().map(|m| m.to_le_bytes());
+                    let max = max.flatten().map(|m| m.to_le_bytes());
+                    add_min(&mut column_stats, min);
+                    add_max(&mut column_stats, max);
+                }
+                ColumnFormat::F32 => {}
+                ColumnFormat::F64 => {}
+                ColumnFormat::Bytes => {}
+                ColumnFormat::String => {}
+            }
+        }
     }
 }
 

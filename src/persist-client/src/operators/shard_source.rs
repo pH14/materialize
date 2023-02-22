@@ -189,6 +189,7 @@ where
     let name_owned = name.to_owned();
     let key_schema_copy = Arc::clone(&key_schema);
     let val_schema_copy = Arc::clone(&val_schema);
+    let until_clone = until.clone();
     let async_stream = async_stream::try_stream!({
         // Only one worker is responsible for distributing parts
         if worker_index != chosen_worker {
@@ -334,7 +335,15 @@ where
                     Some(Ok(ListenEvent::Updates((mut parts, stats)))) => {
                         for part in parts {
                             let stats = stats.get(&part.key);
-                            if should_filter_out::<K, V>(stats.0, key_schema.as_ref(), val_schema.as_ref(), stats.1, mfp.as_ref()) {
+                            // forgive me, for I have sinned
+                            let until = until_clone.clone();
+                            let jank_until = if until.len() == 0 {
+                                Antichain::new()
+                            } else {
+                                Antichain::from_elem(mz_repr::Timestamp::new(u64::from_le_bytes(until.get(0).expect("WIP").encode())))
+                            };
+                            let jank_timestamp = mz_repr::Timestamp::new(u64::from_le_bytes(Codec64::encode(&current_ts)));
+                            if should_filter_out::<K, V>(stats.0, key_schema.as_ref(), val_schema.as_ref(), stats.1, mfp.as_ref(), jank_until, jank_timestamp) {
                                 total_parts_skippable += 1;
                             }
                             total_parts_fetched += 1;
@@ -480,6 +489,8 @@ fn should_filter_out<K: Codec, V: Codec>(
     val_schema: &V::Schema,
     row_idx: usize,
     mfp: Option<&MfpPlan>,
+    until: Antichain<mz_repr::Timestamp>,
+    timestamp: mz_repr::Timestamp,
 ) -> bool {
     let Some(mfp) = mfp else {
         return false;
@@ -554,8 +565,8 @@ fn should_filter_out<K: Codec, V: Codec>(
 
     let is_subset = required_columns.is_subset(&columns_with_stats);
     info!(
-        "MFP required cols: {:?}, read cols from stats: {:?}. is subset: {}. min datums: {:?}",
-        required_columns, columns_with_stats, is_subset, min_datums,
+        "MFP required cols: {:?}, read cols from stats: {:?}. is subset: {}. min datums: {:?}. timestamp: {:?}, until: {:?}",
+        required_columns, columns_with_stats, is_subset, min_datums, timestamp, until
     );
     let arena = mz_repr::RowArena::new();
     let mut row_builder = Row::default();
@@ -570,9 +581,9 @@ fn should_filter_out<K: Codec, V: Codec>(
         .evaluate(
             &mut min_datums,
             &arena,
-            mz_repr::Timestamp::minimum(),
+            timestamp.clone(),
             1,
-            |_time| true,
+            |time| !until.less_equal(time),
             &mut row_builder,
         )
         .collect();
@@ -582,9 +593,9 @@ fn should_filter_out<K: Codec, V: Codec>(
         .evaluate(
             &mut max_datums,
             &arena,
-            mz_repr::Timestamp::minimum(),
+            timestamp,
             1,
-            |_time| true,
+            |time| !until.less_equal(time),
             &mut row_builder,
         )
         .collect();

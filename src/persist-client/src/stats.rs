@@ -133,24 +133,24 @@ impl<K: Codec, V: Codec> BatchStatsBuilder<K, V> {
         }
         self.current_batch_idx += 1;
 
-        if batch.stats.len() > 0 {
-            let parquet_stats = decode_part(
-                &mut std::io::Cursor::new(&batch.stats),
-                self.key_schema.as_ref(),
-                self.val_schema.as_ref(),
-            )?;
-
-            self.stats.push(parquet_stats);
-
-            for (row_idx, batch_part) in batch.parts.iter().enumerate() {
-                self.keys.insert(
-                    batch_part.key.clone(),
-                    (self.current_batch_idx, 2 * row_idx),
-                );
-            }
-
-            self.current_batch_idx += 1;
-        };
+        // if batch.stats.len() > 0 {
+        //     let parquet_stats = decode_part(
+        //         &mut std::io::Cursor::new(&batch.stats),
+        //         self.key_schema.as_ref(),
+        //         self.val_schema.as_ref(),
+        //     )?;
+        //
+        //     self.stats.push(parquet_stats);
+        //
+        //     for (row_idx, batch_part) in batch.parts.iter().enumerate() {
+        //         self.keys.insert(
+        //             batch_part.key.clone(),
+        //             (self.current_batch_idx, 2 * row_idx),
+        //         );
+        //     }
+        //
+        //     self.current_batch_idx += 1;
+        // };
 
         Ok(())
     }
