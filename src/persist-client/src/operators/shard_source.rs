@@ -560,6 +560,10 @@ fn should_filter_out<K: Codec, V: Codec>(
     let arena = mz_repr::RowArena::new();
     let mut row_builder = Row::default();
 
+    // WIP/TODO for compute-y people: we need to be picky about what predicates we can evaluate.
+    // Nullness would need to be enriched with null_count part stats, things like `foo == 123`
+    // would need to become range expressions, etc.
+
     let min_results: Vec<
         Result<(Row, mz_repr::Timestamp, Diff), (MfpPushdownError, mz_repr::Timestamp, Diff)>,
     > = mfp
