@@ -139,6 +139,8 @@ pub fn bench_persist(c: &mut Criterion) {
         DataGenerator::small()
     };
 
+    porcelain::bench_minmax("porcelain/minmax_bytes", c, &data);
+    porcelain::bench_minmax_u64("porcelain/minmax_u64", c, &data);
     porcelain::bench_writes("porcelain/writes", throughput, c, &runtime, &data);
     porcelain::bench_write_to_listen("porcelain/write_to_listen", throughput, c, &runtime, &data);
     porcelain::bench_snapshot("porcelain/snapshot", throughput, c, &runtime, &data);

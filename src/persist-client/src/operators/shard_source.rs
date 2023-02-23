@@ -134,6 +134,7 @@ where
         Arc::clone(&val_schema),
         Box::new(|(_kmin, _vmin), (_kmax, _vmax)| true),
         map_filter_project,
+        consumed_part_tx.clone(),
     );
     let (parts, tokens) = shard_source_fetch(
         &descs, name, clients, location, shard_id, key_schema, val_schema,
@@ -172,6 +173,7 @@ pub(crate) fn shard_source_descs<K, V, D, G>(
     val_schema: Arc<V::Schema>,
     filter: Box<dyn Fn((&K, &V), (&K, &V)) -> bool>,
     map_filter_project: Option<&mut MfpPlan>,
+    consumed_part_tx: mpsc::UnboundedSender<SerdeLeasedBatchPart>,
 ) -> (Stream<G, (usize, SerdeLeasedBatchPart)>, ShutdownButton<()>)
 where
     K: Debug + Codec + Default,
@@ -324,7 +326,9 @@ where
         // let mut min_val = V::default();
         // let mut max_val = V::default();
         let mut total_parts_fetched = 0;
-        let mut total_parts_skippable = 0;
+        let mut total_parts_filtered_out = 0;
+        let mut total_bytes_fetched = 0;
+        let mut total_bytes_filtered_out = 0;
 
         loop {
             // While we have budget left for fetching more parts, read from the
@@ -335,8 +339,8 @@ where
                     Some(Ok(ListenEvent::Updates((mut parts, stats)))) => {
                         for part in parts {
                             let stats = stats.get(&part.key);
-                            // forgive me, for I have sinned
                             let until = until_clone.clone();
+                            // forgive me, for I have sinned
                             let jank_until = if until.len() == 0 {
                                 Antichain::new()
                             } else {
@@ -344,9 +348,13 @@ where
                             };
                             let jank_timestamp = mz_repr::Timestamp::new(u64::from_le_bytes(Codec64::encode(&current_ts)));
                             if should_filter_out::<K, V>(stats.0, key_schema.as_ref(), val_schema.as_ref(), stats.1, mfp.as_ref(), jank_until, jank_timestamp) {
-                                total_parts_skippable += 1;
+                                total_parts_filtered_out += 1;
+                                total_bytes_filtered_out += part.encoded_size_bytes();
+                                let _ = consumed_part_tx.send(part.into_exchangeable_part());
+                                continue;
                             }
                             total_parts_fetched += 1;
+                            total_bytes_fetched += part.encoded_size_bytes();
                             // if stats.get(&part.key, key_schema.as_ref(), val_schema.as_ref(), &mut min_key, &mut min_val, &mut max_key, &mut max_val).is_some() {
                             //     // WIP: how do we model whether a column has no min/max value?
                             //     // it depends a bit on the K / V types themselves, so it seems
@@ -414,7 +422,8 @@ where
                                 current_ts = ts;
                             }
                             None => {
-                                info!("Dataflow complete. Parts fetched: {}, skippable: {}", total_parts_fetched, total_parts_skippable);
+                                info!("parts fetched: {}, parts filtered: {}, bytes fetched: {}, bytes filtered: {}", 
+                                    total_parts_fetched, total_parts_filtered_out, total_bytes_fetched, total_bytes_filtered_out);
                                 cap_set.downgrade(&[]);
                                 return;
                             }
@@ -427,7 +436,8 @@ where
                     // `pinned_stream`, so propagate that information
                     // downstream.
                     None => {
-                        info!("Dataflow complete. Parts fetched: {}, skippable: {}", total_parts_fetched, total_parts_skippable);
+                        info!("parts fetched: {}, parts filtered: {}, bytes fetched: {}, bytes filtered: {}", 
+                                    total_parts_fetched, total_parts_filtered_out, total_bytes_fetched, total_bytes_filtered_out);
                         cap_set.downgrade(&[]);
                         return;
                     }
@@ -515,6 +525,7 @@ fn should_filter_out<K: Codec, V: Codec>(
                     "no column stats for {}, null len or zero bytes for part",
                     colname
                 );
+                top_level_columns += 1;
                 min_datums.push(Datum::Null);
                 max_datums.push(Datum::Null);
                 continue;
@@ -558,6 +569,7 @@ fn should_filter_out<K: Codec, V: Codec>(
             }
         } else {
             info!("no column stats for {}", colname);
+            top_level_columns += 1;
             min_datums.push(Datum::Null);
             max_datums.push(Datum::Null);
         }
@@ -568,6 +580,9 @@ fn should_filter_out<K: Codec, V: Codec>(
         "MFP required cols: {:?}, read cols from stats: {:?}. is subset: {}. min datums: {:?}. timestamp: {:?}, until: {:?}",
         required_columns, columns_with_stats, is_subset, min_datums, timestamp, until
     );
+    if !is_subset {
+        return false;
+    }
     let arena = mz_repr::RowArena::new();
     let mut row_builder = Row::default();
 

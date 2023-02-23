@@ -71,6 +71,24 @@ impl<'a> ColOrd<'a> {
         (min_idx, max_idx)
     }
 
+    pub fn minmax_simd(&self) -> (Option<&[u8]>, Option<&[u8]>) {
+        match self {
+            ColOrd::Bytes(b) => {
+                let min = arrow2::compute::aggregate::min_binary(b);
+                let max = arrow2::compute::aggregate::max_binary(b);
+                return (min, max);
+            }
+            ColOrd::OptU64(b) => {
+                let min = arrow2::compute::aggregate::min(*b);
+                let max = arrow2::compute::aggregate::max(*b);
+                return (min.map_or(None, |_| None), max.map_or(None, |_| None));
+            }
+            _ => {
+                panic!("unsupported simd");
+            }
+        }
+    }
+
     fn cmp(&self, idx0: usize, other: &ColOrd, idx1: usize) -> Ordering {
         // WIP: complete all the pairwise mappings so we can cmp between parts
         // WIP: to add separate null counts, we need to update the logic here to separate out null/

@@ -678,7 +678,7 @@ where
         if should_use_arrow {
             let mut part_builder = PartBuilder::new(key_schema.as_ref(), val_schema.as_ref());
             let t = i64::decode(T::encode(desc.since().get(0).expect("WIP")));
-            info!(
+            debug!(
                 "{}: Arrow compaction with t={}, num parts={}",
                 shard_id,
                 t,

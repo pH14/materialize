@@ -81,7 +81,7 @@ impl From<&ScalarType> for ColumnFormat {
             ScalarType::Float32 => ColumnFormat::F32,
             ScalarType::Float64 => ColumnFormat::F64,
             ScalarType::Bytes => ColumnFormat::Bytes,
-            ScalarType::String => ColumnFormat::String,
+            ScalarType::String | ScalarType::VarChar { .. } => ColumnFormat::String,
             ScalarType::Numeric { .. } => ColumnFormat::Bytes,
             _ => {
                 // warn!(

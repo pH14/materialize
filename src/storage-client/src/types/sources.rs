@@ -3012,7 +3012,7 @@ impl Schema<SourceData> for RelationDesc {
                 ScalarType::Numeric { .. } => {
                     decoders.push(DatumDecoder::Numeric(part.col::<Vec<u8>>(name.as_str())?));
                 }
-                ScalarType::String => {
+                ScalarType::String | ScalarType::VarChar { .. } => {
                     decoders.push(DatumDecoder::StringOpt(
                         part.col::<Option<String>>(name.as_str())?,
                     ));
@@ -3100,7 +3100,7 @@ impl Schema<SourceData> for RelationDesc {
                 ScalarType::Numeric { .. } => {
                     encoders.push(DatumEncoder::Numeric(part.col::<Vec<u8>>(name.as_str())?));
                 }
-                ScalarType::String => {
+                ScalarType::String | ScalarType::VarChar { .. } => {
                     encoders.push(DatumEncoder::StringOpt(
                         part.col::<Option<String>>(name.as_str())?,
                     ));
@@ -3162,7 +3162,7 @@ fn test_source_data_columnar() {
             p.push(Datum::Int16(i16::MAX - 1));
         })
     });
-    packer.push(Datum::False);
+    packer.push(Datum::String("abcd"));
 
     let schema = RelationDesc::from_names_and_types(vec![
         (
@@ -3247,7 +3247,7 @@ fn test_source_data_columnar() {
             "a:a",
             ColumnType {
                 nullable: true,
-                scalar_type: ScalarType::Bool,
+                scalar_type: ScalarType::VarChar { max_length: None },
             },
         ),
     ]);

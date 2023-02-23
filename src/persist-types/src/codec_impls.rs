@@ -172,6 +172,55 @@ impl Codec for String {
     }
 }
 
+/// An implementation of [Schema] for [`u64`].
+#[derive(Debug, Clone, Default)]
+pub struct U64Schema;
+
+pub struct U64Encoder<'a> {
+    inner: &'a mut MutablePrimitiveArray<u64>,
+}
+
+pub struct U64Decoder<'a> {
+    inner: &'a PrimitiveArray<u64>,
+}
+
+impl<'a> PartEncoder<'a, u64> for U64Encoder<'a> {
+    fn encode(&mut self, val: &u64) {
+        self.inner.push(Some(*val));
+    }
+}
+
+impl<'a> PartDecoder<'a, u64> for U64Decoder<'a> {
+    fn decode(&self, idx: usize, val: &mut u64) {
+        *val = self.inner.value(idx)
+    }
+}
+
+impl Schema<u64> for U64Schema {
+    type Encoder<'a> = U64Encoder<'a>;
+    type Decoder<'a> = U64Decoder<'a>;
+
+    fn columns(&self) -> Vec<(String, DataType, bool)> {
+        let data_type = DataType {
+            optional: true,
+            format: ColumnFormat::U64,
+        };
+        vec![("".to_owned(), data_type, true)]
+    }
+
+    fn decoder<'a>(&self, mut cols: ColumnsRef<'a>) -> Result<Self::Decoder<'a>, String> {
+        let col = cols.col::<Option<u64>>("")?;
+        let () = cols.finish()?;
+        Ok(U64Decoder { inner: col })
+    }
+
+    fn encoder<'a>(&self, mut cols: ColumnsMut<'a>) -> Result<Self::Encoder<'a>, String> {
+        let col = cols.col::<Option<u64>>("")?;
+        let () = cols.finish()?;
+        Ok(U64Encoder { inner: col })
+    }
+}
+
 /// An implementation of [Schema] for [`Vec<u8>`].
 #[derive(Debug, Clone, Default)]
 pub struct VecU8Schema;

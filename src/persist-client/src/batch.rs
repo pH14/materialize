@@ -25,7 +25,7 @@ use differential_dataflow::trace::Description;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tokio::task::JoinHandle;
-use tracing::{debug_span, info, instrument, trace_span, warn, Instrument};
+use tracing::{debug, debug_span, info, instrument, trace_span, warn, Instrument};
 
 use mz_ore::cast::CastFrom;
 use mz_persist::indexed::columnar::{ColumnarRecords, ColumnarRecordsBuilder};
@@ -317,7 +317,7 @@ where
             panic!("WIP");
         }
 
-        info!("Stats after writing arrow part: {:?}", self.min_max_v2);
+        debug!("Stats after writing arrow part: {:?}", self.min_max_v2);
 
         self.num_updates += part.len();
         self.parts
@@ -370,7 +370,7 @@ where
         let minmax = self.min_max.finish().expect("finished");
 
         if minmax.len() > 0 {
-            info!("{}: Minmax: {:?}", self.shard_id, minmax);
+            debug!("{}: Minmax: {:?}", self.shard_id, minmax);
         }
 
         let minmax_v2 = self

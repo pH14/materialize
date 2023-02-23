@@ -14,6 +14,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use crate::batch::BatchBuilder;
 use differential_dataflow::trace::Description;
 use timely::progress::Antichain;
 use tracing::info;

@@ -284,6 +284,21 @@ impl Part {
         (None, None)
     }
 
+    pub fn minmax_simd(&self) -> Vec<(usize, usize)> {
+        let mut res = Vec::with_capacity(self.key.len() + self.val.len());
+        for (_name, col) in self.key.iter() {
+            let col_ord = col.to_col_ord();
+            let (min, max) = col_ord.minmax_simd();
+            res.push((min.map_or(0, |x| x.len()), max.map_or(0, |x| x.len())));
+        }
+        for (_name, col) in self.val.iter() {
+            let col_ord = col.to_col_ord();
+            let (min, max) = col_ord.minmax_simd();
+            res.push((min.map_or(0, |x| x.len()), max.map_or(0, |x| x.len())));
+        }
+        res
+    }
+
     /// Flatmaps over the columns of this [Part]'s key and value, returning
     /// a Vecs with indices into each column's minimum and maximum elements.
     pub fn minmax(&self) -> (Vec<usize>, Vec<usize>) {
@@ -332,13 +347,13 @@ impl Part {
             .map(|idx| (key_cols.key(idx), val_cols.key(idx), ts_col.key(idx)))
             .collect::<Vec<_>>();
         indexes.sort();
-        eprintln!(
-            "{:?}",
-            indexes
-                .iter()
-                .map(|(k, v, t)| (k.idx, v.idx, t.idx))
-                .collect::<Vec<_>>()
-        );
+        // eprintln!(
+        //     "{:?}",
+        //     indexes
+        //         .iter()
+        //         .map(|(k, v, t)| (k.idx, v.idx, t.idx))
+        //         .collect::<Vec<_>>()
+        // );
         let mut sorted = PartBuilder::new_from_part(self);
         let mut prev: Option<((ColsOrdKey, ColsOrdKey, ColsOrdKey), i64)> = None;
         for current in indexes {

@@ -23,7 +23,7 @@ use mz_ore::cast::CastFrom;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
-use tracing::{debug_span, info, trace_span, Instrument};
+use tracing::{debug_span, info, trace, trace_span, Instrument};
 
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Blob, SeqNo};
@@ -308,7 +308,9 @@ where
                     val_schema.as_ref(),
                 );
                 let part = result.expect("WIP: oh noes");
-                info!("Decoded part as Arrow: {:?}", part);
+                if part.len() < 10 {
+                    info!("Decoded part as Arrow: {:?}", part);
+                }
                 drop(value);
                 WrittenPart::Arrow(part)
             }
@@ -561,7 +563,7 @@ where
             //         continue;
             //     }
             // }
-            info!(
+            trace!(
                 "Arrow: yielding {:?} {:?} {:?} {:?} on index {} of {}",
                 k,
                 v,

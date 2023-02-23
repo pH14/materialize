@@ -10,8 +10,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use criterion::{black_box, Criterion, Throughput};
-use mz_persist_types::codec_impls::VecU8Schema;
+use criterion::{black_box, BenchmarkId, Criterion, Throughput};
+use mz_persist_types::codec_impls::{U64Schema, UnitSchema, VecU8Schema};
 use timely::progress::Antichain;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -22,9 +22,59 @@ use mz_ore::task;
 use mz_persist::workload::DataGenerator;
 use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{PersistClient, ShardId};
+use mz_persist_types::columnar::{PartEncoder, Schema};
+use mz_persist_types::part::PartBuilder;
 use mz_persist_types::Codec64;
 
 use crate::{bench_all_clients, load};
+
+pub fn bench_minmax(name: &str, c: &mut Criterion, data: &DataGenerator) {
+    let mut part = PartBuilder::new(&VecU8Schema, &VecU8Schema);
+    let schema = VecU8Schema::default();
+    let (keys, vals, mut ts_diff) = part.mut_handles();
+    let mut key_encoder = schema.encoder(keys).expect("WIP");
+    let mut val_encoder = schema.encoder(vals).expect("WIP");
+    for ((k, v), t, d) in data.records() {
+        key_encoder.encode(&k);
+        val_encoder.encode(&v);
+        ts_diff.push(t as i64, d as i64);
+    }
+    let part = part.finish().expect("yay");
+
+    let mut g = c.benchmark_group(name);
+    g.bench_function(BenchmarkId::new("rust_ord", 1), |b| {
+        b.iter(|| part.minmax());
+    });
+    g.bench_function(BenchmarkId::new("arrow", 1), |b| {
+        b.iter(|| part.minmax_simd());
+    });
+}
+
+pub fn bench_minmax_u64(name: &str, c: &mut Criterion, data: &DataGenerator) {
+    let mut part = PartBuilder::new(&U64Schema, &U64Schema);
+    let schema = U64Schema::default();
+    let (keys, vals, mut ts_diff) = part.mut_handles();
+    let mut key_encoder = schema.encoder(keys).expect("WIP");
+    let mut val_encoder = schema.encoder(vals).expect("WIP");
+    for ((mut k, mut v), t, d) in data.records() {
+        k.truncate(8);
+        v = k.clone();
+        let k: [u8; 8] = k.try_into().expect("abc");
+        let v: [u8; 8] = v.try_into().expect("abc");
+        key_encoder.encode(&u64::from_le_bytes(k));
+        val_encoder.encode(&u64::from_le_bytes(v));
+        ts_diff.push(t as i64, d as i64);
+    }
+    let part = part.finish().expect("yay");
+
+    let mut g = c.benchmark_group(name);
+    g.bench_function(BenchmarkId::new("rust_ord", 1), |b| {
+        b.iter(|| part.minmax());
+    });
+    g.bench_function(BenchmarkId::new("arrow_simd", 1), |b| {
+        b.iter(|| part.minmax_simd());
+    });
+}
 
 pub fn bench_writes(
     name: &str,
