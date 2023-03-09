@@ -41,8 +41,8 @@ pub struct BatchFetcher<K, V, T, D>
 where
     T: Timestamp + Lattice + Codec64,
     // These are only here so we can use them in the auto-expiring `Drop` impl.
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Send,
+    V: Debug + Codec + Send,
     D: Semigroup + Codec64 + Send + Sync,
 {
     pub(crate) blob: Arc<dyn Blob + Send + Sync>,
@@ -56,8 +56,8 @@ where
 
 impl<K, V, T, D> BatchFetcher<K, V, T, D>
 where
-    K: Debug + Codec,
-    V: Debug + Codec,
+    K: Debug + Codec + Send,
+    V: Debug + Codec + Send,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
@@ -70,6 +70,15 @@ where
         };
         handle.expire().await;
         b
+    }
+
+    pub(crate) fn clone(&self) -> Self {
+        Self {
+            blob: Arc::clone(&self.blob),
+            metrics: Arc::clone(&self.metrics),
+            shard_id: self.shard_id,
+            _phantom: PhantomData,
+        }
     }
 
     /// Takes a [`SerdeLeasedBatchPart`] into a [`LeasedBatchPart`].

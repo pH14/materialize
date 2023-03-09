@@ -29,16 +29,18 @@ use mz_persist_types::{Codec, Codec64};
 use mz_timely_util::builder_async::{Event, OperatorBuilder as AsyncOperatorBuilder};
 use timely::dataflow::channels::pact::{Exchange, Pipeline};
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
-use timely::dataflow::operators::CapabilitySet;
+use timely::dataflow::operators::{Capability, CapabilitySet, InputCapability};
 use timely::dataflow::{Scope, Stream};
 use timely::order::TotalOrder;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tokio::sync::mpsc;
-use tracing::trace;
+use tokio::task::JoinHandle;
+use tracing::{info, trace};
 
 use crate::cache::PersistClientCache;
-use crate::fetch::{FetchedPart, SerdeLeasedBatchPart};
+use crate::error::InvalidUsage;
+use crate::fetch::{FetchedPart, LeasedBatchPart, SerdeLeasedBatchPart};
 use crate::read::ListenEvent;
 use crate::{PersistLocation, ShardId};
 
@@ -465,16 +467,21 @@ where
                 .await
         };
 
-        while let Some(event) = descs_input.next_mut().await {
-            if let Event::Data(cap, data) = event {
-                // `LeasedBatchPart`es cannot be dropped at this point w/o
-                // panicking, so swap them to an owned version.
-                for (_idx, part) in data.drain(..) {
-                    let (token, fetched) = fetcher
-                        .fetch_leased_part(fetcher.leased_part_from_exchangeable(part))
-                        .await;
-                    let fetched = fetched.expect("shard_id should match across all workers");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Capability<T>, JoinHandle<(LeasedBatchPart<T>, Result<FetchedPart<K, V, T, D>, InvalidUsage<T>>)>)>();
+
+        let task_stream = async_stream::stream! {
+            while let Some((cap, task)) = rx.recv().await {
+                yield (cap, task.await.expect("abc"));
+            }
+        };
+        tokio::pin!(task_stream);
+
+        loop {
+            tokio::select! {
+                Some((cap, (token, fetched))) = task_stream.next() => {
+                    let fetched: FetchedPart<K, V, T, D> = fetched.expect("shard_id should match across all workers");
                     {
+                        info!("{}: Sending data for cap {:?}", shard_id, cap);
                         // Do very fine-grained output activation/session
                         // creation to ensure that we don't hold activated
                         // outputs or sessions across await points, which
@@ -488,8 +495,60 @@ where
                             .give(token.into_exchangeable_part());
                     }
                 }
-            }
+                Some(event) = descs_input.next_mut() => {
+                    if let Event::Data(cap, data) = event {
+                        let cap = cap.retain();
+                        for (_idx, part) in data.drain(..) {
+                            let fetcher_clone = fetcher.clone();
+                            let lpart = fetcher_clone.leased_part_from_exchangeable(part);
+                            let task = mz_ore::task::spawn(|| "abc", async move {
+                                let x = fetcher_clone.fetch_leased_part(lpart);
+                                x.await
+                            });
+                            info!("{}: Sending task with cap {:?}", shard_id, cap);
+                            tx.send((cap.clone(), task)).expect("abc");
+                        }
+                    }
+                }
+                else => {
+                    break;
+                }
+            };
         }
+        //
+        // while let Some(event) = descs_input.next_mut().await {
+        //     if let Event::Data(cap, data) = event {
+        //         // `LeasedBatchPart`es cannot be dropped at this point w/o
+        //         // panicking, so swap them to an owned version.
+        //         for (_idx, part) in data.drain(..) {
+        //             let fetcher_clone = fetcher.clone();
+        //             let lpart = fetcher_clone.leased_part_from_exchangeable(part);
+        //             let task = mz_ore::task::spawn(|| "abc", async move {
+        //                 let x = fetcher_clone.fetch_leased_part(lpart);
+        //                 x.await
+        //             });
+        //             tx.send(task).expect("abc");
+        //
+        //             let (token, fetched) = fetcher
+        //                 .fetch_leased_part(fetcher.leased_part_from_exchangeable(part))
+        //                 .await;
+        //             let fetched = fetched.expect("shard_id should match across all workers");
+        //             {
+        //                 // Do very fine-grained output activation/session
+        //                 // creation to ensure that we don't hold activated
+        //                 // outputs or sessions across await points, which
+        //                 // would prevent messages from being flushed from
+        //                 // the shared timely output buffer.
+        //                 let mut fetched_output = fetched_output.activate();
+        //                 let mut tokens_output = tokens_output.activate();
+        //                 fetched_output.session(&cap).give(fetched);
+        //                 tokens_output
+        //                     .session(&cap)
+        //                     .give(token.into_exchangeable_part());
+        //             }
+        //         }
+        //     }
+        // }
     });
 
     (fetched_stream, tokens_stream)
