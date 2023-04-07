@@ -19,9 +19,9 @@ use differential_dataflow::lattice::Lattice;
 use mz_ore::cast::CastFrom;
 use mz_persist_types::{Codec, Codec64};
 use timely::progress::{Antichain, Timestamp};
-use tracing::debug;
+use tracing::{debug, info};
 
-use mz_persist::location::{CaSResult, Indeterminate, SeqNo};
+use mz_persist::location::{CaSResult, Indeterminate, SeqNo, VersionedData};
 
 use crate::cache::{LockingTypedState, StateCache};
 use crate::error::CodecMismatch;
@@ -36,6 +36,7 @@ use crate::internal::state_diff::StateDiff;
 use crate::internal::state_versions::{EncodedRollup, StateVersions};
 use crate::internal::trace::FueledMergeReq;
 use crate::internal::watch::StateWatch;
+use crate::rpc::{PushClientConn, PushedDiffFn};
 use crate::{PersistConfig, ShardId};
 
 /// An applier of persist commands.
@@ -48,6 +49,8 @@ pub struct Applier<K, V, T, D> {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) shard_metrics: Arc<ShardMetrics>,
     pub(crate) state_versions: Arc<StateVersions>,
+    shared_states: Arc<StateCache>,
+    push_client: Option<Arc<PushClientConn>>,
     pub(crate) shard_id: ShardId,
 
     // Access to the shard's state, shared across all handles created by the same
@@ -69,6 +72,8 @@ impl<K, V, T: Clone, D> Clone for Applier<K, V, T, D> {
             metrics: Arc::clone(&self.metrics),
             shard_metrics: Arc::clone(&self.shard_metrics),
             state_versions: Arc::clone(&self.state_versions),
+            shared_states: Arc::clone(&self.shared_states),
+            push_client: self.push_client.clone(),
             shard_id: self.shard_id,
             state: Arc::clone(&self.state),
         }
@@ -87,7 +92,8 @@ where
         shard_id: ShardId,
         metrics: Arc<Metrics>,
         state_versions: Arc<StateVersions>,
-        shared_states: &StateCache,
+        shared_states: Arc<StateCache>,
+        push_client: Option<Arc<PushClientConn>>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let shard_metrics = metrics.shards.shard(&shard_id);
         let state = shared_states
@@ -102,14 +108,59 @@ where
                     })
             })
             .await?;
-        Ok(Applier {
+        let ret = Applier {
             cfg,
             metrics,
             shard_metrics,
             state_versions,
+            shared_states,
+            push_client,
             shard_id,
             state,
-        })
+        };
+        // WIP only do this once per state init
+        {
+            let mut pushed_diff_fns = ret.shared_states.pushed_diff_fns.write().expect("lock");
+            if pushed_diff_fns.get(&shard_id).is_none() {
+                let applier = ret.clone();
+                let pushed_diff_fn = Box::new(move |data: VersionedData| {
+                    let applied =
+                        applier
+                            .state
+                            .write_lock(&applier.metrics.locks.applier_write, |state| {
+                                debug!(
+                                    "applying pushed diff {} {} to {}",
+                                    shard_id, data.seqno, state.seqno
+                                );
+                                if data.seqno <= state.seqno.next() {
+                                    state.apply_encoded_diffs(
+                                        &applier.cfg,
+                                        &applier.metrics,
+                                        std::iter::once(&data),
+                                    );
+                                    info!("applied pushed diff {} {}", shard_id, data.seqno);
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                    if applied {
+                        return;
+                    }
+                    // We were missing some intermediate diffs, fall back to
+                    // fetching everything from consensus.
+                    //
+                    // WIP probably don't run this in a task?
+                    let applier = applier.clone();
+                    let _task =
+                        mz_ore::task::spawn(|| "persist::push_diff::missing_diffs", async move {
+                            applier.fetch_and_update_state(Some(data.seqno)).await
+                        });
+                });
+                pushed_diff_fns.insert(shard_id, PushedDiffFn(pushed_diff_fn));
+            }
+        }
+        Ok(ret)
     }
 
     /// Returns a new [StateWatch] for changes to this Applier's State.
@@ -272,10 +323,13 @@ where
             cmd.seconds.inc_by(now.elapsed().as_secs_f64());
 
             match ret {
-                ApplyCmdResult::Committed((seqno, new_state, res, maintenance)) => {
+                ApplyCmdResult::Committed((seqno, diff, new_state, res, maintenance)) => {
                     cmd.succeeded.inc();
                     self.shard_metrics.cmd_succeeded.inc();
                     self.update_state(new_state);
+                    if let Some(push_client) = self.push_client.as_ref() {
+                        push_client.push_diff(&self.shard_id, &diff);
+                    }
                     return Ok((seqno, Ok(res), maintenance));
                 }
                 ApplyCmdResult::SkippedStateTransition((seqno, err, maintenance)) => {
@@ -343,7 +397,7 @@ where
             .await;
 
         match cas_res {
-            Ok(CaSResult::Committed) => {
+            Ok((CaSResult::Committed, diff)) => {
                 assert!(
                     expected <= state.seqno,
                     "state seqno regressed: {} vs {}",
@@ -365,9 +419,11 @@ where
                     write_rollup: state.need_rollup(),
                 };
 
-                ApplyCmdResult::Committed((state.seqno, state, work_ret, maintenance))
+                ApplyCmdResult::Committed((state.seqno, diff, state, work_ret, maintenance))
             }
-            Ok(CaSResult::ExpectationMismatch) => ApplyCmdResult::ExpectationMismatch(expected),
+            Ok((CaSResult::ExpectationMismatch, _diff)) => {
+                ApplyCmdResult::ExpectationMismatch(expected)
+            }
             Err(err) => ApplyCmdResult::Indeterminate(err),
         }
     }
@@ -472,7 +528,7 @@ where
     /// Fetches and updates to the latest state. Uses an optional hint to early-out if
     /// any more recent version of state is observed (e.g. updated by another handle),
     /// without making any calls to Consensus or Blob.
-    pub async fn fetch_and_update_state(&mut self, seqno_hint: Option<SeqNo>) {
+    pub async fn fetch_and_update_state(&self, seqno_hint: Option<SeqNo>) {
         let current_seqno = self.seqno();
         let seqno_before = match seqno_hint {
             None => current_seqno,
@@ -549,7 +605,15 @@ where
 }
 
 enum ApplyCmdResult<K, V, T, D, R, E> {
-    Committed((SeqNo, TypedState<K, V, T, D>, R, RoutineMaintenance)),
+    Committed(
+        (
+            SeqNo,
+            VersionedData,
+            TypedState<K, V, T, D>,
+            R,
+            RoutineMaintenance,
+        ),
+    ),
     SkippedStateTransition((SeqNo, E, RoutineMaintenance)),
     Indeterminate(Indeterminate),
     ExpectationMismatch(SeqNo),

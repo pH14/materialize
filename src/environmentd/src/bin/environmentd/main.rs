@@ -99,6 +99,8 @@ use fail::FailScenario;
 use http::header::HeaderValue;
 use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
+use mz_ore::task::RuntimeExt;
+use mz_persist_client::rpc::PushServer;
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
 use prometheus::IntGauge;
@@ -711,9 +713,32 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     let persist_clients = PersistClientCache::new(
         PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
         &metrics_registry,
+        // envd doesn't push anywhere, everyone pushes to us
+        None,
     );
     let persist_clients = Arc::new(persist_clients);
     let orchestrator = Arc::new(TracingOrchestrator::new(orchestrator, args.tracing.clone()));
+
+    // WIP steal the internal_sql_listen_addr so maybe we can get this to demo
+    // without k8s changes
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_owned());
+    let port = args.internal_sql_listen_addr.port();
+    let persist_push_addr = format!("http://{}:{}", host, port);
+    eprintln!("persist_push_addr {}", persist_push_addr);
+    let persist_push_server = PushServer::new(&persist_clients);
+    let _server = runtime.spawn_named(|| "persist::push::server", async move {
+        let span = tracing::info_span!("persist::push::server");
+        let _guard = span.enter();
+        tracing::info!(
+            "persist push server listening on {}",
+            args.internal_sql_listen_addr
+        );
+        let res = persist_push_server
+            .serve(args.internal_sql_listen_addr)
+            .await;
+        tracing::info!("persist push server exited {:?}", res);
+    });
+
     let controller = ControllerConfig {
         build_info: &mz_environmentd::BUILD_INFO,
         orchestrator,
@@ -728,6 +753,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         now: SYSTEM_TIME.clone(),
         postgres_factory: StashFactory::new(&metrics_registry),
         metrics_registry: metrics_registry.clone(),
+        persist_push_addr,
     };
 
     let cluster_replica_sizes: ClusterReplicaSizeMap = match args.cluster_replica_sizes {
@@ -751,7 +777,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     let server = runtime.block_on(mz_environmentd::serve(mz_environmentd::Config {
         sql_listen_addr: args.sql_listen_addr,
         http_listen_addr: args.http_listen_addr,
-        internal_sql_listen_addr: args.internal_sql_listen_addr,
+        // internal_sql_listen_addr: args.internal_sql_listen_addr,
         internal_http_listen_addr: args.internal_http_listen_addr,
         tls,
         frontegg,
@@ -812,10 +838,10 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     );
     println!(" SQL address: {}", server.sql_local_addr());
     println!(" HTTP address: {}", server.http_local_addr());
-    println!(
-        " Internal SQL address: {}",
-        server.internal_sql_local_addr()
-    );
+    // println!(
+    //     " Internal SQL address: {}",
+    //     server.internal_sql_local_addr()
+    // );
     println!(
         " Internal HTTP address: {}",
         server.internal_http_local_addr()

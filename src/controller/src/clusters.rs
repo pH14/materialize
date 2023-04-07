@@ -408,6 +408,7 @@ where
             ClusterRole::System => "system",
             ClusterRole::User => "user",
         };
+        let persist_push_addr = self.persist_push_addr.clone();
         let service = self
             .orchestrator
             .ensure_service(
@@ -428,6 +429,7 @@ where
                             format!("--internal-http-listen-addr={}", assigned["internal-http"]),
                             format!("--opentelemetry-resource=cluster_id={}", cluster_id),
                             format!("--opentelemetry-resource=replica_id={}", replica_id),
+                            format!("--persist-push-addr={}", persist_push_addr),
                         ]
                     },
                     ports: vec![

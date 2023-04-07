@@ -434,7 +434,8 @@ async fn make_machine(
         shard_id,
         metrics,
         state_versions,
-        &StateCache::default(),
+        &Arc::new(StateCache::default()),
+        None,
     )
     .await?;
 

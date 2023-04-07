@@ -290,7 +290,7 @@ pub fn start_server(config: Config) -> Result<Server, anyhow::Error> {
     // Tune down the number of connections to make this all work a little easier
     // with local postgres.
     persist_cfg.consensus_connection_pool_max_size = 1;
-    let persist_clients = PersistClientCache::new(persist_cfg, &metrics_registry);
+    let persist_clients = PersistClientCache::new(persist_cfg, &metrics_registry, None);
     let persist_clients = Arc::new(persist_clients);
     let postgres_factory = StashFactory::new(&metrics_registry);
     let secrets_controller = Arc::clone(&orchestrator);
@@ -339,12 +339,13 @@ pub fn start_server(config: Config) -> Result<Server, anyhow::Error> {
             now: SYSTEM_TIME.clone(),
             postgres_factory,
             metrics_registry: metrics_registry.clone(),
+            persist_push_addr: "WIP".to_owned(),
         },
         secrets_controller,
         cloud_resource_controller: None,
         sql_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         http_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        internal_sql_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        // internal_sql_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         internal_http_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         tls: config.tls,
         frontegg: config.frontegg,

@@ -22,13 +22,15 @@ use differential_dataflow::lattice::Lattice;
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::{
-    Blob, Consensus, ExternalError, BLOB_GET_LIVENESS_KEY, CONSENSUS_HEAD_LIVENESS_KEY,
+    Blob, Consensus, ExternalError, VersionedData, BLOB_GET_LIVENESS_KEY,
+    CONSENSUS_HEAD_LIVENESS_KEY,
 };
 use mz_persist_types::{Codec, Codec64};
+use mz_proto::ProtoType;
 use timely::progress::Timestamp;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
-use tracing::instrument;
+use tracing::{debug, instrument};
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
@@ -36,6 +38,7 @@ use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus};
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
+use crate::rpc::{PushClient, PushClientConn, PushedDiffFn};
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
@@ -53,7 +56,8 @@ pub struct PersistClientCache {
     blob_by_uri: Mutex<BTreeMap<String, (RttLatencyTask, Arc<dyn Blob + Send + Sync>)>>,
     consensus_by_uri: Mutex<BTreeMap<String, (RttLatencyTask, Arc<dyn Consensus + Send + Sync>)>>,
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
-    state_cache: Arc<StateCache>,
+    pub(crate) state_cache: Arc<StateCache>,
+    push_client: Option<Arc<PushClientConn>>,
 }
 
 #[derive(Debug)]
@@ -67,23 +71,51 @@ impl Drop for RttLatencyTask {
 
 impl PersistClientCache {
     /// Returns a new [PersistClientCache].
-    pub fn new(cfg: PersistConfig, registry: &MetricsRegistry) -> Self {
+    pub fn new(
+        cfg: PersistConfig,
+        registry: &MetricsRegistry,
+        push_client: Option<PushClient>,
+    ) -> Self {
         let metrics = Metrics::new(&cfg, registry);
+        let state_cache = Arc::new(StateCache::default());
+        let push_client = push_client.map(|x| {
+            let state_cache = Arc::clone(&state_cache);
+            let conn = x.into_conn(move |res| {
+                // WIP weird place for this logic to live
+                let shard_id = res.shard_id.into_rust().expect("WIP");
+                let diff = VersionedData {
+                    seqno: res.seqno.into_rust().expect("WIP"),
+                    data: res.diff,
+                };
+                debug!(
+                    "client got diff {} {} {}",
+                    shard_id,
+                    diff.seqno,
+                    diff.data.len()
+                );
+                state_cache.push_diff(&shard_id, diff);
+            });
+            Arc::new(conn)
+        });
         PersistClientCache {
             cfg,
             metrics: Arc::new(metrics),
             blob_by_uri: Mutex::new(BTreeMap::new()),
             consensus_by_uri: Mutex::new(BTreeMap::new()),
             cpu_heavy_runtime: Arc::new(CpuHeavyRuntime::new()),
-            state_cache: Arc::new(StateCache::default()),
+            state_cache,
+            push_client,
         }
     }
 
     /// A test helper that returns a [PersistClientCache] disconnected from
     /// metrics.
-    #[cfg(test)]
     pub fn new_no_metrics() -> Self {
-        Self::new(PersistConfig::new_for_tests(), &MetricsRegistry::new())
+        Self::new(
+            PersistConfig::new_for_tests(),
+            &MetricsRegistry::new(),
+            None,
+        )
     }
 
     /// Returns the [PersistConfig] being used by this cache.
@@ -106,6 +138,7 @@ impl PersistClientCache {
             Arc::clone(&self.metrics),
             Arc::clone(&self.cpu_heavy_runtime),
             Arc::clone(&self.state_cache),
+            self.push_client.clone(),
         )
     }
 
@@ -303,6 +336,7 @@ where
 #[derive(Debug, Default)]
 pub struct StateCache {
     states: Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>,
+    pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
 }
 
 #[derive(Debug)]
@@ -312,6 +346,15 @@ enum StateCacheInit {
 }
 
 impl StateCache {
+    pub(crate) fn push_diff(&self, shard_id: &ShardId, diff: VersionedData) {
+        let pushed_diff_fns = self.pushed_diff_fns.read().expect("lock");
+        if let Some(pushed_diff_fn) = pushed_diff_fns.get(shard_id) {
+            pushed_diff_fn.0(diff)
+        } else {
+            debug!("shard not used by this process {}", shard_id);
+        }
+    }
+
     pub(crate) async fn get<K, V, T, D, F, InitFn>(
         &self,
         shard_id: ShardId,
@@ -538,6 +581,7 @@ mod tests {
         let cache = PersistClientCache::new(
             PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone()),
             &MetricsRegistry::new(),
+            None,
         );
         assert_eq!(cache.blob_by_uri.lock().await.len(), 0);
         assert_eq!(cache.consensus_by_uri.lock().await.len(), 0);

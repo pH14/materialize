@@ -83,6 +83,7 @@ use anyhow::Context;
 use axum::routing;
 use fail::FailScenario;
 use futures::future;
+use mz_persist_client::rpc::PushClient;
 use once_cell::sync::Lazy;
 use tracing::info;
 
@@ -140,6 +141,14 @@ struct Args {
         default_value = "127.0.0.1:6878"
     )]
     internal_http_listen_addr: SocketAddr,
+    /// WIP
+    #[clap(
+        long,
+        env = "PERSIST_PUSH_ADDR",
+        value_name = "HOST:PORT",
+        default_value = "127.0.0.1:2103"
+    )]
+    persist_push_addr: String,
 
     // === Cloud options. ===
     /// An external ID to be supplied to all AWS AssumeRole operations.
@@ -259,9 +268,12 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
         )
     });
 
+    info!("WIP persist_push_addr {}", args.persist_push_addr);
+    let push_client = PushClient::connect(args.persist_push_addr).await?;
     let persist_clients = Arc::new(PersistClientCache::new(
         PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
         &metrics_registry,
+        Some(push_client),
     ));
 
     // Start storage server.

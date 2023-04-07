@@ -615,6 +615,7 @@ pub async fn blob_usage(args: &StateArgs) -> Result<(), anyhow::Error> {
         metrics,
         cpu_heavy_runtime,
         state_cache,
+        None,
     )?);
 
     if let Some(shard_id) = shard_id {

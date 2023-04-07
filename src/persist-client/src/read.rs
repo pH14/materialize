@@ -898,6 +898,7 @@ where
                 Ok(b) => return b,
                 Err(seqno) => seqno,
             };
+
             // Only sleep after the first fetch, because the first time through
             // maybe our state was just out of date.
             retry = match retry.take() {
@@ -1359,6 +1360,7 @@ mod tests {
             metrics,
             Arc::new(CpuHeavyRuntime::new()),
             Arc::new(StateCache::default()),
+            None,
         )
         .expect("client construction failed")
         .expect_open::<String, String, u64, i64>(ShardId::new())

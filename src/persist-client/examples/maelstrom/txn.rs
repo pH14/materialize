@@ -680,6 +680,7 @@ impl Service for TransactorService {
             metrics,
             cpu_heavy_runtime,
             shared_states,
+            None,
         )?;
         let transactor = Transactor::new(&client, handle.node_id(), shard_id).await?;
         let service = TransactorService(Arc::new(Mutex::new(transactor)));

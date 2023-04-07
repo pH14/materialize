@@ -183,6 +183,7 @@ fn create_mem_mem_client() -> Result<PersistClient, ExternalError> {
         metrics,
         cpu_heavy_runtime,
         shared_states,
+        None,
     )
 }
 
@@ -209,6 +210,7 @@ async fn create_file_pg_client(
         metrics,
         cpu_heavy_runtime,
         shared_states,
+        None,
     )?;
     Ok(Some((postgres_consensus, client, dir)))
 }
@@ -238,6 +240,7 @@ async fn create_s3_pg_client(
         metrics,
         cpu_heavy_runtime,
         shared_states,
+        None,
     )?;
     Ok(Some((postgres_consensus, client)))
 }

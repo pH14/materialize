@@ -112,6 +112,7 @@ use crate::internal::machine::{retry_external, Machine};
 use crate::internal::state_versions::StateVersions;
 use crate::metrics::Metrics;
 use crate::read::{LeasedReaderId, ReadHandle};
+use crate::rpc::PushClientConn;
 use crate::write::{WriteHandle, WriterId};
 
 pub mod async_runtime;
@@ -137,6 +138,7 @@ pub mod operators {
     pub mod shard_source;
 }
 pub mod read;
+pub mod rpc;
 pub mod stats;
 pub mod usage;
 pub mod write;
@@ -151,6 +153,7 @@ mod internal {
     pub mod maintenance;
     pub mod metrics;
     pub mod paths;
+    pub mod service;
     pub mod state;
     pub mod state_diff;
     pub mod state_versions;
@@ -255,6 +258,7 @@ pub struct PersistClient {
     metrics: Arc<Metrics>,
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
     shared_states: Arc<StateCache>,
+    push_client: Option<Arc<PushClientConn>>,
 }
 
 impl PersistClient {
@@ -270,6 +274,7 @@ impl PersistClient {
         metrics: Arc<Metrics>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         shared_states: Arc<StateCache>,
+        push_client: Option<Arc<PushClientConn>>,
     ) -> Result<Self, ExternalError> {
         // TODO: Verify somehow that blob matches consensus to prevent
         // accidental misuse.
@@ -280,6 +285,7 @@ impl PersistClient {
             metrics,
             cpu_heavy_runtime,
             shared_states,
+            push_client,
         })
     }
 
@@ -361,6 +367,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             &self.shared_states,
+            self.push_client.clone(),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());
@@ -514,6 +521,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             &self.shared_states,
+            self.push_client.clone(),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());
@@ -567,6 +575,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             &self.shared_states,
+            self.push_client.clone(),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());

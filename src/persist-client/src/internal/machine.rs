@@ -45,6 +45,7 @@ use crate::internal::state::{
 use crate::internal::state_versions::StateVersions;
 use crate::internal::trace::{ApplyMergeResult, FueledMergeRes};
 use crate::read::LeasedReaderId;
+use crate::rpc::PushClientConn;
 use crate::write::WriterId;
 use crate::{PersistConfig, ShardId};
 
@@ -74,9 +75,18 @@ where
         shard_id: ShardId,
         metrics: Arc<Metrics>,
         state_versions: Arc<StateVersions>,
-        shared_states: &StateCache,
+        shared_states: &Arc<StateCache>,
+        push_client: Option<Arc<PushClientConn>>,
     ) -> Result<Self, Box<CodecMismatch>> {
-        let applier = Applier::new(cfg, shard_id, metrics, state_versions, shared_states).await?;
+        let applier = Applier::new(
+            cfg,
+            shard_id,
+            metrics,
+            state_versions,
+            Arc::clone(shared_states),
+            push_client,
+        )
+        .await?;
         Ok(Machine { applier })
     }
 
@@ -1020,6 +1030,7 @@ pub mod datadriven {
                 Arc::clone(&client.metrics),
                 Arc::clone(&state_versions),
                 &client.shared_states,
+                None,
             )
             .await
             .expect("codecs should match");
