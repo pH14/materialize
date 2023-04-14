@@ -152,6 +152,8 @@ pub struct ControllerConfig {
     pub postgres_factory: StashFactory,
     /// The metrics registry.
     pub metrics_registry: MetricsRegistry,
+    /// The URL for Persist PubSub.
+    pub persist_pubsub_addr: String,
 }
 
 /// Responses that [`Controller`] can produce.
@@ -229,6 +231,8 @@ pub struct Controller<T = mz_repr::Timestamp> {
     metrics_tx: UnboundedSender<(ReplicaId, Vec<ServiceProcessMetrics>)>,
     /// Receiver for the channel over which replica metrics are sent.
     metrics_rx: Peekable<UnboundedReceiverStream<(ReplicaId, Vec<ServiceProcessMetrics>)>>,
+    /// WIP
+    persist_pubsub_addr: String,
 }
 
 impl<T> Controller<T> {
@@ -365,6 +369,7 @@ where
             metrics_tasks: BTreeMap::new(),
             metrics_tx,
             metrics_rx: UnboundedReceiverStream::new(metrics_rx).peekable(),
+            persist_pubsub_addr: config.persist_pubsub_addr,
         }
     }
 }
