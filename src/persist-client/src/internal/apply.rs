@@ -90,15 +90,19 @@ where
     ) -> Result<Self, Box<CodecMismatch>> {
         let shard_metrics = metrics.shards.shard(&shard_id);
         let state = shared_states
-            .get::<K, V, T, D, _, _>(shard_id, || {
-                metrics
-                    .cmds
-                    .init_state
-                    .run_cmd(&shard_metrics, |_cas_mismatch_metric| {
-                        // No cas_mismatch retries because we just use the returned
-                        // state on a mismatch.
-                        state_versions.maybe_init_shard(&shard_metrics)
-                    })
+            .get::<K, V, T, D, _, _>(shard_id, || async {
+                let cmd_metrics = &metrics.cmds.init_state;
+                let now = Instant::now();
+                let res = state_versions.maybe_init_shard(&shard_metrics).await;
+                cmd_metrics.seconds.inc_by(now.elapsed().as_secs_f64());
+                match res.as_ref() {
+                    Ok(_) => {
+                        cmd_metrics.succeeded.inc();
+                        shard_metrics.cmd_succeeded.inc();
+                    }
+                    Err(_) => cmd_metrics.failed.inc(),
+                };
+                res
             })
             .await?;
         Ok(Applier {

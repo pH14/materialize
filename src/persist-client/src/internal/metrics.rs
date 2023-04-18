@@ -520,31 +520,6 @@ pub struct CmdMetrics {
     pub(crate) seconds: Counter,
 }
 
-impl CmdMetrics {
-    pub async fn run_cmd<R, E, F, CmdFn>(
-        &self,
-        shard_metrics: &ShardMetrics,
-        cmd_fn: CmdFn,
-    ) -> Result<R, E>
-    where
-        F: std::future::Future<Output = Result<R, E>>,
-        CmdFn: FnOnce(CmdCasMismatchMetric) -> F,
-    {
-        self.started.inc();
-        let start = Instant::now();
-        let res = cmd_fn(CmdCasMismatchMetric(self.cas_mismatch.clone())).await;
-        self.seconds.inc_by(start.elapsed().as_secs_f64());
-        match res.as_ref() {
-            Ok(_) => {
-                self.succeeded.inc();
-                shard_metrics.cmd_succeeded.inc();
-            }
-            Err(_) => self.failed.inc(),
-        };
-        res
-    }
-}
-
 #[derive(Debug)]
 pub struct CmdsMetrics {
     pub(crate) init_state: CmdMetrics,
