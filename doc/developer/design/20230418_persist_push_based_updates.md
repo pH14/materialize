@@ -4,14 +4,14 @@
 # Summary
 [summary]: #summary
 
-Replacing Persist's polling-based discovery with push-based updates.
+Replacing Persist's polling-based discovery of new state with push-based updates.
 
 # Motivation
 [motivation]: #motivation
 
 tl;dr
-* Reduces CockroachDB read traffic to near zero, reducing current CPU usage by 20-30% (relative to total usage). This will allow us to [scale down
-  our clusters further](https://github.com/MaterializeInc/materialize/issues/18665).
+* Reduces CockroachDB read traffic to near zero, reducing current CPU usage by 20-30% (relative to total usage).
+  This will allow us to [scale down our clusters further](https://github.com/MaterializeInc/materialize/issues/18665).
 * Reduces the median latency of observing new data written to a shard from ~300ms to single digit millis
 
 ---
@@ -144,34 +144,24 @@ shards, and broadcasts out the diff to the interested subscribers.
 
 From there, each subscriber would [apply the diff](#applying-received-updates).
 
-
-Explain the design as if it were part of Materialize and you were teaching the team about it.
-This can mean:
-
-- Introduce new named concepts.
-- Explain the feature using examples that demonstrate product-level changes.
-- Explain how it builds on the current architecture.
-- Explain how engineers and users should think about this change, and how it influences how everyone uses the product.
-- If needed, talk though errors, backwards-compatibility, or migration strategies.
-- Discuss how this affects maintainability, or whether it introduces concepts that might be hard to change in the future.
-
 # Rollout
 [rollout]: #rollout
 
-optimization, ok if it doesn't work. can hold behind feature flag
+We will roll out this change in phases behind a feature flag. The change is seen purely as an optimization opportunity,
+and should be safe to shut off at any time. We will aim ensure that any errors handled due to push-based updates cannot
+crash or halt the process.
 
 We anticipate message volume to be on the order of 1-1.5 per second per shard, with each message in the 100 bytes-1KiB
 range. Given the scale of our usage today, we would expect `environmentd` to be able to broadcast this data and message volume
-comfortably with minimal impact on performance. One metric we'll want to keep an eye on is how much time `environmentd` spends
-decoding and applying diffs, as it necessarily owns a copy of state for all shards in the environment, and will be updating
-state more frequently than before. We anticipate `clusterd` to be negligibly impacted by this added RPC traffic, as each
-`clusterd` would only need to push/receive updates for the shards it is reading and writing.
+comfortably with minimal impact on performance. 
 
-Using push-based updates is seen as an optimization opportunity, and can be safely put behind a feature flag.
+That said, we'll want to keep an eye on is how much time `environmentd` spends decoding, applying, and broadcasting diffs.
+`environmentd` is the only process that necessarily owns a copy of state to each shard, and it will likely be applying
+more diffs than before, in addition to the new workload of broadcasting. We anticipate `clusterd` to be negligibly impacted
+by this added RPC traffic, as each `clusterd` would only need to push/receive updates for the shards it is reading and writing.
 
-[//]: # (Describe what steps are necessary to enable this feature for users.)
-
-[//]: # (How do we validate that the feature performs as expected? What monitoring and observability does it require?)
+Our existing Persist metrics dashboard, in addition to the new metrics outlined below, should be sufficient to monitor
+the change and understand its impact.
 
 ## Testing and observability
 [testing-and-observability]: #testing-and-observability
@@ -180,78 +170,47 @@ We will introduce several metrics to understand the behavior of the change:
 
 * # of updates pushed
 * # of updates received that apply cleanly & uncleanly
-* Latency of update push to receiving
-* Timings of `environmentd`'s broadcasting
+* How frequently `Listen`s need to fallback to polling
+* End-to-end latency of appending data to observing it
+* Timings of `environmentd`'s broadcasting / load
 
-
-* Lots of metrics, existing persist/testing should cover cases of disconnections etc
-* 
-
-
-Testability and explainability are top-tier design concerns!
-Describe how you will test and roll out the implementation.
-When the deliverable is a refactoring, the existing tests may be sufficient.
-When the deliverable is a new feature, new tests are imperative.
-
-Describe what metrics can be used to monitor and observe the feature.
-What information do we need to expose internally, and what information is interesting to the user?
-How do we expose the information?
-
-Basic guidelines:
-
-* Nearly every feature requires either Rust unit tests, sqllogictest tests, or testdrive tests.
-* Features that interact with Kubernetes additionally need a cloudtest test.
-* Features that interact with external systems additionally should be tested manually in a staging environment.
-* Features or changes to performance-critical parts of the system should be load tested.
+CI will be used to ensure we do not introduce novel crashes or halts, but we anticipate the most interesting data to
+come from opted-in environments in staging and prod, rather than what we can synthetically observe.
 
 ## Lifecycle
 [lifecycle]: #lifecycle
 
-This feature will be wrapped in a feature flag.
-
-If the design is risky or has the potential to be destabilizing, you should plan to roll the implementation out behind a feature flag.
-List all feature flags, their behavior and when it is safe to change their value.
-Describe the [lifecycle of the feature](https://www.notion.so/Feature-lifecycle-2fb13301803b4b7e9ba0868238bd4cfb).
-Will it start as an alpha feature behind a feature flag?
-What level of testing will be required to promote to beta?
-To stable?
+We will use a feature flag that can quickly toggle on the publication / subscription to updates dynamically. Our metrics
+dashboards will inform our rollout process.
 
 # Drawbacks
 [drawbacks]: #drawbacks
 
-The main drawback here is how the work fits within broader prioritization, and whether the time should be spent elsewhere.
-Looking forward, we know our polling-based discovery is not long-term sustainable and will need replacement.
-
-[//]: # (Why should we *not* do this?)
+Looking forward, we know our polling-based discovery is not long-term sustainable and will need replacement. Given that,
+we think the main drawbacks here are around broader prioritization (should our time be spent on something else for now),
+and on the specific merits of the proposed idea (could we design it better).
 
 # Conclusion and alternatives
 [conclusion-and-alternatives]: #conclusion-and-alternatives
 
-- Why is the design the best to solve the problem?
-- What other designs have been considered, and what were the reasons to not pick any other?
-- What is the impact of not implementing this design?
-
 ## Architectural
 
-A Persist sidechannel is valuable as Persist is used as a communication layer between processes, and the sidechannel allows
-for quicker and more efficient communication between them.
+As Materialize is currently architected, Persist serves as a type of communication layer between processes. A sidechannel
+would allow for quicker, more efficient communication between processes access the same shard.
 
 An alternative to this architecture, that out obsolete the need for a sidechannel entirely, would be to consolidate
 interactions with Persist purely into `environmentd`, and allow it to instruct `clusterd` what work to perform explicitly.
 Some ideas have been floating that [move more in this direction](https://materializeinc.slack.com/archives/C04LEA9D8BU/p16813495590089590).
 
 After much thought on this one, our determination is that, regardless of whether we make broader architectural changes,
-a Persist sidechannel is worth pursuing now, even if it is obsoleted later. It would benefit the product sooner rather
-than later, its scope is well contained, and it would not introduce any new complexity that would impede any larger redesigns.
+a Persist sidechannel is worth pursuing now, even if it is obsoleted and ripped out later. It would meaningfully benefit
+the product and our infra costs sooner rather than later, its scope is well contained, and it would not introduce any new
+complexity that would impede any larger reworkings.
 
 ## Sidechannel Implementations
 
 While we have proposed an RPC-based implementation that flows through `environmentd`, these are the alternatives we've
 considered:
-
-### CRDB Changefeeds
-
-
 
 ### Controller RPCs
 
@@ -273,7 +232,7 @@ would send diffs directly to the processes that need them.
 This approach is additionally interesting in that it would set Persist up to communicate other types of data as well,
 not just pub-sub of diffs. One hypothetical -- shard writers could cache recently-written blobs to S3 in memory or on
 disk, and other processes could request those blobs from the writer directly, rather than paying the costs of going to
-S3 which has long tail latencies.
+S3, which is likely to have much longer tail latencies.
 
 The downsides of this approach include the complexity overhead, as it introduces the novel pattern of intra-`clusterd`
 communication in a way that does not exist today, and the scaling limitations imposed by all-to-all communication.
@@ -284,11 +243,20 @@ The [PubSub Trait](#pubsub-trait) would be a good fit for an external message bu
 has been designed to accommodate such a choice long-term. These systems could easily support the workload we've outlined.
 However, since we do not currently operate any of these systems, and because one of the primary impetuses for the work is
 to cut down on infrastructure cost, it would both be a significant lift and added cost to introduce one of them. This
-option may be worth exploring in the future as our usage grows, or if other needs for a message bus elsewhere in the
-product crop up.
+option may be worth exploring in the future as our usage grows, or if other needs for a bonafide message bus elsewhere in
+the product crop up.
+
+### CRDB Changefeeds
+
+CRDB contains a CDC feature, Changefeeds, that would allow us to subscribe to any changes to our `Consensus` table.
+While appealing on the surface, we do not believe Changefeeds provide the right tradeoffs -- one of our goals is to
+reduce CRDB load; low latency delivery of updates [is not guaranteed or expected](https://github.com/cockroachdb/cockroach/issues/36289);
+and the ability to scale to 100s or 1000s of changefeeds per CRDB cluster is unknown.
 
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
+
+TODO
 
 - What questions need to be resolved to finalize the design?
 - What questions will need to be resolved during the implementation of the design?
@@ -297,10 +265,5 @@ product crop up.
 # Future work
 [future-work]: #future-work
 
-Pushing data (!)
-
-Describe what work should follow from this design, which new aspects it enables, and how it might affect individual parts of Materialize.
-Think in larger terms.
-This section can also serve as a place to dump ideas that are related but not part of the design.
-
-If you can't think of any, please note this down.
+Once we have the groundwork in place to push diffs, there will likely be other applications and optimization opportunities
+we can explore, e.g. we could push data blobs (provided it is small) between processes to eliminate many S3 reads.
