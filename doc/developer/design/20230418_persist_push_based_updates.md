@@ -1,10 +1,10 @@
-- Feature name: Persist Push-Based Updates
+- Feature name: Persist State PubSub
 - Associated: https://github.com/MaterializeInc/materialize/issues/18661
 
 # Summary
 [summary]: #summary
 
-Replacing Persist's polling-based discovery of new state with push-based updates.
+Replacing Persist's polling-based discovery of new state with pub-sub updates.
 
 # Motivation
 [motivation]: #motivation
@@ -152,13 +152,12 @@ and should be safe to shut off at any time. We will aim ensure that any errors h
 crash or halt the process.
 
 We anticipate message volume to be on the order of 1-1.5 per second per shard, with each message in the 100 bytes-1KiB
-range. Given the scale of our usage today, we would expect `environmentd` to be able to broadcast this data and message volume
-comfortably with minimal impact on performance. 
+range. Given the scale of our usage today, we would expect `environmentd` to be able to broadcast this data and message
+volume comfortably with minimal impact on performance. 
 
-That said, we'll want to keep an eye on is how much time `environmentd` spends decoding, applying, and broadcasting diffs.
-`environmentd` is the only process that must own a copy of state to each shard, and it will likely be applying more diffs
-than before, in addition to the new workload of broadcasting. We anticipate `clusterd` to be negligibly impacted by this
-added RPC traffic, as each `clusterd` would only need to push/receive updates for the shards it is reading and writing.
+That said, we'll want to keep an eye on how much time `environmentd` spends broadcasting diffs. We anticipate `clusterd`
+to be negligibly impacted by this added RPC traffic, as each `clusterd` would only need to push/receive updates for the
+shards it is reading and writing, which is very similar work to what it is already doing.
 
 Our existing Persist metrics dashboard, in addition to the new metrics outlined below, should be sufficient to monitor
 the change and understand its impact.
@@ -236,6 +235,20 @@ S3, which is likely to have much longer tail latencies.
 
 The downsides of this approach include the complexity overhead, as it introduces the novel pattern of intra-`clusterd`
 communication in a way that does not exist today, and the scaling limitations imposed by all-to-all communication.
+
+### `clusterd`-hosted RPC services
+
+The proposed topology has `environmentd` host a singular RPC service that each `clusterd` dials in to. An alternative
+would be to reverse the direction, and have `environmentd` dial in to each `clusterd`, similar to how the Controller gRPC
+connections are set up. This may be easier to roll out as the design is a known quantity, and `environmentd` can use its
+knowledge of which `clusterd` are created and dropped to set up the appropriate connections.
+
+We are partial to the proposed design however, as it more closely models accessing an external PubSub system: clients
+are given an address to connect to, and begin publishing and subscribing to messages with no further information needed.
+And if individual clients fail to connect, or choose not to (e.g. via feature flag), no harm done, everything continues
+to work via fallbacks. Consolidating the discovery and connection establishment into `environmentd` breaks this abstraction
+in a way that would make swapping implementations more challenging (e.g. Kafka wouldn't be dialing in to `clusterd`!),
+making it harder for Persist to hide its PubSub as an internal detail.
 
 ### External PubSub/Message Bus
 
