@@ -19,19 +19,19 @@ tl;dr
 Full context:
 
 Persist stores the state related to a particular shard in `Consensus`, which today is implemented on CockroachDB (CRDB).
-When any changes to state occur, such a frontier advancement or new data being written, a diff with the relevant change 
+When any changes to state occur, such a frontier advancement or new data being written, a diff with the relevant change
 is appended into `Consensus`. Any handles to the shard can read these diffs, and apply them to their state to observe
 the latest updates.
 
 However, today, we lack a way to promptly discover newly appended diffs beyond continuous polling of `Consensus`/CRDB.
-This means that ongoing read handles to a shard, such as those powering Materialized Views or `Subscribe` queries, must 
+This means that ongoing read handles to a shard, such as those powering Materialized Views or `Subscribe` queries, must
 poll `Consensus` to learn about progress. This polling today contributes ~30% of our total CRDB CPU usage, and introduces
 ~300ms worth of latency (and ~500ms in the worst case) between when a diff is appended into `Consensus` and when the read
 handles are actually able to observe the change and progress their dataflows.
 
 If Persist had a sidechannel to communicate appended diffs between handles, we could eliminate nearly the full read load
 we put on CRDB, in addition to vastly reducing the latency between committing new data and observing it. This design doc
-will explore the interface for this communication, as well as a proposed initial implementation based on RPCs that flow 
+will explore the interface for this communication, as well as a proposed initial implementation based on RPCs that flow
 through `environmentd`.
 
 # Explanation
@@ -62,7 +62,7 @@ pub struct ProtoPushDiff {
 trait PersistPubSubClient {
   type Push: PersistPush;
   type Sub: PersistSub;
-  
+
   /// Receive handles with which to push and subscribe to diffs.
   async fn connect(addr: &str) -> (Self::Push, Self::Sub);
 }
@@ -74,11 +74,11 @@ trait PersistPush {
 
 trait PersistSub {
   type S: Stream<ProtoPushDiff>;
-  
+ 
   /// Informs the server which shards this subscribed should receive diffs for.
   /// May be called at any time to update the set of subscribed shards.
   async fn subscribe(&self, shards: Vec<ShardId>) -> Result<(), Error>;
-  
+ 
   /// Returns a Stream of diffs to the subscribed shards.
   async fn stream(&mut self) -> S;
 }
@@ -99,7 +99,7 @@ progress may be visible. The mechanisms to do this have largely been built:
   rather relying on polling.
 
 It is not assumed for push-based updates delivery to be perfectly reliable nor ordered. We will continue to use polling
-as a fallback for discovering state updates, though with a more generous retry policy than we currently have. If a process 
+as a fallback for discovering state updates, though with a more generous retry policy than we currently have. If a process
 receives a diff that does not apply cleanly (e.g. out-of-order delivery), the process will fetch the latest state from
 Cockroach directly instead. While we will continue to have these fallbacks, we anticipate push-based updates being effective
 enough to eliminate the need for nearly all Cockroach reads.
@@ -107,7 +107,7 @@ enough to eliminate the need for nearly all Cockroach reads.
 # Reference Explanation
 
 As a first implementation of the Persist sidechannel, we propose building a new RPC service that flows through `environmentd`.
-The service would be backed by gRPC with a minimal surface area -- to start, we would use a simple bidirection stream that 
+The service would be backed by gRPC with a minimal surface area -- to start, we would use a simple bidirection stream that
 allows each end to push updates back and forth, with `environmentd` broadcasting out any changes it receives.
 
 ## RPC Service
@@ -136,11 +136,11 @@ service ProtoPersist {
 ```
 
 The proposed topology would have each `clusterd` connect to `environmentd`'s RPC service. `clusterd` would subscribe to
-updates to any shards in its `PersistClientCache` (a singleton in both `environmentd` and `clusterd`). When any `clusterd` 
+updates to any shards in its `PersistClientCache` (a singleton in both `environmentd` and `clusterd`). When any `clusterd`
 commits a change to a shard, it publishes the diff to `environmentd`, which tracks which connections are subscribed to which
 shards, and broadcasts out the diff to the interested subscribers. From there, each subscriber would [apply the diff](#applying-received-updates).
 
-`environmentd` is chosen to host the RPC service as it necessarily holds a handle to each shard (and therefore is always 
+`environmentd` is chosen to host the RPC service as it necessarily holds a handle to each shard (and therefore is always
 interested in all diffs), and to align with the existing topology of the Controller, rather than introduce the complexity
 of point-to-point connections between unrelated `clusterd` processes.
 
@@ -153,7 +153,7 @@ crash or halt the process.
 
 We anticipate message volume to be on the order of 1-1.5 per second per shard, with each message in the 100 bytes-1KiB
 range. Given the scale of our usage today, we would expect `environmentd` to be able to broadcast this data and message
-volume comfortably with minimal impact on performance. 
+volume comfortably with minimal impact on performance.
 
 That said, we'll want to keep an eye on how much time `environmentd` spends broadcasting diffs. We anticipate `clusterd`
 to be negligibly impacted by this added RPC traffic, as each `clusterd` would only need to push/receive updates for the
