@@ -86,7 +86,7 @@ trait PersistSub {
 
 ## Publishing Updates
 
-When any handle to a persist shard successfully compares-and-sets a new state, it will publish the change to `PersistPushClient`.
+When any handle to a persist shard successfully compares-and-sets a new state, it will publish the change to `PersistPush`.
 
 ## Applying Received Updates
 
@@ -138,11 +138,11 @@ service ProtoPersist {
 The proposed topology would have each `clusterd` connect to `environmentd`'s RPC service. `clusterd` would subscribe to
 updates to any shards in its `PersistClientCache` (a singleton in both `environmentd` and `clusterd`). When any `clusterd` 
 commits a change to a shard, it publishes the diff to `environmentd`, which tracks which connections are subscribed to which
-shards, and broadcasts out the diff to the interested subscribers.
+shards, and broadcasts out the diff to the interested subscribers. From there, each subscriber would [apply the diff](#applying-received-updates).
 
-<mermaid diagram>
-
-From there, each subscriber would [apply the diff](#applying-received-updates).
+`environmentd` is chosen to host the RPC service as it necessarily holds a handle to each shard (and therefore is always 
+interested in all diffs), and to align with the existing topology of the Controller, rather than introduce the complexity
+of point-to-point connections between unrelated `clusterd` processes.
 
 # Rollout
 [rollout]: #rollout
@@ -156,9 +156,9 @@ range. Given the scale of our usage today, we would expect `environmentd` to be 
 comfortably with minimal impact on performance. 
 
 That said, we'll want to keep an eye on is how much time `environmentd` spends decoding, applying, and broadcasting diffs.
-`environmentd` is the only process that necessarily owns a copy of state to each shard, and it will likely be applying
-more diffs than before, in addition to the new workload of broadcasting. We anticipate `clusterd` to be negligibly impacted
-by this added RPC traffic, as each `clusterd` would only need to push/receive updates for the shards it is reading and writing.
+`environmentd` is the only process that must own a copy of state to each shard, and it will likely be applying more diffs
+than before, in addition to the new workload of broadcasting. We anticipate `clusterd` to be negligibly impacted by this
+added RPC traffic, as each `clusterd` would only need to push/receive updates for the shards it is reading and writing.
 
 Our existing Persist metrics dashboard, in addition to the new metrics outlined below, should be sufficient to monitor
 the change and understand its impact.
@@ -198,9 +198,9 @@ and on the specific merits of the proposed idea (could we design it better).
 As Materialize is currently architected, Persist serves as a type of communication layer between processes. A sidechannel
 would allow for quicker, more efficient communication between processes access the same shard.
 
-An alternative to this architecture, that out obsolete the need for a sidechannel entirely, would be to consolidate
+An alternative to this architecture, that would obsolete the need for a sidechannel entirely, would be to consolidate
 interactions with Persist purely into `environmentd`, and allow it to instruct `clusterd` what work to perform explicitly.
-Some ideas have been floating that [move more in this direction](https://materializeinc.slack.com/archives/C04LEA9D8BU/p16813495590089590).
+Some ideas have been floating that [move in this direction](https://materializeinc.slack.com/archives/C04LEA9D8BU/p16813495590089590).
 
 After much thought on this one, our determination is that, regardless of whether we make broader architectural changes,
 a Persist sidechannel is worth pursuing now, even if it is obsoleted and ripped out later. It would meaningfully benefit
@@ -256,11 +256,7 @@ and the ability to scale to 100s or 1000s of changefeeds per CRDB cluster is unk
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-TODO
-
-- What questions need to be resolved to finalize the design?
-- What questions will need to be resolved during the implementation of the design?
-- What questions does this design raise that we should address separately?
+TBD, no obviously unresolved questions yet
 
 # Future work
 [future-work]: #future-work
