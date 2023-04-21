@@ -100,7 +100,7 @@ use http::header::HeaderValue;
 use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
-use mz_persist_client::rpc::PushServer;
+use mz_persist_client::rpc::PersistPubSubServer;
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
 use prometheus::IntGauge;
@@ -725,7 +725,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     let port = args.internal_sql_listen_addr.port();
     let persist_push_addr = format!("http://{}:{}", host, port);
     eprintln!("persist_push_addr {}", persist_push_addr);
-    let persist_push_server = PushServer::new(&persist_clients);
+    let persist_push_server = PersistPubSubServer::new(&persist_clients);
     let _server = runtime.spawn_named(|| "persist::push::server", async move {
         let span = tracing::info_span!("persist::push::server");
         let _guard = span.enter();

@@ -15,7 +15,7 @@ use std::time::Duration;
 use mz_ore::task::spawn;
 use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::rpc::{PushClient, PushServer};
+use mz_persist_client::rpc::{PersistPubSubServer, PushClient};
 use mz_persist_client::ShardId;
 use tracing::{info, info_span, Span};
 
@@ -33,7 +33,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
         let _guard = span.enter();
         info!("listening on {}", args.listen_addr);
         let cache = PersistClientCache::new_no_metrics();
-        PushServer::new(&cache)
+        PersistPubSubServer::new(&cache)
             .serve(args.listen_addr.clone())
             .await
     });

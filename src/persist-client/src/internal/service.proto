@@ -17,10 +17,17 @@ message ProtoPushDiff {
     bytes diff = 3;
 }
 
-service ProtoPersist {
-    // WIP: A real impl would have dedicated Req and Res messages, each a oneof:
-    // - ProtoPushReq with ProtoPushDiff and something to filter which shards
-    //   are subscribed to. Later, potentially we'd add a ProtoPushPart.
-    // - ProtoPushRes with ProtoPushDiff and similarly a ProtoPushPart later.
-    rpc Push (stream ProtoPushDiff) returns (stream ProtoPushDiff);
+message ProtoSubscribe {
+    repeated string shards = 1;
+}
+
+message ProtoPubSubMessage {
+    oneof message {
+        ProtoPushDiff push_diff = 1;
+        ProtoSubscribe subscribe = 2;
+    }
+}
+
+service ProtoPersistPubSub {
+    rpc PubSub (stream ProtoPubSubMessage) returns (stream ProtoPubSubMessage);
 }
