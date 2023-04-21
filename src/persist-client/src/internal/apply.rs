@@ -36,7 +36,7 @@ use crate::internal::state_diff::StateDiff;
 use crate::internal::state_versions::{EncodedRollup, StateVersions};
 use crate::internal::trace::FueledMergeReq;
 use crate::internal::watch::StateWatch;
-use crate::rpc::{PushClientConn, PushedDiffFn};
+use crate::rpc::{PubSubSender, PushClientConn, PushedDiffFn};
 use crate::{PersistConfig, ShardId};
 
 /// An applier of persist commands.
@@ -50,7 +50,7 @@ pub struct Applier<K, V, T, D> {
     pub(crate) shard_metrics: Arc<ShardMetrics>,
     pub(crate) state_versions: Arc<StateVersions>,
     shared_states: Arc<StateCache>,
-    push_client: Option<Arc<PushClientConn>>,
+    pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
     pub(crate) shard_id: ShardId,
 
     // Access to the shard's state, shared across all handles created by the same
@@ -73,7 +73,7 @@ impl<K, V, T: Clone, D> Clone for Applier<K, V, T, D> {
             shard_metrics: Arc::clone(&self.shard_metrics),
             state_versions: Arc::clone(&self.state_versions),
             shared_states: Arc::clone(&self.shared_states),
-            push_client: self.push_client.clone(),
+            pubsub_sender: self.pubsub_sender.clone(),
             shard_id: self.shard_id,
             state: Arc::clone(&self.state),
         }
@@ -93,7 +93,7 @@ where
         metrics: Arc<Metrics>,
         state_versions: Arc<StateVersions>,
         shared_states: Arc<StateCache>,
-        push_client: Option<Arc<PushClientConn>>,
+        pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let shard_metrics = metrics.shards.shard(&shard_id);
         let state = shared_states
@@ -114,7 +114,7 @@ where
             shard_metrics,
             state_versions,
             shared_states,
-            push_client,
+            pubsub_sender,
             shard_id,
             state,
         };
@@ -327,8 +327,8 @@ where
                     cmd.succeeded.inc();
                     self.shard_metrics.cmd_succeeded.inc();
                     self.update_state(new_state);
-                    if let Some(push_client) = self.push_client.as_ref() {
-                        push_client.push_diff(&self.shard_id, &diff);
+                    if let Some(push_client) = self.pubsub_sender.as_ref() {
+                        push_client.push(&self.shard_id, &diff);
                     }
                     return Ok((seqno, Ok(res), maintenance));
                 }

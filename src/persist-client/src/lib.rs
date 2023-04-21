@@ -112,7 +112,7 @@ use crate::internal::machine::{retry_external, Machine};
 use crate::internal::state_versions::StateVersions;
 use crate::metrics::Metrics;
 use crate::read::{LeasedReaderId, ReadHandle};
-use crate::rpc::PushClientConn;
+use crate::rpc::{PubSubSender, PushClientConn};
 use crate::write::{WriteHandle, WriterId};
 
 pub mod async_runtime;
@@ -258,7 +258,7 @@ pub struct PersistClient {
     metrics: Arc<Metrics>,
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
     shared_states: Arc<StateCache>,
-    push_client: Option<Arc<PushClientConn>>,
+    pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
 }
 
 impl PersistClient {
@@ -274,7 +274,7 @@ impl PersistClient {
         metrics: Arc<Metrics>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         shared_states: Arc<StateCache>,
-        push_client: Option<Arc<PushClientConn>>,
+        pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
     ) -> Result<Self, ExternalError> {
         // TODO: Verify somehow that blob matches consensus to prevent
         // accidental misuse.
@@ -285,7 +285,7 @@ impl PersistClient {
             metrics,
             cpu_heavy_runtime,
             shared_states,
-            push_client,
+            pubsub_sender,
         })
     }
 
@@ -367,7 +367,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             &self.shared_states,
-            self.push_client.clone(),
+            self.pubsub_sender.clone(),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());
@@ -521,7 +521,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             &self.shared_states,
-            self.push_client.clone(),
+            self.pubsub_sender.clone(),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());
@@ -575,7 +575,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             &self.shared_states,
-            self.push_client.clone(),
+            self.pubsub_sender.clone(),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());

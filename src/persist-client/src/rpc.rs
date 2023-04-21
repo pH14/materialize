@@ -9,20 +9,21 @@
 
 #![allow(missing_docs, dead_code)] // WIP
 
-use async_trait::async_trait;
-use futures::Stream;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mz_persist::location::VersionedData;
-use mz_proto::RustType;
+use async_trait::async_trait;
+use futures::Stream;
+use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
 use thiserror::Error;
-use tokio::sync::mpsc::error::SendError;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tonic::{Response, Streaming};
 use tracing::warn;
+
+use mz_persist::location::VersionedData;
+use mz_proto::RustType;
 
 use crate::cache::PersistClientCache;
 use crate::internal::service::proto_persist_pub_sub_client::ProtoPersistPubSubClient;
@@ -33,19 +34,19 @@ use crate::ShardId;
 
 /// WIP
 #[async_trait]
-trait PersistPubSubClient {
+pub trait PersistPubSubClient {
     type Sender: PubSubSender;
     type Receiver: Stream<Item = ProtoPubSubMessage>;
     /// Receive handles with which to push and subscribe to diffs.
-    async fn connect(addr: &str) -> (Self::Sender, Self::Receiver);
+    async fn connect(addr: String) -> Result<(Self::Sender, Self::Receiver), anyhow::Error>;
 }
 
 /// WIP
 #[async_trait]
-trait PubSubSender {
+pub trait PubSubSender: std::fmt::Debug {
     /// Push a diff to subscribers.
     /// WIP: fix error type
-    async fn push(&self, diff: ProtoPushDiff) -> Result<(), Error>;
+    async fn push(&self, shard_id: &ShardId, diff: &VersionedData) -> Result<(), Error>;
 
     /// Informs the server which shards this subscribed should receive diffs for.
     /// May be called at any time to update the set of subscribed shards.
@@ -53,7 +54,7 @@ trait PubSubSender {
 }
 
 #[derive(Copy, Clone, Debug, Error)]
-enum Error {
+pub enum Error {
     #[error("push request dropped")]
     PushDropped,
 }
@@ -91,9 +92,20 @@ pub struct PubSubSenderClient {
     reqs: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
 }
 
+#[derive(Debug)]
+pub struct PubSubReceiver {
+    res: Response<Streaming<ProtoPubSubMessage>>,
+}
+
 #[async_trait]
 impl PubSubSender for PubSubSenderClient {
-    async fn push(&self, diff: ProtoPushDiff) -> Result<(), Error> {
+    async fn push(&self, shard_id: &ShardId, diff: &VersionedData) -> Result<(), Error> {
+        let diff = ProtoPushDiff {
+            shard_id: shard_id.into_proto(),
+            seqno: diff.seqno.into_proto(),
+            diff: diff.data.clone(),
+        };
+
         match self.reqs.send(ProtoPubSubMessage {
             message: Some(Message::PushDiff(diff)),
         }) {
@@ -115,15 +127,45 @@ impl PubSubSender for PubSubSenderClient {
 }
 
 #[derive(Debug)]
-pub struct PubSubReceiverClient {
-    push_res: Response<Streaming<ProtoPubSubMessage>>,
-}
-
-#[derive(Debug)]
 pub struct PushClient {
     client: ProtoPersistPubSubClient<Channel>,
     push_req: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
     push_res: Response<Streaming<ProtoPubSubMessage>>,
+}
+
+#[derive(Debug)]
+pub struct PubSubClient;
+
+#[async_trait]
+impl PersistPubSubClient for PubSubClient {
+    type Sender = PubSubSenderClient;
+    type Receiver = BoxStream<'static, ProtoPubSubMessage>;
+
+    async fn connect(addr: String) -> Result<(Self::Sender, Self::Receiver), anyhow::Error> {
+        let mut client = ProtoPersistPubSubClient::connect(addr).await?;
+        // WIP not unbounded.
+        let (requests, responses) = tokio::sync::mpsc::unbounded_channel();
+        let responses = client
+            .pub_sub(UnboundedReceiverStream::new(responses))
+            .await?;
+
+        let sender = PubSubSenderClient { reqs: requests };
+        let receiver = responses
+            .into_inner()
+            .filter_map(|res| async move {
+                match res {
+                    Ok(message) => Some(message),
+                    Err(err) => {
+                        // WIP: metric coverage here
+                        warn!("pubsub client received err: {:?}", err);
+                        None
+                    }
+                }
+            })
+            .boxed();
+
+        Ok((sender, receiver))
+    }
 }
 
 impl PushClient {

@@ -45,7 +45,7 @@ use crate::internal::state::{
 use crate::internal::state_versions::StateVersions;
 use crate::internal::trace::{ApplyMergeResult, FueledMergeRes};
 use crate::read::LeasedReaderId;
-use crate::rpc::PushClientConn;
+use crate::rpc::{PubSubSender, PushClientConn};
 use crate::write::WriterId;
 use crate::{PersistConfig, ShardId};
 
@@ -76,7 +76,7 @@ where
         metrics: Arc<Metrics>,
         state_versions: Arc<StateVersions>,
         shared_states: &Arc<StateCache>,
-        push_client: Option<Arc<PushClientConn>>,
+        pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let applier = Applier::new(
             cfg,
@@ -84,7 +84,7 @@ where
             metrics,
             state_versions,
             Arc::clone(shared_states),
-            push_client,
+            pubsub_sender,
         )
         .await?;
         Ok(Machine { applier })

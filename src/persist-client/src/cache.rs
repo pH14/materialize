@@ -138,7 +138,8 @@ impl PersistClientCache {
             Arc::clone(&self.metrics),
             Arc::clone(&self.cpu_heavy_runtime),
             Arc::clone(&self.state_cache),
-            self.push_client.clone(),
+            // WIP: set a real one
+            None,
         )
     }
 
