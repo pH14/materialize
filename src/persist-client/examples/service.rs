@@ -9,13 +9,14 @@
 
 #![allow(missing_docs)]
 
+use futures::StreamExt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use mz_ore::task::spawn;
 use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::rpc::{PersistPubSubServer, PushClient};
+use mz_persist_client::rpc::{PersistPubSubClient, PersistPubSubClientImpl, PersistPubSubServer};
 use mz_persist_client::ShardId;
 use tracing::{info, info_span, Span};
 
@@ -37,19 +38,22 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             .serve(args.listen_addr.clone())
             .await
     });
+    tokio::time::sleep(Duration::from_secs(2)).await;
     for addr in args.connect_addrs {
         info!("connecting to {}", addr);
-        let client = PushClient::connect(addr.clone())
-            .await?
-            .into_conn(move |res| {
-                let root_span = info_span!("persist::push::client");
-                let _guard = root_span.enter();
-                info!("client res: {:?}", res)
-            });
+        let (sender, mut receiver) =
+            PersistPubSubClientImpl::connect(addr.clone().to_string()).await?;
+        spawn(|| "persist client", async move {
+            let root_span = info_span!("persist::push::client");
+            let _guard = root_span.enter();
+            while let Some(message) = receiver.next().await {
+                info!("client res: {:?}", message);
+            }
+        });
         info!("connected to {}", addr);
         for seqno in 0u64..7 {
             let data = format!("diff{}", seqno).into_bytes();
-            client.push_diff(
+            sender.push(
                 &ShardId::new(),
                 &VersionedData {
                     seqno: SeqNo(seqno),
@@ -58,7 +62,6 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             );
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let () = client.finish().await?;
         info!("pushed to {}", addr);
     }
     info!("waiting for server to exit");

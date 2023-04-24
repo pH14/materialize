@@ -35,7 +35,6 @@ use crate::ShardId;
 /// WIP
 #[async_trait]
 pub trait PersistPubSubClient {
-    type Sender: PubSubSender;
     /// Receive handles with which to push and subscribe to diffs.
     async fn connect(
         addr: String,
@@ -54,9 +53,9 @@ pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     async fn subscribe(&self, shards: Vec<ShardId>) -> Result<(), Error>;
 }
 
-pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> {}
+pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
 
-impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> {}
+impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
 
 #[derive(Copy, Clone, Debug, Error)]
 pub enum Error {
@@ -93,7 +92,7 @@ impl std::fmt::Debug for PushedDiffFn {
 }
 
 #[derive(Debug)]
-pub struct PubSubSenderClient {
+struct PubSubSenderClient {
     reqs: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
 }
 
@@ -127,19 +126,10 @@ impl PubSubSender for PubSubSenderClient {
 }
 
 #[derive(Debug)]
-pub struct PushClient {
-    client: ProtoPersistPubSubClient<Channel>,
-    push_req: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
-    push_res: Response<Streaming<ProtoPubSubMessage>>,
-}
-
-#[derive(Debug)]
-pub struct PubSubClient;
+pub struct PersistPubSubClientImpl;
 
 #[async_trait]
-impl PersistPubSubClient for PubSubClient {
-    type Sender = PubSubSenderClient;
-
+impl PersistPubSubClient for PersistPubSubClientImpl {
     async fn connect(
         addr: String,
     ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error> {
@@ -166,88 +156,5 @@ impl PersistPubSubClient for PubSubClient {
             .boxed();
 
         Ok((Arc::new(sender), Box::new(receiver)))
-    }
-}
-
-impl PushClient {
-    pub async fn connect(addr: String) -> Result<Self, anyhow::Error> {
-        let mut client = ProtoPersistPubSubClient::connect(addr).await?;
-        // WIP not unbounded.
-        let (push_req, push_req_rx) = tokio::sync::mpsc::unbounded_channel();
-        // WIP don't do this call until we have something to hook up to the
-        // responses
-        let push_res = client
-            .pub_sub(UnboundedReceiverStream::new(push_req_rx))
-            .await?;
-        Ok(PushClient {
-            client,
-            push_req,
-            push_res,
-        })
-    }
-
-    pub fn into_conn<F>(self, res_fn: F) -> PushClientConn
-    where
-        F: Fn(ProtoPushDiff) + Send + Sync + 'static,
-    {
-        let mut push_res = self.push_res.into_inner();
-        let push_res = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
-            while let Some(res) = push_res.next().await {
-                match res {
-                    Ok(x) => match x.message {
-                        None => {}
-                        Some(Message::PushDiff(diff)) => res_fn(diff),
-                        Some(Message::Subscribe(resp)) => {
-                            warn!("pubsub client received stray subscribe: {:?}", resp);
-                        }
-                    },
-                    Err(err) => {
-                        warn!("push client received err: {:?}", err);
-                    }
-                }
-            }
-        });
-        PushClientConn {
-            client: self.client,
-            push_req: self.push_req,
-            push_res,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct PushClientConn {
-    client: ProtoPersistPubSubClient<Channel>,
-    push_req: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
-    push_res: tokio::task::JoinHandle<()>,
-}
-
-impl PushClientConn {
-    pub fn push_diff(&self, shard_id: &ShardId, diff: &VersionedData) {
-        tracing::info!(
-            "pushing diff {} {} {}",
-            shard_id,
-            diff.seqno,
-            diff.data.len()
-        );
-        let req = ProtoPubSubMessage {
-            message: Some(Message::PushDiff(ProtoPushDiff {
-                shard_id: shard_id.into_proto(),
-                seqno: diff.seqno.into_proto(),
-                diff: diff.data.clone(),
-            })),
-        };
-        match self.push_req.send(req) {
-            Ok(()) => {}
-            Err(_err) => {
-                tracing::info!("push_req listener unexpectedly hung up")
-            }
-        }
-    }
-
-    pub async fn finish(self) -> Result<(), anyhow::Error> {
-        drop(self.push_req);
-        let () = self.push_res.await?;
-        Ok(())
     }
 }

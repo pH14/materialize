@@ -9,12 +9,14 @@
 
 //! A cache of [PersistClient]s indexed by [PersistLocation]s.
 
+use futures::StreamExt;
 use std::any::Any;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Write;
+use std::pin::pin;
 use std::sync::{Arc, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -37,9 +39,10 @@ use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus};
+use crate::internal::service::proto_pub_sub_message;
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
-use crate::rpc::{PubSubReceiver, PubSubSender, PushClientConn, PushedDiffFn};
+use crate::rpc::{PubSubReceiver, PubSubSender};
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
@@ -58,7 +61,7 @@ pub struct PersistClientCache {
     consensus_by_uri: Mutex<BTreeMap<String, (RttLatencyTask, Arc<dyn Consensus + Send + Sync>)>>,
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
     pub(crate) state_cache: Arc<StateCache>,
-    push_client: Option<Arc<PushClientConn>>,
+    pubsub_sender: Option<Arc<dyn PubSubSender>>,
 }
 
 #[derive(Debug)]
@@ -83,48 +86,35 @@ impl PersistClientCache {
         };
         let metrics = Arc::new(Metrics::new(&cfg, registry));
         let state_cache = Arc::new(StateCache::new(&cfg, Arc::clone(&metrics)));
-        //
-        // match pubsub {
-        //     None => {}
-        //     Some((sender, receiver)) => {
-        //         let push_res = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
-        //             while let Some(res) = receiver.next().await {
-        //                 match res {
-        //                     Ok(x) => match x.message {
-        //                         None => {}
-        //                         Some(Message::PushDiff(diff)) => res_fn(diff),
-        //                         Some(Message::Subscribe(resp)) => {
-        //                             warn!("pubsub client received stray subscribe: {:?}", resp);
-        //                         }
-        //                     },
-        //                     Err(err) => {
-        //                         warn!("push client received err: {:?}", err);
-        //                     }
-        //                 }
-        //             }
-        //         });
-        //     }
-        // }
 
-        // let push_client = push_client.map(|x| {
-        //     let state_cache = Arc::clone(&state_cache);
-        //     let conn = x.into_conn(move |res| {
-        //         // WIP weird place for this logic to live
-        //         let shard_id = res.shard_id.into_rust().expect("WIP");
-        //         let diff = VersionedData {
-        //             seqno: res.seqno.into_rust().expect("WIP"),
-        //             data: res.diff,
-        //         };
-        //         debug!(
-        //             "client got diff {} {} {}",
-        //             shard_id,
-        //             diff.seqno,
-        //             diff.data.len()
-        //         );
-        //         state_cache.push_diff(&shard_id, diff);
-        //     });
-        //     Arc::new(conn)
-        // });
+        let cache = Arc::clone(&state_cache);
+        if let Some(mut pubsub_receiver) = pubsub_receiver {
+            let push_res = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
+                while let Some(res) = pubsub_receiver.next().await {
+                    match res.message {
+                        None => {}
+                        Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
+                            let shard_id = diff.shard_id.into_rust().expect("WIP");
+                            let diff = VersionedData {
+                                seqno: diff.seqno.into_rust().expect("WIP"),
+                                data: diff.diff,
+                            };
+                            info!(
+                                "client got diff {} {} {}",
+                                shard_id,
+                                diff.seqno,
+                                diff.data.len()
+                            );
+                            cache.push_diff(&shard_id, diff);
+                        }
+                        Some(proto_pub_sub_message::Message::Subscribe(resp)) => {
+                            warn!("pubsub client received stray subscribe: {:?}", resp);
+                        }
+                    }
+                }
+            });
+        }
+
         PersistClientCache {
             cfg,
             metrics,
@@ -132,7 +122,7 @@ impl PersistClientCache {
             consensus_by_uri: Mutex::new(BTreeMap::new()),
             cpu_heavy_runtime: Arc::new(CpuHeavyRuntime::new()),
             state_cache,
-            push_client: None,
+            pubsub_sender,
         }
     }
 
@@ -166,8 +156,7 @@ impl PersistClientCache {
             Arc::clone(&self.metrics),
             Arc::clone(&self.cpu_heavy_runtime),
             Arc::clone(&self.state_cache),
-            // WIP: set a real one
-            None,
+            self.pubsub_sender.clone(),
         )
     }
 
@@ -379,12 +368,12 @@ where
 /// command for the same shard are executing concurrently, only one can win
 /// anyway, the other will retry. With the mutex, we even get to avoid the retry
 /// if the racing commands are on the same process.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StateCache {
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
     states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
-    pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
+    // pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
 }
 
 #[derive(Debug)]
@@ -407,18 +396,12 @@ enum StateCacheInit {
 
 impl StateCache {
     /// Returns a new StateCache.
-    pub fn new(
-        cfg: &PersistConfig,
-        metrics: Arc<Metrics>,
-        pubsub_receiver: Option<Box<dyn PubSubReceiver>>,
-    ) -> Self {
-        if let Some(pubsub_receiver) = pubsub_receiver {}
-
+    pub fn new(cfg: &PersistConfig, metrics: Arc<Metrics>) -> Self {
         StateCache {
             cfg: Arc::new(cfg.clone()),
             metrics,
             states: Default::default(),
-            pushed_diff_fns: Default::default(),
+            // pushed_diff_fns: Default::default(),
         }
     }
 

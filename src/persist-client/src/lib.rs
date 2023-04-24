@@ -112,7 +112,7 @@ use crate::internal::machine::{retry_external, Machine};
 use crate::internal::state_versions::StateVersions;
 use crate::metrics::Metrics;
 use crate::read::{LeasedReaderId, ReadHandle};
-use crate::rpc::{PubSubSender, PushClientConn};
+use crate::rpc::PubSubSender;
 use crate::write::{WriteHandle, WriterId};
 
 pub mod async_runtime;
@@ -258,7 +258,7 @@ pub struct PersistClient {
     metrics: Arc<Metrics>,
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
     shared_states: Arc<StateCache>,
-    pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
+    pubsub_sender: Option<Arc<dyn PubSubSender>>,
 }
 
 impl PersistClient {
@@ -274,7 +274,7 @@ impl PersistClient {
         metrics: Arc<Metrics>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         shared_states: Arc<StateCache>,
-        pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
+        pubsub_sender: Option<Arc<dyn PubSubSender>>,
     ) -> Result<Self, ExternalError> {
         // TODO: Verify somehow that blob matches consensus to prevent
         // accidental misuse.

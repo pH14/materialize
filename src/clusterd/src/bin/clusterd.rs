@@ -83,7 +83,7 @@ use anyhow::Context;
 use axum::routing;
 use fail::FailScenario;
 use futures::future;
-use mz_persist_client::rpc::{PersistPubSubClient, PubSubClient, PushClient};
+use mz_persist_client::rpc::{PersistPubSubClient, PersistPubSubClient};
 use once_cell::sync::Lazy;
 use tracing::info;
 
@@ -269,8 +269,7 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
     });
 
     info!("WIP persist_push_addr {}", args.persist_push_addr);
-    let pubsub = PubSubClient::connect(args.persist_push_addr).await?;
-    // let push_client = PushClient::connect(args.persist_push_addr).await?;
+    let pubsub = PersistPubSubClient::connect(args.persist_push_addr).await?;
     let persist_clients = Arc::new(PersistClientCache::new(
         PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
         &metrics_registry,

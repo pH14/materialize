@@ -36,7 +36,7 @@ use crate::internal::state_diff::StateDiff;
 use crate::internal::state_versions::{EncodedRollup, StateVersions};
 use crate::internal::trace::FueledMergeReq;
 use crate::internal::watch::StateWatch;
-use crate::rpc::{PubSubSender, PushClientConn, PushedDiffFn};
+use crate::rpc::PubSubSender;
 use crate::{PersistConfig, ShardId};
 
 /// An applier of persist commands.
@@ -50,7 +50,7 @@ pub struct Applier<K, V, T, D> {
     pub(crate) shard_metrics: Arc<ShardMetrics>,
     pub(crate) state_versions: Arc<StateVersions>,
     shared_states: Arc<StateCache>,
-    pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
+    pubsub_sender: Option<Arc<dyn PubSubSender>>,
     pub(crate) shard_id: ShardId,
 
     // Access to the shard's state, shared across all handles created by the same
@@ -93,7 +93,7 @@ where
         metrics: Arc<Metrics>,
         state_versions: Arc<StateVersions>,
         shared_states: Arc<StateCache>,
-        pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
+        pubsub_sender: Option<Arc<dyn PubSubSender>>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let shard_metrics = metrics.shards.shard(&shard_id);
         let state = Arc::clone(&shared_states)
@@ -118,48 +118,6 @@ where
             shard_id,
             state,
         };
-        // WIP only do this once per state init
-        // {
-        //     let mut pushed_diff_fns = ret.shared_states.pushed_diff_fns.write().expect("lock");
-        //     if pushed_diff_fns.get(&shard_id).is_none() {
-        //         let applier = ret.clone();
-        //         let pushed_diff_fn = Box::new(move |data: VersionedData| {
-        //             let applied =
-        //                 applier
-        //                     .state
-        //                     .write_lock(&applier.metrics.locks.applier_write, |state| {
-        //                         debug!(
-        //                             "applying pushed diff {} {} to {}",
-        //                             shard_id, data.seqno, state.seqno
-        //                         );
-        //                         if data.seqno <= state.seqno.next() {
-        //                             state.apply_encoded_diffs(
-        //                                 &applier.cfg,
-        //                                 &applier.metrics,
-        //                                 std::iter::once(&data),
-        //                             );
-        //                             info!("applied pushed diff {} {}", shard_id, data.seqno);
-        //                             true
-        //                         } else {
-        //                             false
-        //                         }
-        //                     });
-        //             if applied {
-        //                 return;
-        //             }
-        //             // We were missing some intermediate diffs, fall back to
-        //             // fetching everything from consensus.
-        //             //
-        //             // WIP probably don't run this in a task?
-        //             let applier = applier.clone();
-        //             let _task =
-        //                 mz_ore::task::spawn(|| "persist::push_diff::missing_diffs", async move {
-        //                     applier.fetch_and_update_state(Some(data.seqno)).await
-        //                 });
-        //         });
-        //         pushed_diff_fns.insert(shard_id, PushedDiffFn(pushed_diff_fn));
-        //     }
-        // }
         Ok(ret)
     }
 
