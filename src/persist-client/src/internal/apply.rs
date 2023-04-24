@@ -96,7 +96,7 @@ where
         pubsub_sender: Option<Arc<dyn PubSubSender + Send + Sync>>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let shard_metrics = metrics.shards.shard(&shard_id);
-        let state = shared_states
+        let state = Arc::clone(&shared_states)
             .get::<K, V, T, D, _, _>(shard_id, || {
                 metrics
                     .cmds

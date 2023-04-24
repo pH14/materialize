@@ -4316,6 +4316,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "timely",
  "tokio",
  "tokio-stream",

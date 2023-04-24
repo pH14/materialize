@@ -14,6 +14,7 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
+use std::io::Write;
 use std::sync::{Arc, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,7 @@ use timely::progress::Timestamp;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::{debug, instrument};
+use uuid::Version;
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
@@ -300,6 +302,7 @@ async fn consensus_rtt_latency_task(
 trait DynState: Debug + Send + Sync {
     fn codecs(&self) -> (String, String, String, String, Option<CodecConcreteType>);
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+    fn push_diff(&self, diff: VersionedData);
 }
 
 impl<K, V, T, D> DynState for LockingTypedState<K, V, T, D>
@@ -322,6 +325,10 @@ where
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
     }
+
+    fn push_diff(&self, diff: VersionedData) {
+        self.write_lock(self.)
+    }
 }
 
 /// A cache of `TypedState`, shared between all machines for that shard.
@@ -336,7 +343,7 @@ where
 /// if the racing commands are on the same process.
 #[derive(Debug, Default)]
 pub struct StateCache {
-    states: Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>,
+    states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
     pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
 }
 
@@ -345,9 +352,27 @@ enum StateCacheInit {
     Init(Arc<dyn DynState>),
     NeedInit(Arc<OnceCell<Weak<dyn DynState>>>),
 }
+//
+// struct StateCacheToken {
+//     shard_id: ShardId,
+//     cache: Arc<StateCache>,
+// }
+//
+// impl Drop for StateCacheToken {
+//     fn drop(&mut self) {
+//         let mut states = self.cache.states.lock().expect("lock poisoned");
+//         states.remove(&self.shard_id);
+//     }
+// }
 
 impl StateCache {
     pub(crate) fn push_diff(&self, shard_id: &ShardId, diff: VersionedData) {
+        let states = self.states.lock().expect("lock");
+
+        states.get(shard_id).and_then(|x| x.get()).
+        if let Some(x) = states.get(shard_id) {
+        }
+
         let pushed_diff_fns = self.pushed_diff_fns.read().expect("lock");
         if let Some(pushed_diff_fn) = pushed_diff_fns.get(shard_id) {
             pushed_diff_fn.0(diff)
@@ -357,7 +382,7 @@ impl StateCache {
     }
 
     pub(crate) async fn get<K, V, T, D, F, InitFn>(
-        &self,
+        self: Arc<Self>,
         shard_id: ShardId,
         mut init_fn: InitFn,
     ) -> Result<Arc<LockingTypedState<K, V, T, D>>, Box<CodecMismatch>>
@@ -371,7 +396,7 @@ impl StateCache {
     {
         loop {
             let init = {
-                let mut states = self.states.lock().await;
+                let mut states = self.states.lock().expect("lock poisoned");
                 let state = states.entry(shard_id).or_default();
                 match state.get() {
                     Some(once_val) => match once_val.upgrade() {
