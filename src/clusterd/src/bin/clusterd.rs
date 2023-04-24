@@ -269,12 +269,12 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
     });
 
     info!("WIP persist_push_addr {}", args.persist_push_addr);
-    let (pubsub_sender, pubsub_receiver) = PubSubClient::connect(args.persist_push_addr).await?;
-    let push_client = PushClient::connect(args.persist_push_addr).await?;
+    let pubsub = PubSubClient::connect(args.persist_push_addr).await?;
+    // let push_client = PushClient::connect(args.persist_push_addr).await?;
     let persist_clients = Arc::new(PersistClientCache::new(
         PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
         &metrics_registry,
-        Some(push_client),
+        Some(pubsub),
     ));
 
     // Start storage server.

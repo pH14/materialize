@@ -31,8 +31,7 @@ use mz_proto::ProtoType;
 use timely::progress::Timestamp;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
-use tracing::{debug, instrument};
-use uuid::Version;
+use tracing::{debug, info, instrument, warn};
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
@@ -40,7 +39,7 @@ use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus};
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
-use crate::rpc::{PushClient, PushClientConn, PushedDiffFn};
+use crate::rpc::{PubSubReceiver, PubSubSender, PushClientConn, PushedDiffFn};
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
@@ -76,37 +75,64 @@ impl PersistClientCache {
     pub fn new(
         cfg: PersistConfig,
         registry: &MetricsRegistry,
-        push_client: Option<PushClient>,
+        pubsub: Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>,
     ) -> Self {
-        let metrics = Metrics::new(&cfg, registry);
-        let state_cache = Arc::new(StateCache::default());
-        let push_client = push_client.map(|x| {
-            let state_cache = Arc::clone(&state_cache);
-            let conn = x.into_conn(move |res| {
-                // WIP weird place for this logic to live
-                let shard_id = res.shard_id.into_rust().expect("WIP");
-                let diff = VersionedData {
-                    seqno: res.seqno.into_rust().expect("WIP"),
-                    data: res.diff,
-                };
-                debug!(
-                    "client got diff {} {} {}",
-                    shard_id,
-                    diff.seqno,
-                    diff.data.len()
-                );
-                state_cache.push_diff(&shard_id, diff);
-            });
-            Arc::new(conn)
-        });
+        let (pubsub_sender, pubsub_receiver) = match pubsub {
+            None => (None, None),
+            Some((pubsub_sender, pubsub_receiver)) => (Some(pubsub_sender), Some(pubsub_receiver)),
+        };
+        let metrics = Arc::new(Metrics::new(&cfg, registry));
+        let state_cache = Arc::new(StateCache::new(&cfg, Arc::clone(&metrics)));
+        //
+        // match pubsub {
+        //     None => {}
+        //     Some((sender, receiver)) => {
+        //         let push_res = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
+        //             while let Some(res) = receiver.next().await {
+        //                 match res {
+        //                     Ok(x) => match x.message {
+        //                         None => {}
+        //                         Some(Message::PushDiff(diff)) => res_fn(diff),
+        //                         Some(Message::Subscribe(resp)) => {
+        //                             warn!("pubsub client received stray subscribe: {:?}", resp);
+        //                         }
+        //                     },
+        //                     Err(err) => {
+        //                         warn!("push client received err: {:?}", err);
+        //                     }
+        //                 }
+        //             }
+        //         });
+        //     }
+        // }
+
+        // let push_client = push_client.map(|x| {
+        //     let state_cache = Arc::clone(&state_cache);
+        //     let conn = x.into_conn(move |res| {
+        //         // WIP weird place for this logic to live
+        //         let shard_id = res.shard_id.into_rust().expect("WIP");
+        //         let diff = VersionedData {
+        //             seqno: res.seqno.into_rust().expect("WIP"),
+        //             data: res.diff,
+        //         };
+        //         debug!(
+        //             "client got diff {} {} {}",
+        //             shard_id,
+        //             diff.seqno,
+        //             diff.data.len()
+        //         );
+        //         state_cache.push_diff(&shard_id, diff);
+        //     });
+        //     Arc::new(conn)
+        // });
         PersistClientCache {
             cfg,
-            metrics: Arc::new(metrics),
+            metrics,
             blob_by_uri: Mutex::new(BTreeMap::new()),
             consensus_by_uri: Mutex::new(BTreeMap::new()),
             cpu_heavy_runtime: Arc::new(CpuHeavyRuntime::new()),
             state_cache,
-            push_client,
+            push_client: None,
         }
     }
 
@@ -302,14 +328,14 @@ async fn consensus_rtt_latency_task(
 trait DynState: Debug + Send + Sync {
     fn codecs(&self) -> (String, String, String, String, Option<CodecConcreteType>);
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
-    fn push_diff(&self, diff: VersionedData);
+    fn push_diff(&self, diff: VersionedData) -> bool;
 }
 
 impl<K, V, T, D> DynState for LockingTypedState<K, V, T, D>
 where
     K: Codec,
     V: Codec,
-    T: Timestamp + Codec64,
+    T: Timestamp + Lattice + Codec64,
     D: Codec64,
 {
     fn codecs(&self) -> (String, String, String, String, Option<CodecConcreteType>) {
@@ -326,8 +352,20 @@ where
         self
     }
 
-    fn push_diff(&self, diff: VersionedData) {
-        self.write_lock(self.)
+    fn push_diff(&self, diff: VersionedData) -> bool {
+        self.write_lock(&self.metrics.locks.applier_write, |state| {
+            debug!(
+                "applying pushed diff {} {} to {}",
+                state.shard_id, diff.seqno, state.seqno
+            );
+            if diff.seqno <= state.seqno.next() {
+                state.apply_encoded_diffs(&self.cfg, &self.metrics, std::iter::once(&diff));
+                info!("applied pushed diff {} {}", state.shard_id, diff.seqno);
+                true
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -341,8 +379,10 @@ where
 /// command for the same shard are executing concurrently, only one can win
 /// anyway, the other will retry. With the mutex, we even get to avoid the retry
 /// if the racing commands are on the same process.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StateCache {
+    cfg: Arc<PersistConfig>,
+    metrics: Arc<Metrics>,
     states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
     pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
 }
@@ -366,18 +406,36 @@ enum StateCacheInit {
 // }
 
 impl StateCache {
-    pub(crate) fn push_diff(&self, shard_id: &ShardId, diff: VersionedData) {
-        let states = self.states.lock().expect("lock");
+    /// Returns a new StateCache.
+    pub fn new(
+        cfg: &PersistConfig,
+        metrics: Arc<Metrics>,
+        pubsub_receiver: Option<Box<dyn PubSubReceiver>>,
+    ) -> Self {
+        if let Some(pubsub_receiver) = pubsub_receiver {}
 
-        states.get(shard_id).and_then(|x| x.get()).
-        if let Some(x) = states.get(shard_id) {
+        StateCache {
+            cfg: Arc::new(cfg.clone()),
+            metrics,
+            states: Default::default(),
+            pushed_diff_fns: Default::default(),
         }
+    }
 
-        let pushed_diff_fns = self.pushed_diff_fns.read().expect("lock");
-        if let Some(pushed_diff_fn) = pushed_diff_fns.get(shard_id) {
-            pushed_diff_fn.0(diff)
-        } else {
-            debug!("shard not used by this process {}", shard_id);
+    #[cfg(test)]
+    pub(crate) fn new_no_metrics() -> Self {
+        Self::new(
+            &PersistConfig::new_for_tests(),
+            Arc::new(Metrics::new(
+                &PersistConfig::new_for_tests(),
+                &MetricsRegistry::new(),
+            )),
+        )
+    }
+
+    pub(crate) fn push_diff(&self, shard_id: &ShardId, diff: VersionedData) {
+        if let Some(state) = self.get_cached(shard_id) {
+            state.push_diff(diff);
         }
     }
 
@@ -424,6 +482,8 @@ impl StateCache {
                                 shard_id,
                                 notifier: StateWatchNotifier::default(),
                                 state: RwLock::new(init_res?),
+                                cfg: Arc::clone(&self.cfg),
+                                metrics: Arc::clone(&self.metrics),
                             });
                             let ret = Arc::downgrade(&state);
                             did_init = Some(state);
@@ -470,11 +530,10 @@ impl StateCache {
         }
     }
 
-    #[cfg(test)]
-    async fn get_cached(&self, shard_id: &ShardId) -> Option<Arc<dyn DynState>> {
+    fn get_cached(&self, shard_id: &ShardId) -> Option<Arc<dyn DynState>> {
         self.states
             .lock()
-            .await
+            .expect("lock poisoned")
             .get(shard_id)
             .and_then(|x| x.get())
             .and_then(|x| x.upgrade())
@@ -508,6 +567,8 @@ pub(crate) struct LockingTypedState<K, V, T, D> {
     shard_id: ShardId,
     state: RwLock<TypedState<K, V, T, D>>,
     notifier: StateWatchNotifier,
+    cfg: Arc<PersistConfig>,
+    metrics: Arc<Metrics>,
 }
 
 impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {
@@ -516,6 +577,8 @@ impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {
             shard_id,
             state,
             notifier,
+            cfg: _cfg,
+            metrics: _metrics,
         } = self;
         f.debug_struct("LockingTypedState")
             .field("shard_id", shard_id)
@@ -696,7 +759,7 @@ mod tests {
         }
 
         let s1 = ShardId::new();
-        let states = Arc::new(StateCache::default());
+        let states = Arc::new(StateCache::new_no_metrics());
 
         // The cache starts empty.
         assert_eq!(states.states.lock().await.len(), 0);
@@ -797,7 +860,7 @@ mod tests {
         drop(s1_state2);
         assert_eq!(states.strong_count().await, 1);
         assert_eq!(states.initialized_count().await, 2);
-        assert!(states.get_cached(&s1).await.is_none());
+        assert!(states.get_cached(&s1).is_none());
 
         // But we can re-init that shard if necessary.
         let s1_state1 = states
@@ -816,7 +879,7 @@ mod tests {
 
         const COUNT: usize = 1000;
         let id = ShardId::new();
-        let cache = Arc::new(StateCache::default());
+        let cache = Arc::new(StateCache::new_no_metrics());
 
         let mut futures = (0..COUNT)
             .map(|_| {

@@ -1359,7 +1359,7 @@ mod tests {
             consensus,
             metrics,
             Arc::new(CpuHeavyRuntime::new()),
-            Arc::new(StateCache::default()),
+            Arc::new(StateCache::new_no_metrics()),
             None,
         )
         .expect("client construction failed")

@@ -10,11 +10,11 @@
 #![allow(missing_docs, dead_code)] // WIP
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
-use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use thiserror::Error;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -36,14 +36,15 @@ use crate::ShardId;
 #[async_trait]
 pub trait PersistPubSubClient {
     type Sender: PubSubSender;
-    type Receiver: Stream<Item = ProtoPubSubMessage>;
     /// Receive handles with which to push and subscribe to diffs.
-    async fn connect(addr: String) -> Result<(Self::Sender, Self::Receiver), anyhow::Error>;
+    async fn connect(
+        addr: String,
+    ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error>;
 }
 
 /// WIP
 #[async_trait]
-pub trait PubSubSender: std::fmt::Debug {
+pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     /// Push a diff to subscribers.
     /// WIP: fix error type
     async fn push(&self, shard_id: &ShardId, diff: &VersionedData) -> Result<(), Error>;
@@ -52,6 +53,10 @@ pub trait PubSubSender: std::fmt::Debug {
     /// May be called at any time to update the set of subscribed shards.
     async fn subscribe(&self, shards: Vec<ShardId>) -> Result<(), Error>;
 }
+
+pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> {}
+
+impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> {}
 
 #[derive(Copy, Clone, Debug, Error)]
 pub enum Error {
@@ -90,11 +95,6 @@ impl std::fmt::Debug for PushedDiffFn {
 #[derive(Debug)]
 pub struct PubSubSenderClient {
     reqs: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
-}
-
-#[derive(Debug)]
-pub struct PubSubReceiver {
-    res: Response<Streaming<ProtoPubSubMessage>>,
 }
 
 #[async_trait]
@@ -139,9 +139,10 @@ pub struct PubSubClient;
 #[async_trait]
 impl PersistPubSubClient for PubSubClient {
     type Sender = PubSubSenderClient;
-    type Receiver = BoxStream<'static, ProtoPubSubMessage>;
 
-    async fn connect(addr: String) -> Result<(Self::Sender, Self::Receiver), anyhow::Error> {
+    async fn connect(
+        addr: String,
+    ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error> {
         let mut client = ProtoPersistPubSubClient::connect(addr).await?;
         // WIP not unbounded.
         let (requests, responses) = tokio::sync::mpsc::unbounded_channel();
@@ -164,7 +165,7 @@ impl PersistPubSubClient for PubSubClient {
             })
             .boxed();
 
-        Ok((sender, receiver))
+        Ok((Arc::new(sender), Box::new(receiver)))
     }
 }
 
