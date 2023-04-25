@@ -12,11 +12,13 @@
 use futures::StreamExt;
 use std::any::Any;
 use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Write;
 use std::pin::pin;
+use std::rc::Rc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -373,6 +375,7 @@ pub struct StateCache {
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
     states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
+    subscribed_shards: Arc<std::sync::Mutex<BTreeSet<ShardId>>>,
     // pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
 }
 
@@ -401,6 +404,7 @@ impl StateCache {
             cfg: Arc::new(cfg.clone()),
             metrics,
             states: Default::default(),
+            subscribed_shards: Default::default(),
             // pushed_diff_fns: Default::default(),
         }
     }
@@ -420,6 +424,22 @@ impl StateCache {
         if let Some(state) = self.get_cached(shard_id) {
             state.push_diff(diff);
         }
+    }
+
+    // WIP: not quite sure how to do this yet, but feels like we want to track subscribers
+    // and change their state over some channel, background task consumes and issues updates
+    pub(crate) async fn subscribe_to_shard(
+        &self,
+        shard_id: ShardId,
+        sender: Arc<dyn PubSubSender>,
+    ) {
+        let shards_to_subscribe: Vec<ShardId> = {
+            let mut shards = self.subscribed_shards.lock().expect("lock");
+            shards.insert(shard_id);
+            shards.iter().copied().collect()
+        };
+        info!("subscribing to {:?}", shards_to_subscribe);
+        sender.subscribe(shards_to_subscribe).await;
     }
 
     pub(crate) async fn get<K, V, T, D, F, InitFn>(

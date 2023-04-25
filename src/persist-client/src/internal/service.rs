@@ -120,7 +120,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                                                 if let Some(conn) = conns.get(connection) {
                                                     info!(
                                                         "server forwarding req to {} conns {} {} {}",
-                                                        conns.len(),
+                                                        connection_id,
                                                         shard_id,
                                                         diff.seqno,
                                                         diff.data.len()
@@ -141,6 +141,8 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                                 state_cache.push_diff(&shard_id, diff);
                             }
                             Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
+                                info!("conn {} has subscriptions {:?}", connection_id, diff);
+
                                 let mut subscribed_shards =
                                     subscribers.write().expect("lock poisoned");
 

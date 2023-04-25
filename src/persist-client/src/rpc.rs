@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Channel;
 use tonic::{Response, Streaming};
-use tracing::warn;
+use tracing::{error, info, warn};
 
 use mz_persist::location::VersionedData;
 use mz_proto::RustType;
@@ -46,22 +46,16 @@ pub trait PersistPubSubClient {
 pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     /// Push a diff to subscribers.
     /// WIP: fix error type
-    async fn push(&self, shard_id: &ShardId, diff: &VersionedData) -> Result<(), Error>;
+    async fn push(&self, shard_id: &ShardId, diff: &VersionedData);
 
     /// Informs the server which shards this subscribed should receive diffs for.
     /// May be called at any time to update the set of subscribed shards.
-    async fn subscribe(&self, shards: Vec<ShardId>) -> Result<(), Error>;
+    async fn subscribe(&self, shards: Vec<ShardId>);
 }
 
 pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
 
 impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
-
-#[derive(Copy, Clone, Debug, Error)]
-pub enum Error {
-    #[error("push request dropped")]
-    PushDropped,
-}
 
 #[derive(Debug)]
 pub struct PersistPubSubServer {
@@ -83,14 +77,6 @@ impl PersistPubSubServer {
     }
 }
 
-pub(crate) struct PushedDiffFn(pub Box<dyn Fn(VersionedData) + Send + Sync>);
-
-impl std::fmt::Debug for PushedDiffFn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PushedDiffFn").finish_non_exhaustive()
-    }
-}
-
 #[derive(Debug)]
 struct PubSubSenderClient {
     reqs: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
@@ -98,29 +84,37 @@ struct PubSubSenderClient {
 
 #[async_trait]
 impl PubSubSender for PubSubSenderClient {
-    async fn push(&self, shard_id: &ShardId, diff: &VersionedData) -> Result<(), Error> {
+    async fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
+        let seqno = diff.seqno.clone();
         let diff = ProtoPushDiff {
             shard_id: shard_id.into_proto(),
             seqno: diff.seqno.into_proto(),
             diff: diff.data.clone(),
         };
-
+        // WIP: counters
         match self.reqs.send(ProtoPubSubMessage {
             message: Some(Message::PushDiff(diff)),
         }) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(Error::PushDropped),
+            Ok(_) => {
+                info!("pushed ({}, {})", shard_id, seqno);
+            }
+            Err(err) => {
+                error!("{}", err);
+            }
         }
     }
 
-    async fn subscribe(&self, shards: Vec<ShardId>) -> Result<(), Error> {
+    async fn subscribe(&self, shards: Vec<ShardId>) {
         match self.reqs.send(ProtoPubSubMessage {
             message: Some(Message::Subscribe(ProtoSubscribe {
                 shards: shards.into_iter().map(|s| s.to_string()).collect(),
             })),
         }) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(Error::PushDropped),
+            // WIP: counters
+            Ok(_) => {}
+            Err(err) => {
+                error!("{}", err);
+            }
         }
     }
 }
@@ -133,7 +127,8 @@ impl PersistPubSubClient for PersistPubSubClientImpl {
     async fn connect(
         addr: String,
     ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error> {
-        let mut client = ProtoPersistPubSubClient::connect(addr).await?;
+        let mut client = ProtoPersistPubSubClient::connect(addr.clone()).await?;
+        info!("Created pubsub client to: {:?}", addr);
         // WIP not unbounded.
         let (requests, responses) = tokio::sync::mpsc::unbounded_channel();
         let responses = client
