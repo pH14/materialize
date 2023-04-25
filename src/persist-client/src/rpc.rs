@@ -29,7 +29,9 @@ use crate::cache::PersistClientCache;
 use crate::internal::service::proto_persist_pub_sub_client::ProtoPersistPubSubClient;
 use crate::internal::service::proto_persist_pub_sub_server::ProtoPersistPubSubServer;
 use crate::internal::service::proto_pub_sub_message::Message;
-use crate::internal::service::{PersistService, ProtoPubSubMessage, ProtoPushDiff, ProtoSubscribe};
+use crate::internal::service::{
+    PersistService, ProtoPubSubMessage, ProtoPushDiff, ProtoSubscribe, ProtoUnsubscribe,
+};
 use crate::ShardId;
 
 /// WIP
@@ -42,15 +44,15 @@ pub trait PersistPubSubClient {
 }
 
 /// WIP
-#[async_trait]
 pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     /// Push a diff to subscribers.
-    /// WIP: fix error type
-    async fn push(&self, shard_id: &ShardId, diff: &VersionedData);
+    fn push(&self, shard_id: &ShardId, diff: &VersionedData);
 
-    /// Informs the server which shards this subscribed should receive diffs for.
-    /// May be called at any time to update the set of subscribed shards.
-    async fn subscribe(&self, shards: Vec<ShardId>);
+    /// WIP
+    fn subscribe(&self, shard: &ShardId);
+
+    /// WIP
+    fn unsubscribe(&self, shard: &ShardId);
 }
 
 pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
@@ -84,7 +86,7 @@ struct PubSubSenderClient {
 
 #[async_trait]
 impl PubSubSender for PubSubSenderClient {
-    async fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
+    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
         let seqno = diff.seqno.clone();
         let diff = ProtoPushDiff {
             shard_id: shard_id.into_proto(),
@@ -104,16 +106,34 @@ impl PubSubSender for PubSubSenderClient {
         }
     }
 
-    async fn subscribe(&self, shards: Vec<ShardId>) {
+    fn subscribe(&self, shard: &ShardId) {
         match self.reqs.send(ProtoPubSubMessage {
             message: Some(Message::Subscribe(ProtoSubscribe {
-                shards: shards.into_iter().map(|s| s.to_string()).collect(),
+                shard: shard.to_string(),
             })),
         }) {
             // WIP: counters
-            Ok(_) => {}
+            Ok(_) => {
+                info!("subscribed to {}", shard);
+            }
             Err(err) => {
-                error!("{}", err);
+                error!("error subscribing to {}: {}", shard, err);
+            }
+        }
+    }
+
+    fn unsubscribe(&self, shard: &ShardId) {
+        match self.reqs.send(ProtoPubSubMessage {
+            message: Some(Message::Unsubscribe(ProtoUnsubscribe {
+                shard: shard.to_string(),
+            })),
+        }) {
+            // WIP: counters
+            Ok(_) => {
+                info!("unsubscribed from {}", shard);
+            }
+            Err(err) => {
+                error!("error unsubscribing from {}: {}", shard, err);
             }
         }
     }

@@ -42,6 +42,7 @@ use crate::error::{CodecConcreteType, CodecMismatch};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus};
 use crate::internal::service::proto_pub_sub_message;
+use crate::internal::service::proto_pub_sub_message::Message;
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
 use crate::rpc::{PubSubReceiver, PubSubSender};
@@ -82,41 +83,13 @@ impl PersistClientCache {
         registry: &MetricsRegistry,
         pubsub: Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>,
     ) -> Self {
-        let (pubsub_sender, pubsub_receiver) = match pubsub {
-            None => (None, None),
-            Some((pubsub_sender, pubsub_receiver)) => (Some(pubsub_sender), Some(pubsub_receiver)),
+        let pubsub_sender = match &pubsub {
+            None => None,
+            Some((pubsub_sender, _)) => Some(Arc::clone(pubsub_sender)),
         };
+
         let metrics = Arc::new(Metrics::new(&cfg, registry));
-        let state_cache = Arc::new(StateCache::new(&cfg, Arc::clone(&metrics)));
-
-        let cache = Arc::clone(&state_cache);
-        if let Some(mut pubsub_receiver) = pubsub_receiver {
-            let push_res = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
-                while let Some(res) = pubsub_receiver.next().await {
-                    match res.message {
-                        None => {}
-                        Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
-                            let shard_id = diff.shard_id.into_rust().expect("WIP");
-                            let diff = VersionedData {
-                                seqno: diff.seqno.into_rust().expect("WIP"),
-                                data: diff.diff,
-                            };
-                            info!(
-                                "client got diff {} {} {}",
-                                shard_id,
-                                diff.seqno,
-                                diff.data.len()
-                            );
-                            cache.push_diff(&shard_id, diff);
-                        }
-                        Some(proto_pub_sub_message::Message::Subscribe(resp)) => {
-                            warn!("pubsub client received stray subscribe: {:?}", resp);
-                        }
-                    }
-                }
-            });
-        }
-
+        let state_cache = StateCache::new(&cfg, Arc::clone(&metrics), pubsub);
         PersistClientCache {
             cfg,
             metrics,
@@ -375,6 +348,8 @@ pub struct StateCache {
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
     states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
+
+    pubsub_sender: Option<Arc<dyn PubSubSender>>,
     subscribed_shards: Arc<std::sync::Mutex<BTreeSet<ShardId>>>,
     // pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
 }
@@ -384,33 +359,78 @@ enum StateCacheInit {
     Init(Arc<dyn DynState>),
     NeedInit(Arc<OnceCell<Weak<dyn DynState>>>),
 }
-//
-// struct StateCacheToken {
-//     shard_id: ShardId,
-//     cache: Arc<StateCache>,
-// }
-//
-// impl Drop for StateCacheToken {
-//     fn drop(&mut self) {
-//         let mut states = self.cache.states.lock().expect("lock poisoned");
-//         states.remove(&self.shard_id);
-//     }
-// }
+
+struct StateSubscriptionToken {
+    shard_id: ShardId,
+    pubsub_sender: Option<Arc<dyn PubSubSender>>,
+}
+
+impl Drop for StateSubscriptionToken {
+    fn drop(&mut self) {
+        if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
+            pubsub_sender.unsubscribe(&self.shard_id);
+        }
+    }
+}
 
 impl StateCache {
     /// Returns a new StateCache.
-    pub fn new(cfg: &PersistConfig, metrics: Arc<Metrics>) -> Self {
-        StateCache {
+    pub fn new(
+        cfg: &PersistConfig,
+        metrics: Arc<Metrics>,
+        pubsub: Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>,
+    ) -> Arc<Self> {
+        let (pubsub_sender, pubsub_receiver) = match pubsub {
+            None => (None, None),
+            Some((pubsub_sender, pubsub_receiver)) => (Some(pubsub_sender), Some(pubsub_receiver)),
+        };
+
+        let state_cache = Arc::new(StateCache {
             cfg: Arc::new(cfg.clone()),
             metrics,
             states: Default::default(),
             subscribed_shards: Default::default(),
+            pubsub_sender,
             // pushed_diff_fns: Default::default(),
+        });
+
+        let cache = Arc::clone(&state_cache);
+        if let Some(mut pubsub_receiver) = pubsub_receiver {
+            let push_res = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
+                while let Some(res) = pubsub_receiver.next().await {
+                    match res.message {
+                        None => {}
+                        Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
+                            let shard_id = diff.shard_id.into_rust().expect("WIP");
+                            let diff = VersionedData {
+                                seqno: diff.seqno.into_rust().expect("WIP"),
+                                data: diff.diff,
+                            };
+                            info!(
+                                "client got diff {} {} {}",
+                                shard_id,
+                                diff.seqno,
+                                diff.data.len()
+                            );
+                            cache.push_diff(&shard_id, diff);
+                        }
+                        Some(proto_pub_sub_message::Message::Subscribe(resp)) => {
+                            warn!("pubsub client received stray subscribe: {:?}", resp);
+                        }
+                        Some(proto_pub_sub_message::Message::Unsubscribe(resp)) => {
+                            warn!("pubsub client received stray unsubscribe: {:?}", resp);
+                        }
+                        _ => {}
+                    }
+                }
+            });
         }
+
+        state_cache
     }
 
     #[cfg(test)]
-    pub(crate) fn new_no_metrics() -> Self {
+    pub(crate) fn new_no_metrics() -> Arc<Self> {
         Self::new(
             &PersistConfig::new_for_tests(),
             Arc::new(Metrics::new(
@@ -422,24 +442,9 @@ impl StateCache {
 
     pub(crate) fn push_diff(&self, shard_id: &ShardId, diff: VersionedData) {
         if let Some(state) = self.get_cached(shard_id) {
+            // WIP: could register callbacks here. if not applied, fallback
             state.push_diff(diff);
         }
-    }
-
-    // WIP: not quite sure how to do this yet, but feels like we want to track subscribers
-    // and change their state over some channel, background task consumes and issues updates
-    pub(crate) async fn subscribe_to_shard(
-        &self,
-        shard_id: ShardId,
-        sender: Arc<dyn PubSubSender>,
-    ) {
-        let shards_to_subscribe: Vec<ShardId> = {
-            let mut shards = self.subscribed_shards.lock().expect("lock");
-            shards.insert(shard_id);
-            shards.iter().copied().collect()
-        };
-        info!("subscribing to {:?}", shards_to_subscribe);
-        sender.subscribe(shards_to_subscribe).await;
     }
 
     pub(crate) async fn get<K, V, T, D, F, InitFn>(
@@ -481,12 +486,17 @@ impl StateCache {
                     let state = init_once
                         .get_or_try_init::<Box<CodecMismatch>, _, _>(|| async {
                             let init_res = init_fn().await;
+                            let token = StateSubscriptionToken {
+                                shard_id: shard_id.clone(),
+                                pubsub_sender: self.pubsub_sender.clone(),
+                            };
                             let state = Arc::new(LockingTypedState {
                                 shard_id,
                                 notifier: StateWatchNotifier::default(),
                                 state: RwLock::new(init_res?),
                                 cfg: Arc::clone(&self.cfg),
                                 metrics: Arc::clone(&self.metrics),
+                                _subscription_token: token,
                             });
                             let ret = Arc::downgrade(&state);
                             did_init = Some(state);
@@ -497,6 +507,9 @@ impl StateCache {
                     if let Some(x) = did_init {
                         // We actually did the init work, don't bother casting back
                         // the type erased and weak version.
+                        if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
+                            pubsub_sender.subscribe(&shard_id);
+                        }
                         return Ok(x);
                     }
                     let Some(state) = state.upgrade() else {
@@ -572,6 +585,7 @@ pub(crate) struct LockingTypedState<K, V, T, D> {
     notifier: StateWatchNotifier,
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
+    _subscription_token: StateSubscriptionToken,
 }
 
 impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {
@@ -582,6 +596,7 @@ impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {
             notifier,
             cfg: _cfg,
             metrics: _metrics,
+            _subscription_token,
         } = self;
         f.debug_struct("LockingTypedState")
             .field("shard_id", shard_id)
@@ -762,7 +777,7 @@ mod tests {
         }
 
         let s1 = ShardId::new();
-        let states = Arc::new(StateCache::new_no_metrics());
+        let states = StateCache::new_no_metrics();
 
         // The cache starts empty.
         assert_eq!(states.states.lock().await.len(), 0);
@@ -882,7 +897,7 @@ mod tests {
 
         const COUNT: usize = 1000;
         let id = ShardId::new();
-        let cache = Arc::new(StateCache::new_no_metrics());
+        let cache = StateCache::new_no_metrics();
 
         let mut futures = (0..COUNT)
             .map(|_| {

@@ -108,12 +108,6 @@ where
                     })
             })
             .await?;
-        // WIP: move to spots where this is truly needed, maybe writers and listens?
-        if let Some(pubsub_sender) = pubsub_sender.as_ref() {
-            shared_states
-                .subscribe_to_shard(shard_id, Arc::clone(pubsub_sender))
-                .await;
-        }
         let ret = Applier {
             cfg,
             metrics,
@@ -292,7 +286,7 @@ where
                     self.shard_metrics.cmd_succeeded.inc();
                     self.update_state(new_state);
                     if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                        pubsub_sender.push(&self.shard_id, &diff).await;
+                        pubsub_sender.push(&self.shard_id, &diff);
                     }
                     return Ok((seqno, Ok(res), maintenance));
                 }

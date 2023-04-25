@@ -141,34 +141,32 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                                 state_cache.push_diff(&shard_id, diff);
                             }
                             Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
-                                info!("conn {} has subscriptions {:?}", connection_id, diff);
-
+                                info!(
+                                    "conn {} adding subscription to {}",
+                                    connection_id, diff.shard
+                                );
+                                let shard_id = diff.shard.parse().expect("WIP");
                                 let mut subscribed_shards =
                                     subscribers.write().expect("lock poisoned");
-
-                                let new_subscriptions: BTreeSet<ShardId> = diff
-                                    .shards
-                                    .into_iter()
-                                    .map(|shard| shard.parse().expect("WIP"))
-                                    .collect();
-
-                                for retracted in
-                                    current_subscriptions.difference(&new_subscriptions)
-                                {
-                                    subscribed_shards
-                                        .entry(*retracted)
-                                        .or_default()
-                                        .remove(&connection_id);
-                                }
-
-                                for added in new_subscriptions.difference(&current_subscriptions) {
-                                    subscribed_shards
-                                        .entry(*added)
-                                        .or_default()
-                                        .insert(connection_id);
-                                }
-
-                                current_subscriptions = new_subscriptions;
+                                subscribed_shards
+                                    .entry(shard_id)
+                                    .or_default()
+                                    .insert(connection_id);
+                                current_subscriptions.insert(shard_id);
+                            }
+                            Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
+                                info!(
+                                    "conn {} removing subscription from {}",
+                                    connection_id, diff.shard
+                                );
+                                let shard_id: ShardId = diff.shard.parse().expect("WIP");
+                                let mut subscribed_shards =
+                                    subscribers.write().expect("lock poisoned");
+                                subscribed_shards
+                                    .entry(shard_id.clone())
+                                    .or_default()
+                                    .remove(&connection_id);
+                                current_subscriptions.remove(&shard_id);
                             }
                         }
                     }
