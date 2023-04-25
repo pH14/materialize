@@ -10,16 +10,14 @@
 #![allow(missing_docs, dead_code)] // WIP
 
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
 use futures_util::StreamExt;
-use thiserror::Error;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::Channel;
-use tonic::{Response, Streaming};
+use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
+use tonic::{Extensions, Request};
 use tracing::{error, info, warn};
 
 use mz_persist::location::VersionedData;
@@ -36,25 +34,29 @@ use crate::ShardId;
 
 /// WIP
 #[async_trait]
-pub trait PersistPubSubClient {
+pub trait PersistPubSub {
     /// Receive handles with which to push and subscribe to diffs.
     async fn connect(
         addr: String,
+        caller_id: String,
     ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error>;
 }
 
-/// WIP
+/// The send-side client to Persist PubSub.
 pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     /// Push a diff to subscribers.
     fn push(&self, shard_id: &ShardId, diff: &VersionedData);
 
-    /// WIP
+    /// Subscribe the corresponding [PubSubReceiver] to diffs for the given shard.
+    /// This call is idempotent and is a no-op for already subscribed shards.
     fn subscribe(&self, shard: &ShardId);
 
-    /// WIP
+    /// Unsubscribe the corresponding [PubSubReceiver] to diffs for the given shard.
+    /// This call is idempotent and is a no-op for already unsubscribed shards.
     fn unsubscribe(&self, shard: &ShardId);
 }
 
+/// The receive-side client to Persist PubSub.
 pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
 
 impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
@@ -81,7 +83,7 @@ impl PersistPubSubServer {
 
 #[derive(Debug)]
 struct PubSubSenderClient {
-    reqs: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
+    requests: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
 }
 
 #[async_trait]
@@ -94,7 +96,7 @@ impl PubSubSender for PubSubSenderClient {
             diff: diff.data.clone(),
         };
         // WIP: counters
-        match self.reqs.send(ProtoPubSubMessage {
+        match self.requests.send(ProtoPubSubMessage {
             message: Some(Message::PushDiff(diff)),
         }) {
             Ok(_) => {
@@ -107,7 +109,7 @@ impl PubSubSender for PubSubSenderClient {
     }
 
     fn subscribe(&self, shard: &ShardId) {
-        match self.reqs.send(ProtoPubSubMessage {
+        match self.requests.send(ProtoPubSubMessage {
             message: Some(Message::Subscribe(ProtoSubscribe {
                 shard: shard.to_string(),
             })),
@@ -123,7 +125,7 @@ impl PubSubSender for PubSubSenderClient {
     }
 
     fn unsubscribe(&self, shard: &ShardId) {
-        match self.reqs.send(ProtoPubSubMessage {
+        match self.requests.send(ProtoPubSubMessage {
             message: Some(Message::Unsubscribe(ProtoUnsubscribe {
                 shard: shard.to_string(),
             })),
@@ -139,23 +141,36 @@ impl PubSubSender for PubSubSenderClient {
     }
 }
 
+pub const PERSIST_PUBSUB_CALLER_KEY: &str = "persist-pubsub-caller-id";
+
+/// A [PersistPubSub] implementation backed by gRPC.
 #[derive(Debug)]
-pub struct PersistPubSubClientImpl;
+pub struct PersistPubSubClient;
 
 #[async_trait]
-impl PersistPubSubClient for PersistPubSubClientImpl {
+impl PersistPubSub for PersistPubSubClient {
     async fn connect(
         addr: String,
+        caller_id: String,
     ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error> {
         let mut client = ProtoPersistPubSubClient::connect(addr.clone()).await?;
         info!("Created pubsub client to: {:?}", addr);
         // WIP not unbounded.
         let (requests, responses) = tokio::sync::mpsc::unbounded_channel();
-        let responses = client
-            .pub_sub(UnboundedReceiverStream::new(responses))
-            .await?;
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            AsciiMetadataKey::from_static(PERSIST_PUBSUB_CALLER_KEY),
+            AsciiMetadataValue::try_from(caller_id)
+                .unwrap_or_else(|_| AsciiMetadataValue::from_static("unknown")),
+        );
+        let pubsub_request = Request::from_parts(
+            metadata,
+            Extensions::default(),
+            UnboundedReceiverStream::new(responses),
+        );
+        let responses = client.pub_sub(pubsub_request).await?;
 
-        let sender = PubSubSenderClient { reqs: requests };
+        let sender = PubSubSenderClient { requests };
         let receiver = responses
             .into_inner()
             .filter_map(|res| async move {

@@ -16,7 +16,7 @@ use std::time::Duration;
 use mz_ore::task::spawn;
 use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::rpc::{PersistPubSubClient, PersistPubSubClientImpl, PersistPubSubServer};
+use mz_persist_client::rpc::{PersistPubSub, PersistPubSubClient, PersistPubSubServer};
 use mz_persist_client::ShardId;
 use tracing::{info, info_span, Span};
 
@@ -42,7 +42,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
     for addr in args.connect_addrs {
         info!("connecting to {}", addr);
         let (sender, mut receiver) =
-            PersistPubSubClientImpl::connect(addr.clone().to_string()).await?;
+            PersistPubSubClient::connect(addr.clone().to_string(), String::default()).await?;
         spawn(|| "persist client", async move {
             let root_span = info_span!("persist::push::client");
             let _guard = root_span.enter();

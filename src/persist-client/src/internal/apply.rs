@@ -19,7 +19,7 @@ use differential_dataflow::lattice::Lattice;
 use mz_ore::cast::CastFrom;
 use mz_persist_types::{Codec, Codec64};
 use timely::progress::{Antichain, Timestamp};
-use tracing::{debug, info};
+use tracing::debug;
 
 use mz_persist::location::{CaSResult, Indeterminate, SeqNo, VersionedData};
 

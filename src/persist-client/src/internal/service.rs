@@ -11,26 +11,26 @@
 #![allow(clippy::clone_on_ref_ptr, clippy::disallowed_methods)] // Generated code does this
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
-use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use futures::Stream;
-use mz_ore::collections::{HashMap, HashSet};
-use mz_persist::location::VersionedData;
-use mz_proto::ProtoType;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
-use tonic::{IntoStreamingRequest, Request, Response, Status, Streaming};
-use tracing::{info, info_span};
+use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
+use tonic::{Request, Response, Status, Streaming};
+use tracing::{info, info_span, warn};
+
+use mz_ore::collections::HashMap;
+use mz_persist::location::VersionedData;
+use mz_proto::ProtoType;
 
 use crate::cache::StateCache;
 use crate::internal::service::proto_pub_sub_message::Message;
-use crate::ShardId;
+use crate::rpc::PERSIST_PUBSUB_CALLER_KEY;
 
 include!(concat!(
     env!("OUT_DIR"),
@@ -42,7 +42,9 @@ pub struct PersistService {
     /// Assigns a unique ID to each incoming connection.
     connection_id_counter: AtomicUsize,
     /// Maintains a mapping of `ShardId --> [ConnectionId]`.
-    shard_subscribers: Arc<RwLock<BTreeMap<ShardId, BTreeSet<usize>>>>,
+    /// We keep the ShardId as a String to avoid deserialization costs, and assume that
+    /// invalid ShardId parsing will / should be detected elsewhere in the system.
+    shard_subscribers: Arc<RwLock<BTreeMap<String, BTreeSet<usize>>>>,
     /// Maintains a mapping of `ConnectionId --> Tx`.
     conns: Arc<RwLock<HashMap<usize, UnboundedSender<Result<ProtoPubSubMessage, Status>>>>>,
     state_cache: Arc<StateCache>,
@@ -69,7 +71,14 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
     ) -> Result<Response<Self::PubSubStream>, Status> {
         let root_span = info_span!("persist::push::server");
         let _guard = root_span.enter();
-        info!("incoming push");
+        let caller_id = req
+            .metadata()
+            .get(AsciiMetadataKey::from_static(PERSIST_PUBSUB_CALLER_KEY))
+            .map(|key| key.to_str().ok())
+            .flatten()
+            .map(|key| key.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        info!("incoming push from: {:?}", caller_id);
 
         let mut in_stream = req.into_inner();
 
@@ -85,106 +94,89 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
         let conns = Arc::clone(&self.conns);
         let subscribers = Arc::clone(&self.shard_subscribers);
         let state_cache = Arc::clone(&self.state_cache);
-        // this spawn here is required if you want to handle connection error.
-        // If we just map `in_stream` and write it back as `out_stream` the `out_stream`
-        // will be drooped when connection error occurs and error will never be propagated
-        // to mapped version of `in_stream`.
+        // this spawn here to cleanup after connection error / disconnect, otherwise the stream
+        // would not be polled after the connection drops. in our case, we want to clear the
+        // connection and its subscriptions from our shared state when it drops.
         tokio::spawn(async move {
             let root_span = info_span!("persist::push::server_conn");
             let _guard = root_span.enter();
             let mut current_subscriptions = BTreeSet::new();
 
             while let Some(result) = in_stream.next().await {
-                match result {
-                    Ok(req) => {
-                        match req.message {
-                            None => {}
-                            Some(proto_pub_sub_message::Message::PushDiff(req)) => {
-                                let shard_id = req.shard_id.parse().expect("WIP");
-                                let diff = VersionedData {
-                                    seqno: req.seqno.into_rust().expect("WIP"),
-                                    data: req.diff.clone(),
-                                };
+                let req = match result {
+                    Ok(req) => req,
+                    Err(err) => {
+                        warn!("pubsub connection err: {}", err);
+                        break;
+                    }
+                };
 
-                                {
-                                    let subscribers = subscribers.read().expect("lock poisoned");
-                                    match subscribers.get(&shard_id) {
-                                        None => {}
-                                        Some(subscribed_connections) => {
-                                            let conns = conns.read().expect("lock poisoned");
-                                            for connection in subscribed_connections {
-                                                if *connection == connection_id {
-                                                    continue;
-                                                }
+                match req.message {
+                    None => {}
+                    Some(proto_pub_sub_message::Message::PushDiff(req)) => {
+                        let diff = VersionedData {
+                            seqno: req.seqno.into_rust().expect("WIP"),
+                            data: req.diff.clone(),
+                        };
 
-                                                if let Some(conn) = conns.get(connection) {
-                                                    info!(
-                                                        "server forwarding req to {} conns {} {} {}",
-                                                        connection_id,
-                                                        shard_id,
-                                                        diff.seqno,
-                                                        diff.data.len()
-                                                    );
-                                                    let req = ProtoPubSubMessage {
-                                                        message: Some(Message::PushDiff(
-                                                            req.clone(),
-                                                        )),
-                                                    };
-                                                    let _ = conn.send(Ok(req));
-                                                }
-                                            }
+                        {
+                            let subscribers = subscribers.read().expect("lock poisoned");
+                            match subscribers.get(&req.shard_id) {
+                                None => {}
+                                Some(subscribed_connections) => {
+                                    let conns = conns.read().expect("lock poisoned");
+                                    for connection in subscribed_connections {
+                                        // skip sending the diff back to the original sender
+                                        if *connection == connection_id {
+                                            continue;
+                                        }
+
+                                        if let Some(conn) = conns.get(connection) {
+                                            info!(
+                                                "server forwarding req to {} conns {} {} {}",
+                                                connection_id,
+                                                &req.shard_id,
+                                                diff.seqno,
+                                                diff.data.len()
+                                            );
+                                            let req = ProtoPubSubMessage {
+                                                message: Some(Message::PushDiff(req.clone())),
+                                            };
+                                            let _ = conn.send(Ok(req));
                                         }
                                     }
                                 }
-
-                                // also apply it locally
-                                state_cache.push_diff(&shard_id, diff);
-                            }
-                            Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
-                                info!(
-                                    "conn {} adding subscription to {}",
-                                    connection_id, diff.shard
-                                );
-                                let shard_id = diff.shard.parse().expect("WIP");
-                                let mut subscribed_shards =
-                                    subscribers.write().expect("lock poisoned");
-                                subscribed_shards
-                                    .entry(shard_id)
-                                    .or_default()
-                                    .insert(connection_id);
-                                current_subscriptions.insert(shard_id);
-                            }
-                            Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
-                                info!(
-                                    "conn {} removing subscription from {}",
-                                    connection_id, diff.shard
-                                );
-                                let shard_id: ShardId = diff.shard.parse().expect("WIP");
-                                let mut subscribed_shards =
-                                    subscribers.write().expect("lock poisoned");
-                                subscribed_shards
-                                    .entry(shard_id.clone())
-                                    .or_default()
-                                    .remove(&connection_id);
-                                current_subscriptions.remove(&shard_id);
                             }
                         }
+
+                        // also apply it locally
+                        // WIP: just eat the cost and use ShardId everywhere?
+                        let shard_id = req.shard_id.parse().expect("WIP");
+                        state_cache.push_diff(&shard_id, diff);
                     }
-                    Err(err) => {
-                        if let Some(io_err) = match_for_io_error(&err) {
-                            if io_err.kind() == ErrorKind::BrokenPipe {
-                                // here you can handle special case when client
-                                // disconnected in unexpected way
-                                info!("client disconnected: broken pipe");
-                                break;
-                            }
+                    Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
+                        info!(
+                            "conn {} adding subscription to {}",
+                            connection_id, diff.shard
+                        );
+                        let mut subscribed_shards = subscribers.write().expect("lock poisoned");
+                        subscribed_shards
+                            .entry(diff.shard.clone())
+                            .or_default()
+                            .insert(connection_id);
+                        current_subscriptions.insert(diff.shard);
+                    }
+                    Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
+                        info!(
+                            "conn {} removing subscription from {}",
+                            connection_id, diff.shard
+                        );
+                        let mut subscribed_shards = subscribers.write().expect("lock poisoned");
+                        if let Some(subscribed_connections) = subscribed_shards.get_mut(&diff.shard)
+                        {
+                            subscribed_connections.remove(&connection_id);
                         }
-
-                        match tx.send(Err(err)) {
-                            Ok(_) => (),
-                            // response was dropped
-                            Err(_err) => break,
-                        }
+                        current_subscriptions.remove(&diff.shard);
                     }
                 }
             }
@@ -192,10 +184,9 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
             {
                 let mut subscribers = subscribers.write().expect("lock poisoned");
                 for shard_id in current_subscriptions {
-                    subscribers
-                        .entry(shard_id)
-                        .or_default()
-                        .remove(&connection_id);
+                    if let Some(subscribed_connections) = subscribers.get_mut(&shard_id) {
+                        subscribed_connections.remove(&connection_id);
+                    }
                 }
             }
 
@@ -209,28 +200,5 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
 
         let out_stream: Self::PubSubStream = Box::pin(UnboundedReceiverStream::new(rx));
         Ok(Response::new(out_stream))
-    }
-}
-
-fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
-    let mut err: &(dyn Error + 'static) = err_status;
-
-    loop {
-        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-            return Some(io_err);
-        }
-
-        // h2::Error do not expose std::io::Error with `source()`
-        // https://github.com/hyperium/h2/pull/462
-        if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
-            if let Some(io_err) = h2_err.get_io() {
-                return Some(io_err);
-            }
-        }
-
-        err = match err.source() {
-            Some(err) => err,
-            None => return None,
-        };
     }
 }

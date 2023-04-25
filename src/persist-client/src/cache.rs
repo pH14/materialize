@@ -9,21 +9,22 @@
 
 //! A cache of [PersistClient]s indexed by [PersistLocation]s.
 
-use futures::StreamExt;
 use std::any::Any;
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
-use std::io::Write;
-use std::pin::pin;
-use std::rc::Rc;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
+use futures::StreamExt;
+use timely::progress::Timestamp;
+use tokio::sync::{Mutex, OnceCell};
+use tokio::task::JoinHandle;
+use tracing::{info, instrument, warn};
+
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::{
@@ -32,17 +33,12 @@ use mz_persist::location::{
 };
 use mz_persist_types::{Codec, Codec64};
 use mz_proto::ProtoType;
-use timely::progress::Timestamp;
-use tokio::sync::{Mutex, OnceCell};
-use tokio::task::JoinHandle;
-use tracing::{debug, info, instrument, warn};
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus};
 use crate::internal::service::proto_pub_sub_message;
-use crate::internal::service::proto_pub_sub_message::Message;
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
 use crate::rpc::{PubSubReceiver, PubSubSender};
@@ -318,15 +314,22 @@ where
 
     fn push_diff(&self, diff: VersionedData) -> bool {
         self.write_lock(&self.metrics.locks.applier_write, |state| {
-            debug!(
-                "applying pushed diff {} {} to {}",
-                state.shard_id, diff.seqno, state.seqno
-            );
-            if diff.seqno <= state.seqno.next() {
-                state.apply_encoded_diffs(&self.cfg, &self.metrics, std::iter::once(&diff));
-                info!("applied pushed diff {} {}", state.shard_id, diff.seqno);
+            let seqno_before = state.seqno;
+            state.apply_encoded_diffs(&self.cfg, &self.metrics, std::iter::once(&diff));
+            let seqno_after = state.seqno;
+            assert!(seqno_after >= seqno_before);
+
+            if seqno_before != seqno_after {
+                info!(
+                    "applied pushed diff {}. seqno {} -> {}.",
+                    state.shard_id, seqno_before, state.seqno
+                );
                 true
             } else {
+                info!(
+                    "failed to apply pushed diff {}. seqno {} vs diff {}",
+                    state.shard_id, seqno_before, diff.seqno
+                );
                 false
             }
         })
@@ -348,9 +351,7 @@ pub struct StateCache {
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
     states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
-
     pubsub_sender: Option<Arc<dyn PubSubSender>>,
-    subscribed_shards: Arc<std::sync::Mutex<BTreeSet<ShardId>>>,
     // pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
 }
 
@@ -360,12 +361,12 @@ enum StateCacheInit {
     NeedInit(Arc<OnceCell<Weak<dyn DynState>>>),
 }
 
-struct StateSubscriptionToken {
+struct PubSubSubscriptionToken {
     shard_id: ShardId,
     pubsub_sender: Option<Arc<dyn PubSubSender>>,
 }
 
-impl Drop for StateSubscriptionToken {
+impl Drop for PubSubSubscriptionToken {
     fn drop(&mut self) {
         if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
             pubsub_sender.unsubscribe(&self.shard_id);
@@ -389,17 +390,15 @@ impl StateCache {
             cfg: Arc::new(cfg.clone()),
             metrics,
             states: Default::default(),
-            subscribed_shards: Default::default(),
             pubsub_sender,
             // pushed_diff_fns: Default::default(),
         });
 
         let cache = Arc::clone(&state_cache);
         if let Some(mut pubsub_receiver) = pubsub_receiver {
-            let push_res = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
+            let _ = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
                 while let Some(res) = pubsub_receiver.next().await {
                     match res.message {
-                        None => {}
                         Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
                             let shard_id = diff.shard_id.into_rust().expect("WIP");
                             let diff = VersionedData {
@@ -414,13 +413,9 @@ impl StateCache {
                             );
                             cache.push_diff(&shard_id, diff);
                         }
-                        Some(proto_pub_sub_message::Message::Subscribe(resp)) => {
-                            warn!("pubsub client received stray subscribe: {:?}", resp);
+                        ref msg @ None | ref msg @ Some(_) => {
+                            warn!("pubsub client received unexpected message: {:?}", msg);
                         }
-                        Some(proto_pub_sub_message::Message::Unsubscribe(resp)) => {
-                            warn!("pubsub client received stray unsubscribe: {:?}", resp);
-                        }
-                        _ => {}
                     }
                 }
             });
@@ -486,7 +481,7 @@ impl StateCache {
                     let state = init_once
                         .get_or_try_init::<Box<CodecMismatch>, _, _>(|| async {
                             let init_res = init_fn().await;
-                            let token = StateSubscriptionToken {
+                            let token = PubSubSubscriptionToken {
                                 shard_id: shard_id.clone(),
                                 pubsub_sender: self.pubsub_sender.clone(),
                             };
@@ -585,7 +580,7 @@ pub(crate) struct LockingTypedState<K, V, T, D> {
     notifier: StateWatchNotifier,
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
-    _subscription_token: StateSubscriptionToken,
+    _subscription_token: PubSubSubscriptionToken,
 }
 
 impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {
@@ -676,6 +671,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures::stream::{FuturesUnordered, StreamExt};
+
     use mz_build_info::DUMMY_BUILD_INFO;
     use mz_ore::now::SYSTEM_TIME;
     use mz_ore::task::spawn;

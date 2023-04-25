@@ -371,7 +371,6 @@ impl PersistClient {
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());
-
         let reader_id = LeasedReaderId::new();
         let heartbeat_ts = (self.cfg.now)();
         let (reader_state, maintenance) = machine
