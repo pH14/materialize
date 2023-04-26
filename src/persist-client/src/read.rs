@@ -941,7 +941,10 @@ where
                     retry
                 }
             };
-            self.machine.applier.fetch_and_update_state(None).await;
+            self.machine
+                .applier
+                .fetch_and_update_state(Some(seqno))
+                .await;
         }
     }
 

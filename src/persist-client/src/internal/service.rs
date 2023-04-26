@@ -20,11 +20,10 @@ use futures::Stream;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
-use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
+use tonic::metadata::AsciiMetadataKey;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, info_span, warn};
 
-use mz_ore::collections::HashMap;
 use mz_persist::location::VersionedData;
 use mz_proto::ProtoType;
 
@@ -41,19 +40,18 @@ include!(concat!(
 pub struct PersistService {
     /// Assigns a unique ID to each incoming connection.
     connection_id_counter: AtomicUsize,
-    /// Maintains a mapping of `ShardId --> [ConnectionId]`.
-    /// We keep the ShardId as a String to avoid deserialization costs, and assume that
-    /// invalid ShardId parsing will / should be detected elsewhere in the system.
-    shard_subscribers: Arc<RwLock<BTreeMap<String, BTreeSet<usize>>>>,
-    /// Maintains a mapping of `ConnectionId --> Tx`.
-    conns: Arc<RwLock<HashMap<usize, UnboundedSender<Result<ProtoPubSubMessage, Status>>>>>,
+    /// Maintains a mapping of `ShardId --> [ConnectionId -> Tx]`.
+    shard_subscribers: Arc<
+        RwLock<
+            BTreeMap<String, BTreeMap<usize, UnboundedSender<Result<ProtoPubSubMessage, Status>>>>,
+        >,
+    >,
     state_cache: Arc<StateCache>,
 }
 
 impl PersistService {
     pub fn new(state_cache: Arc<StateCache>) -> Self {
         PersistService {
-            conns: Arc::new(RwLock::new(HashMap::new())),
             shard_subscribers: Default::default(),
             connection_id_counter: AtomicUsize::new(0),
             state_cache,
@@ -84,14 +82,8 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
 
         // WIP not unbounded
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let connection_id = {
-            let mut conns = self.conns.write().expect("lock poisoned");
-            let connection_id = self.connection_id_counter.fetch_add(1, Ordering::SeqCst);
-            conns.insert(connection_id, tx.clone());
-            connection_id
-        };
+        let connection_id = self.connection_id_counter.fetch_add(1, Ordering::SeqCst);
 
-        let conns = Arc::clone(&self.conns);
         let subscribers = Arc::clone(&self.shard_subscribers);
         let state_cache = Arc::clone(&self.state_cache);
         // this spawn here to cleanup after connection error / disconnect, otherwise the stream
@@ -124,26 +116,22 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                             match subscribers.get(&req.shard_id) {
                                 None => {}
                                 Some(subscribed_connections) => {
-                                    let conns = conns.read().expect("lock poisoned");
-                                    for connection in subscribed_connections {
+                                    for (subscribed_conn_id, tx) in subscribed_connections {
                                         // skip sending the diff back to the original sender
-                                        if *connection == connection_id {
+                                        if *subscribed_conn_id == connection_id {
                                             continue;
                                         }
-
-                                        if let Some(conn) = conns.get(connection) {
-                                            info!(
-                                                "server forwarding req to {} conns {} {} {}",
-                                                connection_id,
-                                                &req.shard_id,
-                                                diff.seqno,
-                                                diff.data.len()
-                                            );
-                                            let req = ProtoPubSubMessage {
-                                                message: Some(Message::PushDiff(req.clone())),
-                                            };
-                                            let _ = conn.send(Ok(req));
-                                        }
+                                        info!(
+                                            "server forwarding req to {} conns {} {} {}",
+                                            caller_id,
+                                            &req.shard_id,
+                                            diff.seqno,
+                                            diff.data.len()
+                                        );
+                                        let req = ProtoPubSubMessage {
+                                            message: Some(Message::PushDiff(req.clone())),
+                                        };
+                                        let _ = tx.send(Ok(req));
                                     }
                                 }
                             }
@@ -155,21 +143,18 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                         state_cache.push_diff(&shard_id, diff);
                     }
                     Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
-                        info!(
-                            "conn {} adding subscription to {}",
-                            connection_id, diff.shard
-                        );
+                        info!("conn {} adding subscription to {}", caller_id, diff.shard);
                         let mut subscribed_shards = subscribers.write().expect("lock poisoned");
                         subscribed_shards
                             .entry(diff.shard.clone())
                             .or_default()
-                            .insert(connection_id);
+                            .insert(connection_id, tx.clone());
                         current_subscriptions.insert(diff.shard);
                     }
                     Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
                         info!(
                             "conn {} removing subscription from {}",
-                            connection_id, diff.shard
+                            caller_id, diff.shard
                         );
                         let mut subscribed_shards = subscribers.write().expect("lock poisoned");
                         if let Some(subscribed_connections) = subscribed_shards.get_mut(&diff.shard)
@@ -190,12 +175,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                 }
             }
 
-            {
-                let mut conns = conns.write().expect("lock poisoned");
-                conns.remove(&connection_id);
-            }
-
-            info!("push stream ended");
+            info!("push stream to {} ended", caller_id);
         });
 
         let out_stream: Self::PubSubStream = Box::pin(UnboundedReceiverStream::new(rx));
