@@ -23,7 +23,6 @@ use tracing::{error, info, warn};
 use mz_persist::location::VersionedData;
 use mz_proto::RustType;
 
-use crate::cache::PersistClientCache;
 use crate::internal::service::proto_persist_pub_sub_client::ProtoPersistPubSubClient;
 use crate::internal::service::proto_persist_pub_sub_server::ProtoPersistPubSubServer;
 use crate::internal::service::proto_pub_sub_message::Message;
@@ -67,8 +66,8 @@ pub struct PersistPubSubServer {
 }
 
 impl PersistPubSubServer {
-    pub fn new(cache: &PersistClientCache) -> Self {
-        let service = PersistService::new(Arc::clone(&cache.state_cache));
+    pub fn new() -> Self {
+        let service = PersistService::new();
         PersistPubSubServer { service }
     }
 

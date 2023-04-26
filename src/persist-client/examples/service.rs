@@ -33,8 +33,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
     let server = spawn(|| "persist service", async move {
         let _guard = span.enter();
         info!("listening on {}", args.listen_addr);
-        let cache = PersistClientCache::new_no_metrics();
-        PersistPubSubServer::new(&cache)
+        PersistPubSubServer::new()
             .serve(args.listen_addr.clone())
             .await
     });

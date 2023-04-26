@@ -27,7 +27,6 @@ use tracing::{info, info_span, warn};
 use mz_persist::location::VersionedData;
 use mz_proto::ProtoType;
 
-use crate::cache::StateCache;
 use crate::internal::service::proto_pub_sub_message::Message;
 use crate::rpc::PERSIST_PUBSUB_CALLER_KEY;
 
@@ -46,15 +45,13 @@ pub struct PersistService {
             BTreeMap<String, BTreeMap<usize, UnboundedSender<Result<ProtoPubSubMessage, Status>>>>,
         >,
     >,
-    state_cache: Arc<StateCache>,
 }
 
 impl PersistService {
-    pub fn new(state_cache: Arc<StateCache>) -> Self {
+    pub fn new() -> Self {
         PersistService {
             shard_subscribers: Default::default(),
             connection_id_counter: AtomicUsize::new(0),
-            state_cache,
         }
     }
 }
@@ -85,7 +82,6 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
         let connection_id = self.connection_id_counter.fetch_add(1, Ordering::SeqCst);
 
         let subscribers = Arc::clone(&self.shard_subscribers);
-        let state_cache = Arc::clone(&self.state_cache);
         // this spawn here to cleanup after connection error / disconnect, otherwise the stream
         // would not be polled after the connection drops. in our case, we want to clear the
         // connection and its subscriptions from our shared state when it drops.
@@ -123,7 +119,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                                         }
                                         info!(
                                             "server forwarding req to {} conns {} {} {}",
-                                            caller_id,
+                                            subscribed_conn_id,
                                             &req.shard_id,
                                             diff.seqno,
                                             diff.data.len()
@@ -136,11 +132,6 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                                 }
                             }
                         }
-
-                        // also apply it locally
-                        // WIP: just eat the cost and use ShardId everywhere?
-                        let shard_id = req.shard_id.parse().expect("WIP");
-                        state_cache.push_diff(&shard_id, diff);
                     }
                     Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
                         info!("conn {} adding subscription to {}", caller_id, diff.shard);

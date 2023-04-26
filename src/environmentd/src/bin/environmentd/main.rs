@@ -98,7 +98,7 @@ use http::header::HeaderValue;
 use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
-use mz_persist_client::rpc::PersistPubSubServer;
+use mz_persist_client::rpc::{PersistPubSub, PersistPubSubClient, PersistPubSubServer};
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
 use prometheus::IntGauge;
@@ -728,14 +728,6 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     };
     let secrets_reader = secrets_controller.reader();
     let now = SYSTEM_TIME.clone();
-    let persist_clients = PersistClientCache::new(
-        PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
-        &metrics_registry,
-        // envd doesn't push anywhere, everyone pushes to us
-        None,
-    );
-    let persist_clients = Arc::new(persist_clients);
-    let orchestrator = Arc::new(TracingOrchestrator::new(orchestrator, args.tracing.clone()));
 
     let persist_pubsub_addr = format!(
         "http://{}:{}",
@@ -743,7 +735,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         args.internal_persist_pubsub_listen_addr.port()
     );
     eprintln!("persist_push_addr {}", persist_pubsub_addr);
-    let persist_push_server = PersistPubSubServer::new(&persist_clients);
+    let persist_push_server = PersistPubSubServer::new();
     let _server = runtime.spawn_named(|| "persist::push::server", async move {
         let span = tracing::info_span!("persist::push::server");
         let _guard = span.enter();
@@ -758,6 +750,29 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
             .await;
         tracing::info!("persist push server exited {:?}", res);
     });
+
+    let persist_clients = runtime.block_on(async {
+        // WIP: should succeed even on failure
+        // WIP: this blocks start up :(
+        // WIP: timeout
+        // this server is hosted locally, so we'd expect the
+        // connection establishment time to be very quick
+        let pubsub = PersistPubSubClient::connect(
+            format!("http://{}", args.internal_persist_pubsub_listen_addr),
+            "environmentd".to_string(),
+        )
+        .await;
+
+        // WIP: log error if failed
+        PersistClientCache::new(
+            PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
+            &metrics_registry,
+            pubsub.ok(),
+        )
+    });
+
+    let persist_clients = Arc::new(persist_clients);
+    let orchestrator = Arc::new(TracingOrchestrator::new(orchestrator, args.tracing.clone()));
 
     let controller = ControllerConfig {
         build_info: &mz_environmentd::BUILD_INFO,
