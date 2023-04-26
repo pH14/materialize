@@ -735,7 +735,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         args.internal_persist_pubsub_listen_addr.port()
     );
     eprintln!("persist_push_addr {}", persist_pubsub_addr);
-    let persist_push_server = PersistPubSubServer::new();
+    let persist_push_server = PersistPubSubServer::new(&metrics_registry);
     let _server = runtime.spawn_named(|| "persist::push::server", async move {
         let span = tracing::info_span!("persist::push::server");
         let _guard = span.enter();

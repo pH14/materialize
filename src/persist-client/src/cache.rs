@@ -23,7 +23,7 @@ use futures::StreamExt;
 use timely::progress::Timestamp;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
@@ -320,13 +320,13 @@ where
             assert!(seqno_after >= seqno_before);
 
             if seqno_before != seqno_after {
-                info!(
+                debug!(
                     "applied pushed diff {}. seqno {} -> {}.",
                     state.shard_id, seqno_before, state.seqno
                 );
                 true
             } else {
-                info!(
+                debug!(
                     "failed to apply pushed diff {}. seqno {} vs diff {}",
                     state.shard_id, seqno_before, diff.seqno
                 );
@@ -362,13 +362,17 @@ enum StateCacheInit {
 
 struct PubSubSubscriptionToken {
     shard_id: ShardId,
+    metrics: Arc<Metrics>,
     pubsub_sender: Option<Arc<dyn PubSubSender>>,
 }
 
 impl Drop for PubSubSubscriptionToken {
     fn drop(&mut self) {
         if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-            pubsub_sender.unsubscribe(&self.shard_id);
+            pubsub_sender.unsubscribe(
+                &self.shard_id,
+                &self.metrics.pubsub_client.sender.unsubscribe,
+            );
         }
     }
 }
@@ -403,13 +407,13 @@ impl StateCache {
                                 seqno: diff.seqno.into_rust().expect("WIP"),
                                 data: diff.diff,
                             };
-                            info!(
+                            debug!(
                                 "client got diff {} {} {}",
                                 shard_id,
                                 diff.seqno,
                                 diff.data.len()
                             );
-                            cache.push_diff(&shard_id, diff);
+                            cache.apply_diff(&shard_id, diff);
                         }
                         ref msg @ None | ref msg @ Some(_) => {
                             warn!("pubsub client received unexpected message: {:?}", msg);
@@ -434,10 +438,16 @@ impl StateCache {
         )
     }
 
-    pub(crate) fn push_diff(&self, shard_id: &ShardId, diff: VersionedData) {
+    pub(crate) fn apply_diff(&self, shard_id: &ShardId, diff: VersionedData) {
         if let Some(state) = self.get_cached(shard_id) {
             // WIP: could register callbacks here. if not applied, fallback
-            state.push_diff(diff);
+            let applied = state.push_diff(diff);
+            let shard_metrics = self.metrics.shards.shard(shard_id);
+            if applied {
+                shard_metrics.pubsub_push_diff_applied.inc();
+            } else {
+                shard_metrics.pubsub_push_diff_not_applied.inc();
+            }
         }
     }
 
@@ -482,6 +492,7 @@ impl StateCache {
                             let init_res = init_fn().await;
                             let token = PubSubSubscriptionToken {
                                 shard_id: shard_id.clone(),
+                                metrics: Arc::clone(&self.metrics),
                                 pubsub_sender: self.pubsub_sender.clone(),
                             };
                             let state = Arc::new(LockingTypedState {
@@ -502,7 +513,8 @@ impl StateCache {
                         // We actually did the init work, don't bother casting back
                         // the type erased and weak version.
                         if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                            pubsub_sender.subscribe(&shard_id);
+                            pubsub_sender
+                                .subscribe(&shard_id, &self.metrics.pubsub_client.sender.subscribe);
                         }
                         return Ok(x);
                     }

@@ -13,6 +13,7 @@ use futures::StreamExt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use mz_ore::metrics::MetricsRegistry;
 use mz_ore::task::spawn;
 use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_client::cache::PersistClientCache;
