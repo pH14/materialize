@@ -879,7 +879,7 @@ impl RunnerInner {
                 now: SYSTEM_TIME.clone(),
                 postgres_factory: postgres_factory.clone(),
                 metrics_registry: metrics_registry.clone(),
-                persist_push_addr: "WIP".into(),
+                persist_pubsub_addr: "http://localhost:6879".into(),
             },
             secrets_controller,
             cloud_resource_controller: None,

@@ -144,11 +144,11 @@ struct Args {
     /// WIP
     #[clap(
         long,
-        env = "PERSIST_PUSH_ADDR",
+        env = "PERSIST_PUBSUB_ADDR",
         value_name = "HOST:PORT",
-        default_value = "127.0.0.1:2103"
+        default_value = "127.0.0.1:6879"
     )]
-    persist_push_addr: String,
+    persist_pubsub_addr: String,
 
     // === Cloud options. ===
     /// An external ID to be supplied to all AWS AssumeRole operations.
@@ -268,12 +268,13 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
         )
     });
 
-    info!("WIP persist_push_addr {}", args.persist_push_addr);
+    info!("WIP persist_pubsub_addr {}", args.persist_pubsub_addr);
     let pubsub_caller_id = std::env::var("HOSTNAME")
         .ok()
         .or_else(|| args.tracing.log_prefix.clone())
         .unwrap_or_default();
-    let pubsub = PersistPubSubClient::connect(args.persist_push_addr, pubsub_caller_id).await?;
+    // WIP: try to connect, but pass in None if it fails
+    let pubsub = PersistPubSubClient::connect(args.persist_pubsub_addr, pubsub_caller_id).await?;
     let persist_clients = Arc::new(PersistClientCache::new(
         PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
         &metrics_registry,

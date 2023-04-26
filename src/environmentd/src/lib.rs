@@ -138,7 +138,7 @@ pub struct Config {
     pub http_listen_addr: SocketAddr,
     /// The IP address and port to listen for pgwire connections from the cloud
     /// system on.
-    // pub internal_sql_listen_addr: SocketAddr,
+    pub internal_sql_listen_addr: SocketAddr,
     /// The IP address and port to serve the metrics registry from.
     pub internal_http_listen_addr: SocketAddr,
     /// Origins for which cross-origin resource sharing (CORS) for HTTP requests
@@ -272,8 +272,8 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     // start queueing incoming connections for when we're ready.
     let (sql_listener, sql_conns) = server::listen(config.sql_listen_addr).await?;
     let (http_listener, http_conns) = server::listen(config.http_listen_addr).await?;
-    // let (internal_sql_listener, internal_sql_conns) =
-    //     server::listen(config.internal_sql_listen_addr).await?;
+    let (internal_sql_listener, internal_sql_conns) =
+        server::listen(config.internal_sql_listen_addr).await?;
     let (internal_http_listener, internal_http_conns) =
         server::listen(config.internal_http_listen_addr).await?;
 
@@ -408,25 +408,25 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     });
 
     // Launch internal SQL server.
-    // task::spawn(|| "internal_sql_server", {
-    //     let internal_sql_server = mz_pgwire::Server::new(mz_pgwire::Config {
-    //         tls: pgwire_tls.map(|mut pgwire_tls| {
-    //             // Allow, but do not require, TLS connections on the internal
-    //             // port. Some users of the internal SQL server do not support
-    //             // TLS, while others require it, so we allow both.
-    //             //
-    //             // TODO(benesch): migrate all internal applications to TLS and
-    //             // remove `TlsMode::Allow`.
-    //             pgwire_tls.mode = mz_pgwire::TlsMode::Allow;
-    //             pgwire_tls
-    //         }),
-    //         adapter_client: adapter_client.clone(),
-    //         frontegg: None,
-    //         metrics,
-    //         internal: true,
-    //     });
-    //     server::serve(internal_sql_conns, internal_sql_server)
-    // });
+    task::spawn(|| "internal_sql_server", {
+        let internal_sql_server = mz_pgwire::Server::new(mz_pgwire::Config {
+            tls: pgwire_tls.map(|mut pgwire_tls| {
+                // Allow, but do not require, TLS connections on the internal
+                // port. Some users of the internal SQL server do not support
+                // TLS, while others require it, so we allow both.
+                //
+                // TODO(benesch): migrate all internal applications to TLS and
+                // remove `TlsMode::Allow`.
+                pgwire_tls.mode = mz_pgwire::TlsMode::Allow;
+                pgwire_tls
+            }),
+            adapter_client: adapter_client.clone(),
+            frontegg: None,
+            metrics,
+            internal: true,
+        });
+        server::serve(internal_sql_conns, internal_sql_server)
+    });
 
     // Launch HTTP server.
     task::spawn(|| "http_server", {
@@ -466,7 +466,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     Ok(Server {
         sql_listener,
         http_listener,
-        // internal_sql_listener,
+        internal_sql_listener,
         internal_http_listener,
         _adapter_handle: adapter_handle,
     })
@@ -477,7 +477,7 @@ pub struct Server {
     // Drop order matters for these fields.
     sql_listener: ListenerHandle,
     http_listener: ListenerHandle,
-    // internal_sql_listener: ListenerHandle,
+    internal_sql_listener: ListenerHandle,
     internal_http_listener: ListenerHandle,
     _adapter_handle: mz_adapter::Handle,
 }
@@ -492,8 +492,7 @@ impl Server {
     }
 
     pub fn internal_sql_local_addr(&self) -> SocketAddr {
-        // self.internal_sql_listener.local_addr()
-        panic!("WIP")
+        self.internal_sql_listener.local_addr()
     }
 
     pub fn internal_http_local_addr(&self) -> SocketAddr {

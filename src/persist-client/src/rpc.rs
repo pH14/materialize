@@ -17,6 +17,7 @@ use futures::Stream;
 use futures_util::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
+use tonic::transport::Endpoint;
 use tonic::{Extensions, Request};
 use tracing::{error, info, warn};
 
@@ -153,6 +154,7 @@ impl PersistPubSub for PersistPubSubClient {
         addr: String,
         caller_id: String,
     ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error> {
+        // WIP: connect with retries and a timeout
         let mut client = ProtoPersistPubSubClient::connect(addr.clone()).await?;
         info!("Created pubsub client to: {:?}", addr);
         // WIP not unbounded.
