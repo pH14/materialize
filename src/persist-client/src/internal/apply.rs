@@ -36,10 +36,7 @@ use crate::internal::state_diff::StateDiff;
 use crate::internal::state_versions::{EncodedRollup, StateVersions};
 use crate::internal::trace::FueledMergeReq;
 use crate::internal::watch::StateWatch;
-<<<<<<< HEAD
-=======
 use crate::rpc::PubSubSender;
->>>>>>> cc72cf33f8 (persist: wip pubsub)
 use crate::{PersistConfig, ShardId};
 
 /// An applier of persist commands.
@@ -117,11 +114,6 @@ where
             state,
         };
         Ok(ret)
-    }
-
-    /// Returns a new [StateWatch] for changes to this Applier's State.
-    pub fn watch(&self) -> StateWatch<K, V, T, D> {
-        StateWatch::new(Arc::clone(&self.state), &self.metrics)
     }
 
     /// Returns a new [StateWatch] for changes to this Applier's State.

@@ -17,7 +17,6 @@ use futures::Stream;
 use futures_util::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
-use tonic::transport::Endpoint;
 use tonic::{Extensions, Request};
 use tracing::{error, info, warn};
 

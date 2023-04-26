@@ -352,7 +352,6 @@ pub struct StateCache {
     metrics: Arc<Metrics>,
     states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
     pubsub_sender: Option<Arc<dyn PubSubSender>>,
-    // pub(crate) pushed_diff_fns: RwLock<BTreeMap<ShardId, PushedDiffFn>>,
 }
 
 #[derive(Debug)]
@@ -391,7 +390,6 @@ impl StateCache {
             metrics,
             states: Default::default(),
             pubsub_sender,
-            // pushed_diff_fns: Default::default(),
         });
 
         let cache = Arc::clone(&state_cache);
@@ -432,6 +430,7 @@ impl StateCache {
                 &PersistConfig::new_for_tests(),
                 &MetricsRegistry::new(),
             )),
+            None,
         )
     }
 
@@ -443,7 +442,7 @@ impl StateCache {
     }
 
     pub(crate) async fn get<K, V, T, D, F, InitFn>(
-        self: Arc<Self>,
+        &self,
         shard_id: ShardId,
         mut init_fn: InitFn,
     ) -> Result<Arc<LockingTypedState<K, V, T, D>>, Box<CodecMismatch>>
@@ -487,7 +486,7 @@ impl StateCache {
                             };
                             let state = Arc::new(LockingTypedState {
                                 shard_id,
-                                notifier: StateWatchNotifier::default(),
+                                notifier: StateWatchNotifier::new(Arc::clone(&self.metrics)),
                                 state: RwLock::new(init_res?),
                                 cfg: Arc::clone(&self.cfg),
                                 metrics: Arc::clone(&self.metrics),
@@ -544,27 +543,27 @@ impl StateCache {
     fn get_cached(&self, shard_id: &ShardId) -> Option<Arc<dyn DynState>> {
         self.states
             .lock()
-            .expect("lock poisoned")
+            .expect("lock")
             .get(shard_id)
             .and_then(|x| x.get())
             .and_then(|x| x.upgrade())
     }
 
     #[cfg(test)]
-    async fn initialized_count(&self) -> usize {
+    fn initialized_count(&self) -> usize {
         self.states
             .lock()
-            .await
+            .expect("lock")
             .values()
             .filter(|x| x.initialized())
             .count()
     }
 
     #[cfg(test)]
-    async fn strong_count(&self) -> usize {
+    fn strong_count(&self) -> usize {
         self.states
             .lock()
-            .await
+            .expect("lock")
             .values()
             .filter(|x| x.get().map_or(false, |x| x.upgrade().is_some()))
             .count()
@@ -776,7 +775,7 @@ mod tests {
         let states = StateCache::new_no_metrics();
 
         // The cache starts empty.
-        assert_eq!(states.states.lock().await.len(), 0);
+        assert_eq!(states.states.lock().expect("lock").len(), 0);
 
         // Panic'ing during init_fn .
         let s = Arc::clone(&states);
@@ -786,7 +785,7 @@ mod tests {
         })
         .await;
         assert!(res.is_err());
-        assert_eq!(states.initialized_count().await, 0);
+        assert_eq!(states.initialized_count(), 0);
 
         // Returning an error from init_fn doesn't initialize an entry in the cache.
         let res = states
@@ -798,7 +797,7 @@ mod tests {
             })
             .await;
         assert!(res.is_err());
-        assert_eq!(states.initialized_count().await, 0);
+        assert_eq!(states.initialized_count(), 0);
 
         // Initialize one shard.
         let did_work = Arc::new(AtomicBool::new(false));
@@ -813,8 +812,8 @@ mod tests {
             .await
             .expect("should successfully initialize");
         assert_eq!(did_work.load(Ordering::SeqCst), true);
-        assert_eq!(states.initialized_count().await, 1);
-        assert_eq!(states.strong_count().await, 1);
+        assert_eq!(states.initialized_count(), 1);
+        assert_eq!(states.strong_count(), 1);
 
         // Trying to initialize it again does no work and returns the same state.
         let did_work = Arc::new(AtomicBool::new(false));
@@ -830,8 +829,8 @@ mod tests {
             .await
             .expect("should successfully initialize");
         assert_eq!(did_work.load(Ordering::SeqCst), false);
-        assert_eq!(states.initialized_count().await, 1);
-        assert_eq!(states.strong_count().await, 1);
+        assert_eq!(states.initialized_count(), 1);
+        assert_eq!(states.strong_count(), 1);
         assert_same(&s1_state1, &s1_state2);
 
         // Trying to initialize with different types doesn't work.
@@ -850,8 +849,8 @@ mod tests {
             format!("{}", res.expect_err("types shouldn't match")),
             "requested codecs (\"String\", \"()\", \"u64\", \"i64\", Some(CodecConcreteType(\"(alloc::string::String, (), u64, i64)\"))) did not match ones in durable storage (\"()\", \"()\", \"u64\", \"i64\", Some(CodecConcreteType(\"((), (), u64, i64)\")))"
         );
-        assert_eq!(states.initialized_count().await, 1);
-        assert_eq!(states.strong_count().await, 1);
+        assert_eq!(states.initialized_count(), 1);
+        assert_eq!(states.strong_count(), 1);
 
         // We can add a shard of a different type.
         let s2 = ShardId::new();
@@ -859,8 +858,8 @@ mod tests {
             .get::<String, (), u64, i64, _, _>(s2, || async { Ok(new_state(s2)) })
             .await
             .expect("should successfully initialize");
-        assert_eq!(states.initialized_count().await, 2);
-        assert_eq!(states.strong_count().await, 2);
+        assert_eq!(states.initialized_count(), 2);
+        assert_eq!(states.strong_count(), 2);
         let s2_state2 = states
             .get::<String, (), u64, i64, _, _>(s2, || async { Ok(new_state(s2)) })
             .await
@@ -870,10 +869,10 @@ mod tests {
         // The cache holds weak references to State so we reclaim memory if the
         // shards stops being used.
         drop(s1_state1);
-        assert_eq!(states.strong_count().await, 2);
+        assert_eq!(states.strong_count(), 2);
         drop(s1_state2);
-        assert_eq!(states.strong_count().await, 1);
-        assert_eq!(states.initialized_count().await, 2);
+        assert_eq!(states.strong_count(), 1);
+        assert_eq!(states.initialized_count(), 2);
         assert!(states.get_cached(&s1).is_none());
 
         // But we can re-init that shard if necessary.
@@ -881,10 +880,10 @@ mod tests {
             .get::<(), (), u64, i64, _, _>(s1, || async { Ok(new_state(s1)) })
             .await
             .expect("should successfully initialize");
-        assert_eq!(states.initialized_count().await, 2);
-        assert_eq!(states.strong_count().await, 2);
+        assert_eq!(states.initialized_count(), 2);
+        assert_eq!(states.strong_count(), 2);
         drop(s1_state1);
-        assert_eq!(states.strong_count().await, 1);
+        assert_eq!(states.strong_count(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
