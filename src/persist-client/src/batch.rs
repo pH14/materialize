@@ -859,7 +859,7 @@ mod tests {
             (("3".to_owned(), "three".to_owned()), 3, 1),
         ];
 
-        let cache = PersistClientCache::new_no_metrics();
+        let cache = PersistClientCache::new_no_metrics().await;
         // Set blob_target_size to 0 so that each row gets forced into its own
         // batch. Set max_outstanding to a small value that's >1 to test various
         // edge cases below.
@@ -948,7 +948,7 @@ mod tests {
     async fn batch_builder_keys() {
         mz_ore::test::init_logging();
 
-        let cache = PersistClientCache::new_no_metrics();
+        let cache = PersistClientCache::new_no_metrics().await;
         // Set blob_target_size to 0 so that each row gets forced into its own batch part
         cache.cfg.dynamic.set_blob_target_size(0);
         let client = cache
@@ -992,7 +992,7 @@ mod tests {
     async fn batch_builder_partial_order() {
         mz_ore::test::init_logging();
 
-        let cache = PersistClientCache::new_no_metrics();
+        let cache = PersistClientCache::new_no_metrics().await;
         // Set blob_target_size to 0 so that each row gets forced into its own batch part
         cache.cfg.dynamic.set_blob_target_size(0);
         let client = cache

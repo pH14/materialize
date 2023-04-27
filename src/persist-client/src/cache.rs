@@ -41,7 +41,9 @@ use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsens
 use crate::internal::service::proto_pub_sub_message;
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
-use crate::rpc::{PubSubReceiver, PubSubSender};
+use crate::rpc::{
+    PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig, PubSubReceiver, PubSubSender,
+};
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
@@ -74,17 +76,35 @@ impl Drop for RttLatencyTask {
 
 impl PersistClientCache {
     /// Returns a new [PersistClientCache].
-    pub fn new(
+    pub async fn new(
         cfg: PersistConfig,
         registry: &MetricsRegistry,
-        pubsub: Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>,
+        pubsub: Option<PersistPubSubClientConfig>,
     ) -> Self {
+        let metrics = Arc::new(Metrics::new(&cfg, registry));
+        let pubsub = if let Some(config) = pubsub {
+            let pubsub = mz_ore::retry::Retry::default()
+                // WIP: set a low max duration, or find some way to signal when the server is ready
+                // WIP: find a way to record retries, if we have to stick with this
+                .retry_async_canceling(|_| async {
+                    PersistPubSubClient::connect(&config, Arc::clone(&metrics)).await
+                })
+                .await;
+
+            if let Err(err) = &pubsub {
+                warn!("failed to connect to pubsub: {:?}", err);
+            }
+
+            pubsub.ok()
+        } else {
+            None
+        };
+
         let pubsub_sender = match &pubsub {
             None => None,
             Some((pubsub_sender, _)) => Some(Arc::clone(pubsub_sender)),
         };
 
-        let metrics = Arc::new(Metrics::new(&cfg, registry));
         let state_cache = StateCache::new(&cfg, Arc::clone(&metrics), pubsub);
         PersistClientCache {
             cfg,
@@ -99,12 +119,13 @@ impl PersistClientCache {
 
     /// A test helper that returns a [PersistClientCache] disconnected from
     /// metrics.
-    pub fn new_no_metrics() -> Self {
+    pub async fn new_no_metrics() -> Self {
         Self::new(
             PersistConfig::new_for_tests(),
             &MetricsRegistry::new(),
             None,
         )
+        .await
     }
 
     /// Returns the [PersistConfig] being used by this cache.
@@ -369,10 +390,7 @@ struct PubSubSubscriptionToken {
 impl Drop for PubSubSubscriptionToken {
     fn drop(&mut self) {
         if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-            pubsub_sender.unsubscribe(
-                &self.shard_id,
-                &self.metrics.pubsub_client.sender.unsubscribe,
-            );
+            pubsub_sender.unsubscribe(&self.shard_id);
         }
     }
 }
@@ -399,9 +417,11 @@ impl StateCache {
         let cache = Arc::clone(&state_cache);
         if let Some(mut pubsub_receiver) = pubsub_receiver {
             let _ = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
+                cache.metrics.pubsub_client.receiver.connected.set(1);
                 while let Some(res) = pubsub_receiver.next().await {
                     match res.message {
                         Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
+                            cache.metrics.pubsub_client.receiver.push_received.inc();
                             let shard_id = diff.shard_id.into_rust().expect("WIP");
                             let diff = VersionedData {
                                 seqno: diff.seqno.into_rust().expect("WIP"),
@@ -417,10 +437,19 @@ impl StateCache {
                         }
                         ref msg @ None | ref msg @ Some(_) => {
                             warn!("pubsub client received unexpected message: {:?}", msg);
+                            cache
+                                .metrics
+                                .pubsub_client
+                                .receiver
+                                .unknown_message_received
+                                .inc();
                         }
                     }
                 }
+                cache.metrics.pubsub_client.receiver.connected.set(0);
             });
+        } else {
+            state_cache.metrics.pubsub_client.receiver.connected.set(0);
         }
 
         state_cache
@@ -513,8 +542,7 @@ impl StateCache {
                         // We actually did the init work, don't bother casting back
                         // the type erased and weak version.
                         if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                            pubsub_sender
-                                .subscribe(&shard_id, &self.metrics.pubsub_client.sender.subscribe);
+                            pubsub_sender.subscribe(&shard_id);
                         }
                         return Ok(x);
                     }
@@ -696,7 +724,8 @@ mod tests {
             PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone()),
             &MetricsRegistry::new(),
             None,
-        );
+        )
+        .await;
         assert_eq!(cache.blob_by_uri.lock().await.len(), 0);
         assert_eq!(cache.consensus_by_uri.lock().await.len(), 0);
 

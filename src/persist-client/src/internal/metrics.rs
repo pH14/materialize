@@ -1560,9 +1560,10 @@ impl PubSubClientMetrics {
 
 #[derive(Debug)]
 pub struct PubSubClientReceiverMetrics {
+    pub(crate) connected: UIntGauge,
     pub(crate) push_received: IntCounter,
-    pub(crate) subscribe_received: IntCounter,
-    pub(crate) unsubscribe_received: IntCounter,
+    pub(crate) errors_received: IntCounter,
+    pub(crate) unknown_message_received: IntCounter,
 }
 
 impl PubSubClientReceiverMetrics {
@@ -1574,9 +1575,13 @@ impl PubSubClientReceiverMetrics {
         ));
 
         Self {
+            connected: registry.register(metric!(
+                    name: "mz_persist_pubsub_client_receiver_connected",
+                    help: "WIP",
+            )),
             push_received: call_received.with_label_values(&["push"]),
-            subscribe_received: call_received.with_label_values(&["push"]),
-            unsubscribe_received: call_received.with_label_values(&["subscribe"]),
+            errors_received: call_received.with_label_values(&["error"]),
+            unknown_message_received: call_received.with_label_values(&["unknown"]),
         }
     }
 }

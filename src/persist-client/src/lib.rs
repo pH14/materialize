@@ -748,10 +748,10 @@ mod tests {
         }
     }
 
-    pub fn new_test_client_cache() -> PersistClientCache {
+    pub async fn new_test_client_cache() -> PersistClientCache {
         // Configure an aggressively small blob_target_size so we get some
         // amount of coverage of that in tests. Similarly, for max_outstanding.
-        let mut cache = PersistClientCache::new_no_metrics();
+        let mut cache = PersistClientCache::new_no_metrics().await;
         cache.cfg.dynamic.set_blob_target_size(10);
         cache.cfg.dynamic.set_batch_builder_max_outstanding_parts(1);
 

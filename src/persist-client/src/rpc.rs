@@ -15,18 +15,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::Stream;
 use futures_util::StreamExt;
-use mz_ore::cast::CastFrom;
-use mz_ore::metrics::MetricsRegistry;
 use prost::Message;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
 use tonic::{Extensions, Request};
 use tracing::{debug, error, info, warn};
 
-use crate::internal::metrics::{PubSubClientCallMetrics, PubSubClientMetrics, PubSubServerMetrics};
+use mz_ore::cast::CastFrom;
+use mz_ore::metrics::MetricsRegistry;
 use mz_persist::location::VersionedData;
 use mz_proto::RustType;
 
+use crate::internal::metrics::{PubSubClientCallMetrics, PubSubServerMetrics};
 use crate::internal::service::proto_persist_pub_sub_client::ProtoPersistPubSubClient;
 use crate::internal::service::proto_persist_pub_sub_server::ProtoPersistPubSubServer;
 use crate::internal::service::{
@@ -41,23 +41,23 @@ use crate::ShardId;
 pub trait PersistPubSub {
     /// Receive handles with which to push and subscribe to diffs.
     async fn connect(
-        addr: String,
-        caller_id: String,
+        config: &PersistPubSubClientConfig,
+        metrics: Arc<Metrics>,
     ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error>;
 }
 
 /// The send-side client to Persist PubSub.
 pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     /// Push a diff to subscribers.
-    fn push(&self, shard_id: &ShardId, diff: &VersionedData, metrics: &PubSubClientCallMetrics);
+    fn push(&self, shard_id: &ShardId, diff: &VersionedData);
 
     /// Subscribe the corresponding [PubSubReceiver] to diffs for the given shard.
     /// This call is idempotent and is a no-op for already subscribed shards.
-    fn subscribe(&self, shard: &ShardId, metrics: &PubSubClientCallMetrics);
+    fn subscribe(&self, shard: &ShardId);
 
     /// Unsubscribe the corresponding [PubSubReceiver] to diffs for the given shard.
     /// This call is idempotent and is a no-op for already unsubscribed shards.
-    fn unsubscribe(&self, shard: &ShardId, metrics: &PubSubClientCallMetrics);
+    fn unsubscribe(&self, shard: &ShardId);
 }
 
 /// The receive-side client to Persist PubSub.
@@ -88,12 +88,13 @@ impl PersistPubSubServer {
 
 #[derive(Debug)]
 struct PubSubSenderClient {
+    metrics: Arc<Metrics>,
     requests: tokio::sync::mpsc::UnboundedSender<ProtoPubSubMessage>,
 }
 
 #[async_trait]
 impl PubSubSender for PubSubSenderClient {
-    fn push(&self, shard_id: &ShardId, diff: &VersionedData, metrics: &PubSubClientCallMetrics) {
+    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
         let seqno = diff.seqno.clone();
         let diff = ProtoPushDiff {
             shard_id: shard_id.into_proto(),
@@ -106,18 +107,23 @@ impl PubSubSender for PubSubSenderClient {
         let size = msg.encoded_len();
         match self.requests.send(msg) {
             Ok(_) => {
-                metrics.succeeded.inc();
-                metrics.bytes_sent.inc_by(u64::cast_from(size));
+                self.metrics.pubsub_client.sender.push.succeeded.inc();
+                self.metrics
+                    .pubsub_client
+                    .sender
+                    .push
+                    .bytes_sent
+                    .inc_by(u64::cast_from(size));
                 debug!("pushed ({}, {})", shard_id, seqno);
             }
             Err(err) => {
-                metrics.failed.inc();
+                self.metrics.pubsub_client.sender.push.failed.inc();
                 error!("{}", err);
             }
         }
     }
 
-    fn subscribe(&self, shard: &ShardId, metrics: &PubSubClientCallMetrics) {
+    fn subscribe(&self, shard: &ShardId) {
         let msg = ProtoPubSubMessage {
             message: Some(proto_pub_sub_message::Message::Subscribe(ProtoSubscribe {
                 shard: shard.to_string(),
@@ -126,18 +132,23 @@ impl PubSubSender for PubSubSenderClient {
         let size = msg.encoded_len();
         match self.requests.send(msg) {
             Ok(_) => {
-                metrics.succeeded.inc();
-                metrics.bytes_sent.inc_by(u64::cast_from(size));
+                self.metrics.pubsub_client.sender.subscribe.succeeded.inc();
+                self.metrics
+                    .pubsub_client
+                    .sender
+                    .subscribe
+                    .bytes_sent
+                    .inc_by(u64::cast_from(size));
                 debug!("subscribed to {}", shard);
             }
             Err(err) => {
-                metrics.failed.inc();
+                self.metrics.pubsub_client.sender.subscribe.failed.inc();
                 error!("error subscribing to {}: {}", shard, err);
             }
         }
     }
 
-    fn unsubscribe(&self, shard: &ShardId, metrics: &PubSubClientCallMetrics) {
+    fn unsubscribe(&self, shard: &ShardId) {
         let msg = ProtoPubSubMessage {
             message: Some(proto_pub_sub_message::Message::Unsubscribe(
                 ProtoUnsubscribe {
@@ -148,12 +159,22 @@ impl PubSubSender for PubSubSenderClient {
         let size = msg.encoded_len();
         match self.requests.send(msg) {
             Ok(_) => {
-                metrics.succeeded.inc();
-                metrics.bytes_sent.inc_by(u64::cast_from(size));
+                self.metrics
+                    .pubsub_client
+                    .sender
+                    .unsubscribe
+                    .succeeded
+                    .inc();
+                self.metrics
+                    .pubsub_client
+                    .sender
+                    .unsubscribe
+                    .bytes_sent
+                    .inc_by(u64::cast_from(size));
                 debug!("unsubscribed from {}", shard);
             }
             Err(err) => {
-                metrics.failed.inc();
+                self.metrics.pubsub_client.sender.unsubscribe.failed.inc();
                 error!("error unsubscribing from {}: {}", shard, err);
             }
         }
@@ -162,6 +183,12 @@ impl PubSubSender for PubSubSenderClient {
 
 pub const PERSIST_PUBSUB_CALLER_KEY: &str = "persist-pubsub-caller-id";
 
+#[derive(Debug)]
+pub struct PersistPubSubClientConfig {
+    pub addr: String,
+    pub caller_id: String,
+}
+
 /// A [PersistPubSub] implementation backed by gRPC.
 #[derive(Debug)]
 pub struct PersistPubSubClient;
@@ -169,18 +196,18 @@ pub struct PersistPubSubClient;
 #[async_trait]
 impl PersistPubSub for PersistPubSubClient {
     async fn connect(
-        addr: String,
-        caller_id: String,
+        config: &PersistPubSubClientConfig,
+        metrics: Arc<Metrics>,
     ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error> {
         // WIP: connect with retries and a timeout
-        let mut client = ProtoPersistPubSubClient::connect(addr.clone()).await?;
-        info!("Created pubsub client to: {:?}", addr);
+        let mut client = ProtoPersistPubSubClient::connect(config.addr.clone()).await?;
+        info!("Created pubsub client to: {:?}", config.addr);
         // WIP not unbounded.
         let (requests, responses) = tokio::sync::mpsc::unbounded_channel();
         let mut metadata = MetadataMap::new();
         metadata.insert(
             AsciiMetadataKey::from_static(PERSIST_PUBSUB_CALLER_KEY),
-            AsciiMetadataValue::try_from(caller_id)
+            AsciiMetadataValue::try_from(&config.caller_id)
                 .unwrap_or_else(|_| AsciiMetadataValue::from_static("unknown")),
         );
         let pubsub_request = Request::from_parts(
@@ -190,15 +217,20 @@ impl PersistPubSub for PersistPubSubClient {
         );
         let responses = client.pub_sub(pubsub_request).await?;
 
-        let sender = PubSubSenderClient { requests };
+        let sender = PubSubSenderClient {
+            metrics: Arc::clone(&metrics),
+            requests,
+        };
+        // let errors_received = metrics.pubsub_client.receiver.errors_received.clone();
         let receiver = responses
             .into_inner()
-            .filter_map(|res| async move {
+            .filter_map(|res| async {
                 match res {
                     Ok(message) => Some(message),
                     Err(err) => {
-                        // WIP: metric coverage here
                         warn!("pubsub client received err: {:?}", err);
+                        // WIP: figure out a move or borrow that works here
+                        // errors_received.inc();
                         None
                     }
                 }

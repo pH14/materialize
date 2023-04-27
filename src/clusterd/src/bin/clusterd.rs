@@ -81,7 +81,7 @@ use anyhow::Context;
 use axum::routing;
 use fail::FailScenario;
 use futures::future;
-use mz_persist_client::rpc::{PersistPubSub, PersistPubSubClient};
+use mz_persist_client::rpc::{PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig};
 use once_cell::sync::Lazy;
 use tracing::info;
 
@@ -271,13 +271,17 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
         .ok()
         .or_else(|| args.tracing.log_prefix.clone())
         .unwrap_or_default();
-    // WIP: try to connect, but pass in None if it fails
-    let pubsub = PersistPubSubClient::connect(args.persist_pubsub_addr, pubsub_caller_id).await?;
-    let persist_clients = Arc::new(PersistClientCache::new(
-        PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
-        &metrics_registry,
-        Some(pubsub),
-    ));
+    let persist_clients = Arc::new(
+        PersistClientCache::new(
+            PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
+            &metrics_registry,
+            Some(PersistPubSubClientConfig {
+                addr: args.persist_pubsub_addr,
+                caller_id: pubsub_caller_id,
+            }),
+        )
+        .await,
+    );
 
     // Start storage server.
     let (_storage_server, storage_client) = mz_storage::serve(
