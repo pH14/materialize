@@ -11,12 +11,15 @@
 
 use futures::StreamExt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::task::spawn;
 use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_client::cache::PersistClientCache;
+use mz_persist_client::cfg::PersistConfig;
+use mz_persist_client::metrics::Metrics;
 use mz_persist_client::rpc::{PersistPubSub, PersistPubSubClient, PersistPubSubServer};
 use mz_persist_client::ShardId;
 use tracing::{info, info_span, Span};
@@ -31,10 +34,14 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<(), anyhow::Error> {
     let span = Span::current();
+    let metrics = Arc::new(Metrics::new(
+        &PersistConfig::new_for_tests(),
+        &MetricsRegistry::new(),
+    ));
     let server = spawn(|| "persist service", async move {
         let _guard = span.enter();
         info!("listening on {}", args.listen_addr);
-        PersistPubSubServer::new()
+        PersistPubSubServer::new(&MetricsRegistry::new())
             .serve(args.listen_addr.clone())
             .await
     });
@@ -59,6 +66,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                     seqno: SeqNo(seqno),
                     data: data.into(),
                 },
+                &metrics.pubsub_client.sender.push,
             );
             tokio::time::sleep(Duration::from_secs(2)).await;
         }

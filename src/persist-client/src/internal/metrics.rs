@@ -1545,8 +1545,8 @@ impl PubSubServerMetrics {
 /// Metrics for the PubSubClient implementation.
 #[derive(Debug)]
 pub struct PubSubClientMetrics {
-    pub(crate) sender: PubSubClientSenderMetrics,
-    pub(crate) receiver: PubSubClientReceiverMetrics,
+    pub sender: PubSubClientSenderMetrics,
+    pub receiver: PubSubClientReceiverMetrics,
 }
 
 impl PubSubClientMetrics {
@@ -1584,9 +1584,9 @@ impl PubSubClientReceiverMetrics {
 #[derive(Debug)]
 pub struct PubSubClientSenderMetrics {
     // WIP: probably want pushed per shard, as well as byte size
-    pub(crate) push: PubSubClientCallMetrics,
-    pub(crate) subscribe: PubSubClientCallMetrics,
-    pub(crate) unsubscribe: PubSubClientCallMetrics,
+    pub push: PubSubClientCallMetrics,
+    pub subscribe: PubSubClientCallMetrics,
+    pub unsubscribe: PubSubClientCallMetrics,
 }
 
 #[derive(Debug)]
