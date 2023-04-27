@@ -901,20 +901,6 @@ where
             Err(seqno) => seqno,
         };
 
-        // Our state might just be out of date. Fetch the newest state
-        // immediately and try again.
-        //
-        // TODO: Once we have state pubsub, we probably want to remove this
-        // optimization and jump straight to watch+sleep.
-        self.machine
-            .applier
-            .fetch_and_update_state(Some(seqno))
-            .await;
-        seqno = match self.machine.next_listen_batch(frontier) {
-            Ok(b) => return b,
-            Err(seqno) => seqno,
-        };
-
         // The latest state still doesn't have a new frontier for us:
         // watch+sleep in a loop until it does.
         let sleeps = self.metrics.retries.next_listen_batch.stream(

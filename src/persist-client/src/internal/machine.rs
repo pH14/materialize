@@ -690,20 +690,6 @@ where
             }
         };
 
-        // Our state might just be out of date. Fetch the newest state
-        // immediately and try again.
-        //
-        // TODO: Once we have state pubsub, we probably want to remove this
-        // optimization and jump straight to watch+sleep.
-        self.applier.fetch_and_update_state(Some(seqno)).await;
-        let (mut seqno, mut upper) = match self.applier.snapshot(as_of) {
-            Ok(x) => return Ok(x),
-            Err(SnapshotErr::AsOfNotYetAvailable(seqno, Upper(upper))) => (seqno, upper),
-            Err(SnapshotErr::AsOfHistoricalDistinctionsLost(Since(since))) => {
-                return Err(Since(since))
-            }
-        };
-
         // The latest state still couldn't serve this as_of: watch+sleep in a
         // loop until it's ready.
         let mut watch = self.applier.watch();
