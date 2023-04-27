@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::{Arc, RwLock, TryLockError, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, instrument, warn};
 
 use mz_ore::metrics::MetricsRegistry;
+use mz_ore::now::SYSTEM_TIME;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::{
     Blob, Consensus, ExternalError, VersionedData, BLOB_GET_LIVENESS_KEY,
@@ -419,6 +420,9 @@ impl StateCache {
             let _ = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
                 cache.metrics.pubsub_client.receiver.connected.set(1);
                 while let Some(res) = pubsub_receiver.next().await {
+                    let timestamp = u128::from_le_bytes(
+                        <[u8; 16]>::try_from(res.timestamp.as_slice()).expect("WIP"),
+                    );
                     match res.message {
                         Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
                             cache.metrics.pubsub_client.receiver.push_received.inc();
@@ -434,6 +438,17 @@ impl StateCache {
                                 diff.data.len()
                             );
                             cache.apply_diff(&shard_id, diff);
+                            let now = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .expect("failed to get millis since epoch")
+                                .as_micros();
+                            let latency = now.saturating_sub(timestamp) as f64;
+                            cache
+                                .metrics
+                                .pubsub_client
+                                .receiver
+                                .approx_diff_latency
+                                .observe(latency);
                         }
                         ref msg @ None | ref msg @ Some(_) => {
                             warn!("pubsub client received unexpected message: {:?}", msg);

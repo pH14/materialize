@@ -14,11 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use futures::Stream;
 use mz_ore::cast::CastFrom;
+use mz_ore::now::SYSTEM_TIME;
 use prost::Message;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -29,7 +30,7 @@ use tracing::{debug, info, info_span, warn};
 
 use crate::internal::metrics::PubSubServerMetrics;
 use mz_persist::location::VersionedData;
-use mz_proto::ProtoType;
+use mz_proto::{ProtoType, RustType};
 
 use crate::rpc::PERSIST_PUBSUB_CALLER_KEY;
 
@@ -138,6 +139,12 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                                             diff.data.len()
                                         );
                                         let req = ProtoPubSubMessage {
+                                            timestamp: SystemTime::now()
+                                                .duration_since(SystemTime::UNIX_EPOCH)
+                                                .expect("failed to get millis since epoch")
+                                                .as_micros()
+                                                .to_le_bytes()
+                                                .to_vec(),
                                             message: Some(
                                                 proto_pub_sub_message::Message::PushDiff(
                                                     req.clone(),

@@ -11,6 +11,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -23,6 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use mz_ore::cast::CastFrom;
 use mz_ore::metrics::MetricsRegistry;
+use mz_ore::now::SYSTEM_TIME;
 use mz_persist::location::VersionedData;
 use mz_proto::RustType;
 
@@ -101,7 +103,12 @@ impl PubSubSender for PubSubSenderClient {
             seqno: diff.seqno.into_proto(),
             diff: diff.data.clone(),
         };
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("failed to get millis since epoch")
+            .as_micros();
         let msg = ProtoPubSubMessage {
+            timestamp: now.to_le_bytes().to_vec(),
             message: Some(proto_pub_sub_message::Message::PushDiff(diff)),
         };
         let size = msg.encoded_len();
@@ -124,7 +131,12 @@ impl PubSubSender for PubSubSenderClient {
     }
 
     fn subscribe(&self, shard: &ShardId) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("failed to get millis since epoch")
+            .as_micros();
         let msg = ProtoPubSubMessage {
+            timestamp: now.to_le_bytes().to_vec(),
             message: Some(proto_pub_sub_message::Message::Subscribe(ProtoSubscribe {
                 shard: shard.to_string(),
             })),
@@ -149,7 +161,12 @@ impl PubSubSender for PubSubSenderClient {
     }
 
     fn unsubscribe(&self, shard: &ShardId) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("failed to get millis since epoch")
+            .as_micros();
         let msg = ProtoPubSubMessage {
+            timestamp: now.to_le_bytes().to_vec(),
             message: Some(proto_pub_sub_message::Message::Unsubscribe(
                 ProtoUnsubscribe {
                     shard: shard.to_string(),

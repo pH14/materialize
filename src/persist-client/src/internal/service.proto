@@ -26,11 +26,13 @@ message ProtoUnsubscribe {
 }
 
 message ProtoPubSubMessage {
+    bytes timestamp = 1;
     oneof message {
-        ProtoPushDiff push_diff = 1;
-        ProtoSubscribe subscribe = 2;
-        ProtoUnsubscribe unsubscribe = 3;
+        ProtoPushDiff push_diff = 2;
+        ProtoSubscribe subscribe = 3;
+        ProtoUnsubscribe unsubscribe = 4;
     }
+
 }
 
 service ProtoPersistPubSub {

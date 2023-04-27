@@ -1564,6 +1564,7 @@ pub struct PubSubClientReceiverMetrics {
     pub(crate) push_received: IntCounter,
     pub(crate) errors_received: IntCounter,
     pub(crate) unknown_message_received: IntCounter,
+    pub(crate) approx_diff_latency: Histogram,
 }
 
 impl PubSubClientReceiverMetrics {
@@ -1582,6 +1583,11 @@ impl PubSubClientReceiverMetrics {
             push_received: call_received.with_label_values(&["push"]),
             errors_received: call_received.with_label_values(&["error"]),
             unknown_message_received: call_received.with_label_values(&["unknown"]),
+            approx_diff_latency: registry.register(metric!(
+                name: "mz_persist_pubsub_client_approx_diff_apply_latency",
+                help: "histogram of (approximate) latency between sending a diff and applying it",
+                buckets: prometheus::exponential_buckets(128.0, 2.0, 14).expect("WIP"),
+            )),
         }
     }
 }
