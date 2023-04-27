@@ -682,9 +682,9 @@ where
         as_of: &Antichain<T>,
     ) -> Result<Vec<HollowBatch<T>>, Since<T>> {
         let start = Instant::now();
-        let seqno = match self.applier.snapshot(as_of) {
+        let (mut seqno, mut upper) = match self.applier.snapshot(as_of) {
             Ok(x) => return Ok(x),
-            Err(SnapshotErr::AsOfNotYetAvailable(seqno, _upper)) => seqno,
+            Err(SnapshotErr::AsOfNotYetAvailable(seqno, Upper(upper))) => (seqno, upper),
             Err(SnapshotErr::AsOfHistoricalDistinctionsLost(Since(since))) => {
                 return Err(Since(since))
             }
