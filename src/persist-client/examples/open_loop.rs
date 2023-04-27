@@ -134,6 +134,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
         &metrics_registry,
         None,
     )
+    .await
     .open(location)
     .await?;
 

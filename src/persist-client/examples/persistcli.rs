@@ -111,7 +111,7 @@ enum Command {
     OpenLoop(crate::open_loop::Args),
     Inspect(mz_persist_client::cli::inspect::InspectArgs),
     Admin(mz_persist_client::cli::admin::AdminArgs),
-    Service(crate::service::Args),
+    // Service(crate::service::Args),
 }
 
 fn main() {
@@ -161,8 +161,7 @@ fn main() {
         }
         Command::Admin(command) => {
             runtime.block_on(mz_persist_client::cli::admin::run(command).instrument(root_span))
-        }
-        Command::Service(args) => runtime.block_on(crate::service::run(args).instrument(root_span)),
+        } // Command::Service(args) => runtime.block_on(crate::service::run(args).instrument(root_span)),
     };
 
     if let Err(err) = res {
