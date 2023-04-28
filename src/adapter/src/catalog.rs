@@ -6748,6 +6748,7 @@ impl Catalog {
             }),
             stats_collection_enabled: Some(config.persist_stats_collection_enabled()),
             stats_filter_enabled: Some(config.persist_stats_filter_enabled()),
+            pubsub_push_enabled: Some(config.persist_pubsub_push_enabled()),
         }
     }
 

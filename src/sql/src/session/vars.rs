@@ -636,6 +636,15 @@ const PERSIST_STATS_FILTER_ENABLED: ServerVar<bool> = ServerVar {
     safe: true,
 };
 
+/// WIP
+const PERSIST_PUBSUB_PUSH_ENABLED: ServerVar<bool> = ServerVar {
+    name: UncasedStr::new("persist_pubsub_push_enabled"),
+    value: &PersistConfig::DEFAULT_PUBSUB_PUSH_ENABLED,
+    description: "Whether to push state diffs to Persist PubSub.",
+    internal: true,
+    safe: true,
+};
+
 /// Boolean flag indicating that the remote configuration was synchronized at
 /// least once with the persistent [SessionVars].
 pub static CONFIG_HAS_SYNCED_ONCE: ServerVar<bool> = ServerVar {
@@ -1484,6 +1493,7 @@ impl Default for SystemVars {
             .with_var(&PERSIST_NEXT_LISTEN_BATCH_RETRYER_CLAMP)
             .with_var(&PERSIST_STATS_COLLECTION_ENABLED)
             .with_var(&PERSIST_STATS_FILTER_ENABLED)
+            .with_var(&PERSIST_PUBSUB_PUSH_ENABLED)
             .with_var(&METRICS_RETENTION)
             .with_var(&MOCK_AUDIT_EVENT_TIMESTAMP)
             .with_var(&ENABLE_WITH_MUTUALLY_RECURSIVE)
@@ -1794,6 +1804,11 @@ impl SystemVars {
     /// Returns the `persist_stats_filter_enabled` configuration parameter.
     pub fn persist_stats_filter_enabled(&self) -> bool {
         *self.expect_value(&PERSIST_STATS_FILTER_ENABLED)
+    }
+
+    /// WIP
+    pub fn persist_pubsub_push_enabled(&self) -> bool {
+        *self.expect_value(&PERSIST_PUBSUB_PUSH_ENABLED)
     }
 
     /// Returns the `metrics_retention` configuration parameter.
@@ -2843,4 +2858,5 @@ fn is_persist_config_var(name: &str) -> bool {
         || name == PERSIST_NEXT_LISTEN_BATCH_RETRYER_CLAMP.name()
         || name == PERSIST_STATS_COLLECTION_ENABLED.name()
         || name == PERSIST_STATS_FILTER_ENABLED.name()
+        || name == PERSIST_PUBSUB_PUSH_ENABLED.name()
 }
