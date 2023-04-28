@@ -169,11 +169,13 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                         let now = Instant::now();
                         metrics.subscribe_call_count.inc();
                         debug!("conn {} adding subscription to {}", caller_id, diff.shard);
-                        let mut subscribed_shards = subscribers.write().expect("lock poisoned");
-                        subscribed_shards
-                            .entry(diff.shard.clone())
-                            .or_default()
-                            .insert(connection_id, tx.clone());
+                        {
+                            let mut subscribed_shards = subscribers.write().expect("lock poisoned");
+                            subscribed_shards
+                                .entry(diff.shard.clone())
+                                .or_default()
+                                .insert(connection_id, tx.clone());
+                        }
                         current_subscriptions.insert(diff.shard);
                         metrics
                             .subscribe_seconds
@@ -186,10 +188,13 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                             "conn {} removing subscription from {}",
                             caller_id, diff.shard
                         );
-                        let mut subscribed_shards = subscribers.write().expect("lock poisoned");
-                        if let Some(subscribed_connections) = subscribed_shards.get_mut(&diff.shard)
                         {
-                            subscribed_connections.remove(&connection_id);
+                            let mut subscribed_shards = subscribers.write().expect("lock poisoned");
+                            if let Some(subscribed_connections) =
+                                subscribed_shards.get_mut(&diff.shard)
+                            {
+                                subscribed_connections.remove(&connection_id);
+                            }
                         }
                         current_subscriptions.remove(&diff.shard);
                         metrics

@@ -1586,7 +1586,7 @@ impl PubSubClientReceiverMetrics {
             approx_diff_latency: registry.register(metric!(
                 name: "mz_persist_pubsub_client_approx_diff_apply_latency",
                 help: "histogram of (approximate) latency between sending a diff and applying it",
-                buckets: prometheus::exponential_buckets(128.0, 2.0, 14).expect("WIP"),
+                buckets: prometheus::exponential_buckets(128.0, 2.0, 16).expect("WIP"),
             )),
         }
     }

@@ -38,6 +38,8 @@ use crate::internal::service::{
 use crate::metrics::Metrics;
 use crate::ShardId;
 
+// WIP: make versions that wrap connection details so we can call into them, but connect later non-blocking like
+
 /// WIP
 #[async_trait]
 pub trait PersistPubSub {
