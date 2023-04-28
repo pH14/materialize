@@ -278,7 +278,9 @@ where
                     self.shard_metrics.cmd_succeeded.inc();
                     self.update_state(new_state);
                     if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                        pubsub_sender.push(&self.shard_id, &diff);
+                        if self.cfg.dynamic.pubsub_push_enabled() {
+                            pubsub_sender.push(&self.shard_id, &diff);
+                        }
                     }
                     return Ok((seqno, Ok(res), maintenance));
                 }
