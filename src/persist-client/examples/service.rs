@@ -1,78 +1,110 @@
-// // Copyright Materialize, Inc. and contributors. All rights reserved.
-// //
-// // Use of this software is governed by the Business Source License
-// // included in the LICENSE file.
-// //
-// // As of the Change Date specified in that file, in accordance with
-// // the Business Source License, use of this software will be governed
-// // by the Apache License, Version 2.0.
+// Copyright Materialize, Inc. and contributors. All rights reserved.
 //
-// #![allow(missing_docs)]
+// Use of this software is governed by the Business Source License
+// included in the LICENSE file.
 //
-// use futures::StreamExt;
-// use std::net::SocketAddr;
-// use std::sync::Arc;
-// use std::time::Duration;
-//
-// use mz_ore::metrics::MetricsRegistry;
-// use mz_ore::task::spawn;
-// use mz_persist::location::{SeqNo, VersionedData};
-// use mz_persist_client::cfg::PersistConfig;
-// use mz_persist_client::metrics::Metrics;
-// use mz_persist_client::rpc::{PersistPubSub, PersistPubSubClient, PersistPubSubServer};
-// use mz_persist_client::ShardId;
-// use tracing::{info, info_span, Span};
-//
-// #[derive(Debug, clap::Parser)]
-// pub struct Args {
-//     #[clap(long, value_name = "HOST:PORT", default_value = "127.0.0.1:6878")]
-//     listen_addr: SocketAddr,
-//
-//     connect_addrs: Vec<String>,
-// }
-//
-// pub async fn run(args: Args) -> Result<(), anyhow::Error> {
-//     let span = Span::current();
-//     let metrics = Arc::new(Metrics::new(
-//         &PersistConfig::new_for_tests(),
-//         &MetricsRegistry::new(),
-//     ));
-//     let server = spawn(|| "persist service", async move {
-//         let _guard = span.enter();
-//         info!("listening on {}", args.listen_addr);
-//         PersistPubSubServer::new(&MetricsRegistry::new())
-//             .serve(args.listen_addr.clone())
-//             .await
-//     });
-//     tokio::time::sleep(Duration::from_secs(2)).await;
-//     for addr in args.connect_addrs {
-//         info!("connecting to {}", addr);
-//         let (sender, mut receiver) =
-//             PersistPubSubClient::connect(addr.clone().to_string(), String::default()).await?;
-//         spawn(|| "persist client", async move {
-//             let root_span = info_span!("persist::push::client");
-//             let _guard = root_span.enter();
-//             while let Some(message) = receiver.next().await {
-//                 info!("client res: {:?}", message);
-//             }
-//         });
-//         info!("connected to {}", addr);
-//         for seqno in 0u64..7 {
-//             let data = format!("diff{}", seqno).into_bytes();
-//             sender.push(
-//                 &ShardId::new(),
-//                 &VersionedData {
-//                     seqno: SeqNo(seqno),
-//                     data: data.into(),
-//                 },
-//                 &metrics.pubsub_client.sender.push,
-//             );
-//             tokio::time::sleep(Duration::from_secs(2)).await;
-//         }
-//         info!("pushed to {}", addr);
-//     }
-//     info!("waiting for server to exit");
-//     let res = server.await;
-//     info!("server existed {:?}", res);
-//     Ok(())
-// }
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0.
+
+#![allow(missing_docs)]
+
+use std::net::SocketAddr;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::StreamExt;
+use tracing::{info, Span};
+
+use mz_ore::metrics::MetricsRegistry;
+use mz_persist::location::{SeqNo, VersionedData};
+use mz_persist_client::cfg::PersistConfig;
+use mz_persist_client::metrics::Metrics;
+use mz_persist_client::rpc::{
+    PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig, PersistPubSubServer,
+};
+use mz_persist_client::ShardId;
+
+#[derive(clap::ArgEnum, Copy, Clone, Debug)]
+pub enum Role {
+    Server,
+    Writer,
+    Reader,
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct Args {
+    #[clap(long, value_name = "HOST:PORT", default_value = "127.0.0.1:6878")]
+    listen_addr: SocketAddr,
+
+    #[clap(long, arg_enum)]
+    role: Role,
+
+    connect_addrs: Vec<String>,
+}
+
+pub async fn run(args: Args) -> Result<(), anyhow::Error> {
+    let span = Span::current();
+    let shard_id = ShardId::from_str("s00000000-0000-0000-0000-000000000000").expect("shard id");
+    match args.role {
+        Role::Server => {
+            let _guard = span.enter();
+            info!("listening on {}", args.listen_addr);
+            PersistPubSubServer::new(&MetricsRegistry::new())
+                .serve(args.listen_addr.clone())
+                .await;
+            info!("server ded");
+        }
+        Role::Writer => {
+            let (sender, _receiver) = PersistPubSubClient::connect(
+                &PersistPubSubClientConfig {
+                    addr: format!("http://{}", args.listen_addr),
+                    caller_id: "writer".to_string(),
+                },
+                Arc::new(Metrics::new(
+                    &PersistConfig::new_for_tests(),
+                    &MetricsRegistry::new(),
+                )),
+            )
+            .await
+            .expect("connected");
+
+            let mut i = 0;
+            loop {
+                info!("writing");
+                sender.push(
+                    &shard_id,
+                    &VersionedData {
+                        seqno: SeqNo(i),
+                        data: Bytes::default(),
+                    },
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                i += 1;
+            }
+        }
+        Role::Reader => {
+            let (sender, mut receiver) = PersistPubSubClient::connect(
+                &PersistPubSubClientConfig {
+                    addr: format!("http://{}", args.listen_addr),
+                    caller_id: "hello".to_string(),
+                },
+                Arc::new(Metrics::new(
+                    &PersistConfig::new_for_tests(),
+                    &MetricsRegistry::new(),
+                )),
+            )
+            .await
+            .expect("server is reachable");
+
+            sender.subscribe(&shard_id);
+            while let Some(message) = receiver.next().await {
+                info!("client res: {:?}", message);
+            }
+            info!("stream to client ded");
+        }
+    }
+    Ok(())
+}
