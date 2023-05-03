@@ -9,16 +9,21 @@
 
 #![allow(missing_docs, dead_code)] // WIP
 
+use std::collections::BTreeSet;
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures::Stream;
 use futures_util::StreamExt;
 use prost::Message;
+use tokio::sync::mpsc::error::SendError;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
+use tonic::transport::{Channel, Endpoint, Error};
 use tonic::{Extensions, Request};
 use tracing::{debug, error, info, warn};
 
@@ -93,6 +98,47 @@ impl PersistPubSubServer {
 struct PubSubSenderClient {
     metrics: Arc<Metrics>,
     requests: tokio::sync::broadcast::Sender<ProtoPubSubMessage>,
+    subscribes: Arc<Mutex<BTreeSet<ShardId>>>,
+}
+
+impl PubSubSenderClient {
+    fn reconnect(&self) {
+        let subscribes = self.subscribes.lock().expect("lock");
+        for shard_id in subscribes.iter() {
+            info!("reconnecting to: {}", shard_id);
+            self.subscribe_inner(shard_id);
+        }
+    }
+
+    fn subscribe_inner(&self, shard: &ShardId) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("failed to get millis since epoch")
+            .as_micros();
+        let msg = ProtoPubSubMessage {
+            timestamp: now.to_le_bytes().to_vec(),
+            message: Some(proto_pub_sub_message::Message::Subscribe(ProtoSubscribe {
+                shard: shard.to_string(),
+            })),
+        };
+        let size = msg.encoded_len();
+        match self.requests.send(msg) {
+            Ok(_) => {
+                self.metrics.pubsub_client.sender.subscribe.succeeded.inc();
+                self.metrics
+                    .pubsub_client
+                    .sender
+                    .subscribe
+                    .bytes_sent
+                    .inc_by(u64::cast_from(size));
+                info!("subscribed to {}", shard);
+            }
+            Err(err) => {
+                self.metrics.pubsub_client.sender.subscribe.failed.inc();
+                error!("error subscribing to {}: {}", shard, err);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -114,7 +160,7 @@ impl PubSubSender for PubSubSenderClient {
         };
         let size = msg.encoded_len();
         match self.requests.send(msg) {
-            Ok(_) => {
+            Ok(i) => {
                 self.metrics.pubsub_client.sender.push.succeeded.inc();
                 self.metrics
                     .pubsub_client
@@ -122,6 +168,7 @@ impl PubSubSender for PubSubSenderClient {
                     .push
                     .bytes_sent
                     .inc_by(u64::cast_from(size));
+                info!("pushed to {} listeners", i);
                 debug!("pushed ({}, {})", shard_id, seqno);
             }
             Err(err) => {
@@ -132,36 +179,13 @@ impl PubSubSender for PubSubSenderClient {
     }
 
     fn subscribe(&self, shard: &ShardId) {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("failed to get millis since epoch")
-            .as_micros();
-        let msg = ProtoPubSubMessage {
-            timestamp: now.to_le_bytes().to_vec(),
-            message: Some(proto_pub_sub_message::Message::Subscribe(ProtoSubscribe {
-                shard: shard.to_string(),
-            })),
-        };
-        let size = msg.encoded_len();
-        match self.requests.send(msg) {
-            Ok(_) => {
-                self.metrics.pubsub_client.sender.subscribe.succeeded.inc();
-                self.metrics
-                    .pubsub_client
-                    .sender
-                    .subscribe
-                    .bytes_sent
-                    .inc_by(u64::cast_from(size));
-                debug!("subscribed to {}", shard);
-            }
-            Err(err) => {
-                self.metrics.pubsub_client.sender.subscribe.failed.inc();
-                error!("error subscribing to {}: {}", shard, err);
-            }
-        }
+        self.subscribes.lock().expect("lock").insert(*shard);
+        self.subscribe_inner(shard);
     }
 
     fn unsubscribe(&self, shard: &ShardId) {
+        self.subscribes.lock().expect("lock").remove(shard);
+
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("failed to get millis since epoch")
@@ -249,13 +273,17 @@ impl PersistPubSub for PersistPubSubClient {
     ) -> Result<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>), anyhow::Error> {
         // we use a broadcast so the Sender does not need to be replaced // if the underlying connection is swapped out
         let (rpc_requests, rpc_responses) = tokio::sync::broadcast::channel(100);
+        drop(rpc_responses);
 
-        let sender = PubSubSenderClient {
+        let sender = Arc::new(PubSubSenderClient {
             metrics: Arc::clone(&metrics),
             requests: rpc_requests.clone(),
-        };
+            subscribes: Default::default(),
+        });
 
         let (receiver_input, receiver_output) = tokio::sync::mpsc::channel(100);
+        let requestz = rpc_requests.clone();
+        let senderz = Arc::clone(&sender);
         mz_ore::task::spawn(|| format!("persist_pubsub_client_connection"), async move {
             let mut metadata = MetadataMap::new();
             metadata.insert(
@@ -265,35 +293,71 @@ impl PersistPubSub for PersistPubSubClient {
             );
 
             loop {
+                let mut broadcast = BroadcastStream::new(requestz.subscribe());
                 let pubsub_request = Request::from_parts(
                     metadata.clone(),
                     Extensions::default(),
-                    BroadcastStream::new(rpc_responses.resubscribe()).filter_map(|x| async {
-                        match x {
-                            Ok(x) => Some(x),
-                            // WIP: metrics for broadcast recv errors
-                            Err(x) => None,
+                    async_stream::stream! {
+                        while let Some(x) = broadcast.next().await {
+                            match x {
+                                Ok(x) => yield x,
+                                // WIP: metrics for broadcast recv errors
+                                Err(x) => {}
+                            }
                         }
-                    }),
+                    }, // BroadcastStream::new(rpc_responses.resubscribe()).filter_map(|x| async {
+                       //     match x {
+                       //         Ok(x) => Some(x),
+                       //         // WIP: metrics for broadcast recv errors
+                       //         Err(x) => None,
+                       //     }
+                       // }),
                 );
 
                 // WIP: count connections made
                 // WIP: connect with retries and a timeout
-                let mut client = ProtoPersistPubSubClient::connect(config.addr.clone())
-                    .await
-                    .expect("WIP");
+                let client = mz_ore::retry::Retry::default()
+                    .clamp_backoff(Duration::from_secs(60))
+                    .retry_async(|_| async {
+                        info!("connecting to pubsub");
+                        let endpoint = Endpoint::from_str(&config.addr)
+                            .expect("valid pubsub addr")
+                            .timeout(Duration::from_secs(5));
+                        ProtoPersistPubSubClient::connect(endpoint).await
+                    })
+                    .await;
+
+                let mut client = match client {
+                    Ok(client) => client,
+                    Err(err) => {
+                        warn!("error connecting to persist pubsub: {:?}", err);
+                        continue;
+                    }
+                };
+
                 info!("Created pubsub client to: {:?}", config.addr);
                 let mut responses = client
                     .pub_sub(pubsub_request)
                     .await
                     .expect("WIP")
                     .into_inner();
+
+                senderz.reconnect();
+                info!("reconnected");
+
                 loop {
+                    info!("awaiting responses");
                     match responses.next().await {
                         None => break,
                         Some(Ok(x)) => {
                             // WIP
-                            let _ = receiver_input.send(x);
+                            info!("got response: {:?}", x);
+                            match receiver_input.send(x).await {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    warn!("pubsub client receiver input failure: {:?}", err);
+                                }
+                            }
                         }
                         Some(Err(err)) => {
                             // WIP count errors
@@ -302,12 +366,11 @@ impl PersistPubSub for PersistPubSubClient {
                         }
                     }
                 }
+
+                info!("need to reconnect");
             }
         });
 
-        Ok((
-            Arc::new(sender),
-            Box::new(ReceiverStream::new(receiver_output)),
-        ))
+        Ok((sender, Box::new(ReceiverStream::new(receiver_output))))
     }
 }

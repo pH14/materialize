@@ -89,7 +89,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             let (sender, mut receiver) = PersistPubSubClient::connect(
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
-                    caller_id: "hello".to_string(),
+                    caller_id: "reader".to_string(),
                 },
                 Arc::new(Metrics::new(
                     &PersistConfig::new_for_tests(),

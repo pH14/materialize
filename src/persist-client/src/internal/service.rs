@@ -12,18 +12,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use futures::Stream;
 use prost::Message;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::{Request, Response, Status, Streaming};
+use tokio_stream::StreamExt;
 use tonic::metadata::AsciiMetadataKey;
+use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, info_span, warn};
 
 use mz_ore::cast::CastFrom;
@@ -168,7 +168,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                     Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
                         let now = Instant::now();
                         metrics.subscribe_call_count.inc();
-                        debug!("conn {} adding subscription to {}", caller_id, diff.shard);
+                        info!("conn {} adding subscription to {}", caller_id, diff.shard);
                         {
                             let mut subscribed_shards = subscribers.write().expect("lock poisoned");
                             subscribed_shards
@@ -184,7 +184,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                     Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
                         let now = Instant::now();
                         metrics.unsubscribe_call_count.inc();
-                        debug!(
+                        info!(
                             "conn {} removing subscription from {}",
                             caller_id, diff.shard
                         );
