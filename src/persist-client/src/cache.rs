@@ -84,18 +84,10 @@ impl PersistClientCache {
     ) -> Self {
         let metrics = Arc::new(Metrics::new(&cfg, registry));
         let pubsub = if let Some(config) = pubsub {
-            let pubsub = mz_ore::retry::Retry::default()
-                // WIP: set a low max duration, or find some way to signal when the server is ready
-                // WIP: find a way to record retries, if we have to stick with this
-                .retry_async_canceling(|_| async {
-                    PersistPubSubClient::connect(&config, Arc::clone(&metrics)).await
-                })
-                .await;
-
+            let pubsub = PersistPubSubClient::connect(config, Arc::clone(&metrics)).await;
             if let Err(err) = &pubsub {
                 warn!("failed to connect to pubsub: {:?}", err);
             }
-
             pubsub.ok()
         } else {
             None
@@ -382,7 +374,7 @@ enum StateCacheInit {
     NeedInit(Arc<OnceCell<Weak<dyn DynState>>>),
 }
 
-struct PubSubSubscriptionToken {
+pub(crate) struct PubSubSubscriptionToken {
     shard_id: ShardId,
     metrics: Arc<Metrics>,
     pubsub_sender: Option<Arc<dyn PubSubSender>>,
@@ -539,6 +531,9 @@ impl StateCache {
                                 metrics: Arc::clone(&self.metrics),
                                 pubsub_sender: self.pubsub_sender.clone(),
                             };
+                            if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
+                                pubsub_sender.subscribe(&shard_id);
+                            }
                             let state = Arc::new(LockingTypedState {
                                 shard_id,
                                 notifier: StateWatchNotifier::new(Arc::clone(&self.metrics)),
@@ -556,9 +551,6 @@ impl StateCache {
                     if let Some(x) = did_init {
                         // We actually did the init work, don't bother casting back
                         // the type erased and weak version.
-                        if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                            pubsub_sender.subscribe(&shard_id);
-                        }
                         return Ok(x);
                     }
                     let Some(state) = state.upgrade() else {

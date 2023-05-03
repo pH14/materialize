@@ -59,7 +59,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
         }
         Role::Writer => {
             let (sender, _receiver) = PersistPubSubClient::connect(
-                &PersistPubSubClientConfig {
+                PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "writer".to_string(),
                 },
@@ -87,7 +87,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
         }
         Role::Reader => {
             let (sender, mut receiver) = PersistPubSubClient::connect(
-                &PersistPubSubClientConfig {
+                PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "hello".to_string(),
                 },
