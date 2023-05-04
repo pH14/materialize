@@ -68,8 +68,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                     &MetricsRegistry::new(),
                 )),
             )
-            .await
-            .expect("connected");
+            .await;
 
             let mut i = 0;
             loop {
@@ -96,8 +95,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                     &MetricsRegistry::new(),
                 )),
             )
-            .await
-            .expect("server is reachable");
+            .await;
 
             sender.subscribe(&shard_id);
             while let Some(message) = receiver.next().await {

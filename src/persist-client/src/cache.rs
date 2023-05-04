@@ -84,11 +84,7 @@ impl PersistClientCache {
     ) -> Self {
         let metrics = Arc::new(Metrics::new(&cfg, registry));
         let pubsub = if let Some(config) = pubsub {
-            let pubsub = PersistPubSubClient::connect(config, Arc::clone(&metrics)).await;
-            if let Err(err) = &pubsub {
-                warn!("failed to connect to pubsub: {:?}", err);
-            }
-            pubsub.ok()
+            Some(PersistPubSubClient::connect(config, Arc::clone(&metrics)).await)
         } else {
             None
         };
