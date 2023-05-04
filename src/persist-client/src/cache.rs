@@ -29,13 +29,12 @@ use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::SYSTEM_TIME;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::{
-    Blob, BLOB_GET_LIVENESS_KEY, Consensus, CONSENSUS_HEAD_LIVENESS_KEY, ExternalError,
-    VersionedData,
+    Blob, Consensus, ExternalError, VersionedData, BLOB_GET_LIVENESS_KEY,
+    CONSENSUS_HEAD_LIVENESS_KEY,
 };
 use mz_persist_types::{Codec, Codec64};
 use mz_proto::ProtoType;
 
-use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
 use crate::internal::machine::retry_external;
@@ -46,6 +45,7 @@ use crate::rpc::{
     PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig, PubSubReceiver, PubSubSender,
     PubSubToken,
 };
+use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
 ///
@@ -84,15 +84,12 @@ impl PersistClientCache {
         pubsub: Option<PersistPubSubClientConfig>,
     ) -> Self {
         let metrics = Arc::new(Metrics::new(&cfg, registry));
-        let pubsub = if let Some(config) = pubsub {
-            Some(PersistPubSubClient::connect(config, Arc::clone(&metrics)).await)
+        let (pubsub_sender, pubsub_receiver) = if let Some(config) = pubsub {
+            let (pubsub_sender, pubsub_receiver) =
+                PersistPubSubClient::connect(config, Arc::clone(&metrics)).await;
+            (Some(pubsub_sender), Some(pubsub_receiver))
         } else {
-            None
-        };
-
-        let (pubsub_sender, pubsub_receiver) = match pubsub {
-            None => (None, None),
-            Some((pubsub_sender, pubsub_receiver)) => (Some(pubsub_sender), Some(pubsub_receiver)),
+            (None, None)
         };
 
         let state_cache = StateCache::new(&cfg, Arc::clone(&metrics), pubsub_sender.clone());
