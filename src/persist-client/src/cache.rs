@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::{Arc, RwLock, TryLockError, Weak};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
@@ -23,29 +23,29 @@ use futures::StreamExt;
 use timely::progress::Timestamp;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument};
 
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::SYSTEM_TIME;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::{
-    Blob, Consensus, ExternalError, VersionedData, BLOB_GET_LIVENESS_KEY,
-    CONSENSUS_HEAD_LIVENESS_KEY,
+    Blob, BLOB_GET_LIVENESS_KEY, Consensus, CONSENSUS_HEAD_LIVENESS_KEY, ExternalError,
+    VersionedData,
 };
 use mz_persist_types::{Codec, Codec64};
 use mz_proto::ProtoType;
 
+use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus, ShardMetrics};
-use crate::internal::service::proto_pub_sub_message;
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
 use crate::rpc::{
     PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig, PubSubReceiver, PubSubSender,
+    PubSubToken,
 };
-use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
 ///
@@ -381,20 +381,6 @@ enum StateCacheInit {
     NeedInit(Arc<OnceCell<Weak<dyn DynState>>>),
 }
 
-pub(crate) struct PubSubSubscriptionToken {
-    shard_id: ShardId,
-    metrics: Arc<Metrics>,
-    pubsub_sender: Option<Arc<dyn PubSubSender>>,
-}
-
-impl Drop for PubSubSubscriptionToken {
-    fn drop(&mut self) {
-        if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-            pubsub_sender.unsubscribe(&self.shard_id);
-        }
-    }
-}
-
 impl StateCache {
     /// Returns a new StateCache.
     pub fn new(
@@ -468,14 +454,11 @@ impl StateCache {
                     let state = init_once
                         .get_or_try_init::<Box<CodecMismatch>, _, _>(|| async {
                             let init_res = init_fn().await;
-                            let token = PubSubSubscriptionToken {
-                                shard_id: shard_id.clone(),
-                                metrics: Arc::clone(&self.metrics),
-                                pubsub_sender: self.pubsub_sender.clone(),
+                            let token = if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
+                                Some(Arc::clone(&pubsub_sender).subscribe(&shard_id))
+                            } else {
+                                None
                             };
-                            if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                                pubsub_sender.subscribe(&shard_id);
-                            }
                             let state = Arc::new(LockingTypedState {
                                 shard_id,
                                 notifier: StateWatchNotifier::new(Arc::clone(&self.metrics)),
@@ -570,7 +553,7 @@ pub(crate) struct LockingTypedState<K, V, T, D> {
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
     shard_metrics: Arc<ShardMetrics>,
-    _subscription_token: PubSubSubscriptionToken,
+    _subscription_token: Option<Arc<PubSubToken>>,
 }
 
 impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {

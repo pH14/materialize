@@ -9,31 +9,29 @@
 
 #![allow(missing_docs, dead_code)] // WIP
 
-use std::collections::BTreeSet;
-use std::future::Future;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures::Stream;
 use futures_util::StreamExt;
 use prost::Message;
-use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
-use tonic::transport::{Channel, Endpoint, Error};
-use tonic::{Extensions, Request, Response, Status, Streaming};
+use tonic::transport::Endpoint;
+use tonic::{Extensions, Request};
 use tracing::{debug, error, info, warn};
 
-use crate::cache::StateCache;
 use mz_ore::cast::CastFrom;
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist::location::VersionedData;
 use mz_proto::{ProtoType, RustType};
 
+use crate::cache::StateCache;
 use crate::internal::metrics::PubSubServerMetrics;
 use crate::internal::service::proto_persist_pub_sub_client::ProtoPersistPubSubClient;
 use crate::internal::service::proto_persist_pub_sub_server::ProtoPersistPubSubServer;
@@ -67,10 +65,11 @@ pub trait PubSubSender: std::fmt::Debug + Send + Sync {
 
     /// Subscribe the corresponding [PubSubReceiver] to diffs for the given shard.
     /// This call is idempotent and is a no-op for already subscribed shards.
-    fn subscribe(&self, shard: &ShardId);
+    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<PubSubToken>;
 
     /// Unsubscribe the corresponding [PubSubReceiver] to diffs for the given shard.
     /// This call is idempotent and is a no-op for already unsubscribed shards.
+    /// WIP: not intended to be called explicitly, but needed for the token to work
     fn unsubscribe(&self, shard: &ShardId);
 }
 
@@ -78,6 +77,22 @@ pub trait PubSubSender: std::fmt::Debug + Send + Sync {
 pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
 
 impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
+
+#[derive(Debug)]
+pub struct PubSubToken {
+    shard_id: ShardId,
+    pubsub_sender: Arc<dyn PubSubSender>,
+}
+
+impl Drop for PubSubToken {
+    fn drop(&mut self) {
+        info!(
+            "unsubscribing {} due to dropped pubsub token",
+            self.shard_id
+        );
+        self.pubsub_sender.unsubscribe(&self.shard_id)
+    }
+}
 
 #[derive(Debug)]
 pub struct PersistPubSubServer {
@@ -104,16 +119,21 @@ impl PersistPubSubServer {
 struct PubSubSenderClient {
     metrics: Arc<Metrics>,
     requests: tokio::sync::broadcast::Sender<ProtoPubSubMessage>,
-    subscribes: Arc<Mutex<BTreeSet<ShardId>>>,
+    subscribes: Arc<Mutex<BTreeMap<ShardId, Weak<PubSubToken>>>>,
 }
 
 impl PubSubSenderClient {
     fn reconnect(&self) {
-        let subscribes = self.subscribes.lock().expect("lock");
-        for shard_id in subscribes.iter() {
-            info!("reconnecting to: {}", shard_id);
-            self.subscribe_locked(shard_id);
-        }
+        let mut subscribes = self.subscribes.lock().expect("lock");
+        subscribes.retain(|shard_id, token| {
+            if token.upgrade().is_none() {
+                false
+            } else {
+                info!("reconnecting to: {}", shard_id);
+                self.subscribe_locked(shard_id);
+                true
+            }
+        })
     }
 
     fn subscribe_locked(&self, shard: &ShardId) {
@@ -143,7 +163,6 @@ impl PubSubSenderClient {
     }
 }
 
-#[async_trait]
 impl PubSubSender for PubSubSenderClient {
     fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
         let seqno = diff.seqno.clone();
@@ -176,15 +195,37 @@ impl PubSubSender for PubSubSenderClient {
         }
     }
 
-    fn subscribe(&self, shard: &ShardId) {
+    fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<PubSubToken> {
+        info!("creating new subscribe token");
         let mut subscribes = self.subscribes.lock().expect("lock");
-        subscribes.insert(*shard);
-        self.subscribe_locked(shard);
+        if let Some(token) = subscribes.get(shard_id) {
+            match token.upgrade() {
+                None => assert!(subscribes.remove(shard_id).is_some()),
+                Some(token) => {
+                    return Arc::clone(&token);
+                }
+            }
+        }
+        let pubsub_sender = Arc::clone(&self);
+        let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
+        let token = Arc::new(PubSubToken {
+            shard_id: shard_id.clone(),
+            pubsub_sender,
+        });
+        assert!(subscribes
+            .insert(*shard_id, Arc::downgrade(&token))
+            .is_none());
+        self.subscribe_locked(shard_id);
+        token
     }
 
     fn unsubscribe(&self, shard: &ShardId) {
         let mut subscribes = self.subscribes.lock().expect("lock");
-        subscribes.remove(shard);
+        let removed_token = subscribes.remove(shard);
+
+        if let Some(removed_token) = removed_token {
+            assert!(removed_token.upgrade().is_none());
+        }
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -347,6 +388,7 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
                 u128::from_le_bytes(<[u8; 16]>::try_from(res.timestamp.as_slice()).expect("WIP"));
             match res.message {
                 Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
+                    info!("received diff: {:?}", diff);
                     cache.metrics.pubsub_client.receiver.push_received.inc();
                     let shard_id = diff.shard_id.into_rust().expect("WIP");
                     let diff = VersionedData {

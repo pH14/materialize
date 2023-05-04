@@ -97,7 +97,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             )
             .await;
 
-            sender.subscribe(&shard_id);
+            let _token = sender.subscribe(&shard_id);
             while let Some(message) = receiver.next().await {
                 info!("client res: {:?}", message);
             }
