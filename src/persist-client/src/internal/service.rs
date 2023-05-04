@@ -72,6 +72,7 @@ impl PubSubState {
         info!("cleaning up state from: {}", connection_id);
         let now = Instant::now();
         {
+            // WIP: is it OK to lock this to probe every shard?
             let mut subscribers = self.shard_subscribers.write().expect("lock poisoned");
             for (_shard, connections) in subscribers.iter_mut() {
                 connections.remove(&connection_id);

@@ -21,16 +21,18 @@ use futures::Stream;
 use futures_util::StreamExt;
 use prost::Message;
 use tokio::sync::mpsc::error::SendError;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
 use tonic::transport::{Channel, Endpoint, Error};
 use tonic::{Extensions, Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
+use crate::cache::StateCache;
 use mz_ore::cast::CastFrom;
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist::location::VersionedData;
-use mz_proto::RustType;
+use mz_proto::{ProtoType, RustType};
 
 use crate::internal::metrics::PubSubServerMetrics;
 use crate::internal::service::proto_persist_pub_sub_client::ProtoPersistPubSubClient;
@@ -332,4 +334,55 @@ impl PersistPubSub for PersistPubSubClient {
             Box::new(ReceiverStream::new(receiver_output)),
         )
     }
+}
+
+pub(crate) fn subscribe_state_cache_to_pubsub(
+    cache: Arc<StateCache>,
+    mut pubsub_receiver: Box<dyn PubSubReceiver>,
+) -> JoinHandle<()> {
+    mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
+        cache.metrics.pubsub_client.receiver.connected.set(1);
+        while let Some(res) = pubsub_receiver.next().await {
+            let timestamp =
+                u128::from_le_bytes(<[u8; 16]>::try_from(res.timestamp.as_slice()).expect("WIP"));
+            match res.message {
+                Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
+                    cache.metrics.pubsub_client.receiver.push_received.inc();
+                    let shard_id = diff.shard_id.into_rust().expect("WIP");
+                    let diff = VersionedData {
+                        seqno: diff.seqno.into_rust().expect("WIP"),
+                        data: diff.diff,
+                    };
+                    debug!(
+                        "client got diff {} {} {}",
+                        shard_id,
+                        diff.seqno,
+                        diff.data.len()
+                    );
+                    cache.apply_diff(&shard_id, diff);
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .expect("failed to get millis since epoch")
+                        .as_micros();
+                    let latency = now.saturating_sub(timestamp) as f64;
+                    cache
+                        .metrics
+                        .pubsub_client
+                        .receiver
+                        .approx_diff_latency
+                        .observe(latency);
+                }
+                ref msg @ None | ref msg @ Some(_) => {
+                    warn!("pubsub client received unexpected message: {:?}", msg);
+                    cache
+                        .metrics
+                        .pubsub_client
+                        .receiver
+                        .unknown_message_received
+                        .inc();
+                }
+            }
+        }
+        cache.metrics.pubsub_client.receiver.connected.set(0);
+    })
 }

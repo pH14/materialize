@@ -64,6 +64,7 @@ pub struct PersistClientCache {
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
     pub(crate) state_cache: Arc<StateCache>,
     pubsub_sender: Option<Arc<dyn PubSubSender>>,
+    _pubsub_receiver_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -89,12 +90,21 @@ impl PersistClientCache {
             None
         };
 
-        let pubsub_sender = match &pubsub {
-            None => None,
-            Some((pubsub_sender, _)) => Some(Arc::clone(pubsub_sender)),
+        let (pubsub_sender, pubsub_receiver) = match pubsub {
+            None => (None, None),
+            Some((pubsub_sender, pubsub_receiver)) => (Some(pubsub_sender), Some(pubsub_receiver)),
         };
 
-        let state_cache = StateCache::new(&cfg, Arc::clone(&metrics), pubsub);
+        let state_cache = StateCache::new(&cfg, Arc::clone(&metrics), pubsub_sender.clone());
+        let receiver_task = if let Some(pubsub_receiver) = pubsub_receiver {
+            Some(crate::rpc::subscribe_state_cache_to_pubsub(
+                Arc::clone(&state_cache),
+                pubsub_receiver,
+            ))
+        } else {
+            None
+        };
+
         PersistClientCache {
             cfg,
             metrics,
@@ -103,6 +113,7 @@ impl PersistClientCache {
             cpu_heavy_runtime: Arc::new(CpuHeavyRuntime::new()),
             state_cache,
             pubsub_sender,
+            _pubsub_receiver_task: receiver_task,
         }
     }
 
@@ -359,7 +370,7 @@ where
 #[derive(Clone, Debug)]
 pub struct StateCache {
     cfg: Arc<PersistConfig>,
-    metrics: Arc<Metrics>,
+    pub(crate) metrics: Arc<Metrics>,
     states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
     pubsub_sender: Option<Arc<dyn PubSubSender>>,
 }
@@ -389,73 +400,15 @@ impl StateCache {
     pub fn new(
         cfg: &PersistConfig,
         metrics: Arc<Metrics>,
-        pubsub: Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>,
+        pubsub_sender: Option<Arc<dyn PubSubSender>>,
     ) -> Arc<Self> {
-        let (pubsub_sender, pubsub_receiver) = match pubsub {
-            None => (None, None),
-            Some((pubsub_sender, pubsub_receiver)) => (Some(pubsub_sender), Some(pubsub_receiver)),
-        };
-
-        let state_cache = Arc::new(StateCache {
+        // WIP: remove Arc again
+        Arc::new(StateCache {
             cfg: Arc::new(cfg.clone()),
             metrics,
             states: Default::default(),
             pubsub_sender,
-        });
-
-        let cache = Arc::clone(&state_cache);
-        if let Some(mut pubsub_receiver) = pubsub_receiver {
-            let _ = mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
-                cache.metrics.pubsub_client.receiver.connected.set(1);
-                while let Some(res) = pubsub_receiver.next().await {
-                    let timestamp = u128::from_le_bytes(
-                        <[u8; 16]>::try_from(res.timestamp.as_slice()).expect("WIP"),
-                    );
-                    match res.message {
-                        Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
-                            cache.metrics.pubsub_client.receiver.push_received.inc();
-                            let shard_id = diff.shard_id.into_rust().expect("WIP");
-                            let diff = VersionedData {
-                                seqno: diff.seqno.into_rust().expect("WIP"),
-                                data: diff.diff,
-                            };
-                            debug!(
-                                "client got diff {} {} {}",
-                                shard_id,
-                                diff.seqno,
-                                diff.data.len()
-                            );
-                            cache.apply_diff(&shard_id, diff);
-                            let now = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .expect("failed to get millis since epoch")
-                                .as_micros();
-                            let latency = now.saturating_sub(timestamp) as f64;
-                            cache
-                                .metrics
-                                .pubsub_client
-                                .receiver
-                                .approx_diff_latency
-                                .observe(latency);
-                        }
-                        ref msg @ None | ref msg @ Some(_) => {
-                            warn!("pubsub client received unexpected message: {:?}", msg);
-                            cache
-                                .metrics
-                                .pubsub_client
-                                .receiver
-                                .unknown_message_received
-                                .inc();
-                        }
-                    }
-                }
-                cache.metrics.pubsub_client.receiver.connected.set(0);
-            });
-        } else {
-            state_cache.metrics.pubsub_client.receiver.connected.set(0);
-        }
-
-        state_cache
+        })
     }
 
     #[cfg(test)]
