@@ -38,7 +38,7 @@ use mz_proto::ProtoType;
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
 use crate::internal::machine::retry_external;
-use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus};
+use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus, ShardMetrics};
 use crate::internal::service::proto_pub_sub_message;
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
@@ -309,7 +309,7 @@ async fn consensus_rtt_latency_task(
 trait DynState: Debug + Send + Sync {
     fn codecs(&self) -> (String, String, String, String, Option<CodecConcreteType>);
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
-    fn push_diff(&self, diff: VersionedData) -> bool;
+    fn push_diff(&self, diff: VersionedData);
 }
 
 impl<K, V, T, D> DynState for LockingTypedState<K, V, T, D>
@@ -333,7 +333,7 @@ where
         self
     }
 
-    fn push_diff(&self, diff: VersionedData) -> bool {
+    fn push_diff(&self, diff: VersionedData) {
         self.write_lock(&self.metrics.locks.applier_write, |state| {
             let seqno_before = state.seqno;
             state.apply_encoded_diffs(&self.cfg, &self.metrics, std::iter::once(&diff));
@@ -345,13 +345,13 @@ where
                     "applied pushed diff {}. seqno {} -> {}.",
                     state.shard_id, seqno_before, state.seqno
                 );
-                true
+                self.shard_metrics.pubsub_push_diff_applied.inc();
             } else {
                 debug!(
                     "failed to apply pushed diff {}. seqno {} vs diff {}",
                     state.shard_id, seqno_before, diff.seqno
                 );
-                false
+                self.shard_metrics.pubsub_push_diff_not_applied.inc();
             }
         })
     }
@@ -425,14 +425,7 @@ impl StateCache {
 
     pub(crate) fn apply_diff(&self, shard_id: &ShardId, diff: VersionedData) {
         if let Some(state) = self.get_cached(shard_id) {
-            // WIP: could register callbacks here. if not applied, fallback
-            let applied = state.push_diff(diff);
-            let shard_metrics = self.metrics.shards.shard(shard_id);
-            if applied {
-                shard_metrics.pubsub_push_diff_applied.inc();
-            } else {
-                shard_metrics.pubsub_push_diff_not_applied.inc();
-            }
+            state.push_diff(diff);
         }
     }
 
@@ -489,6 +482,7 @@ impl StateCache {
                                 state: RwLock::new(init_res?),
                                 cfg: Arc::clone(&self.cfg),
                                 metrics: Arc::clone(&self.metrics),
+                                shard_metrics: self.metrics.shards.shard(&shard_id),
                                 _subscription_token: token,
                             });
                             let ret = Arc::downgrade(&state);
@@ -575,6 +569,7 @@ pub(crate) struct LockingTypedState<K, V, T, D> {
     notifier: StateWatchNotifier,
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
+    shard_metrics: Arc<ShardMetrics>,
     _subscription_token: PubSubSubscriptionToken,
 }
 
@@ -586,6 +581,7 @@ impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {
             notifier,
             cfg: _cfg,
             metrics: _metrics,
+            shard_metrics: _shard_metrics,
             _subscription_token,
         } = self;
         f.debug_struct("LockingTypedState")
