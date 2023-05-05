@@ -1547,6 +1547,7 @@ impl PubSubServerMetrics {
 pub struct PubSubClientMetrics {
     pub sender: PubSubClientSenderMetrics,
     pub receiver: PubSubClientReceiverMetrics,
+    pub grpc_connection: PubSubGrpcClientConnectionMetrics,
 }
 
 impl PubSubClientMetrics {
@@ -1554,6 +1555,38 @@ impl PubSubClientMetrics {
         PubSubClientMetrics {
             sender: PubSubClientSenderMetrics::new(registry),
             receiver: PubSubClientReceiverMetrics::new(registry),
+            grpc_connection: PubSubGrpcClientConnectionMetrics::new(registry),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PubSubGrpcClientConnectionMetrics {
+    pub(crate) connection_established_count: IntCounter,
+    pub(crate) connect_call_attempt_count: IntCounter,
+    pub(crate) broadcast_recv_lagged_count: IntCounter,
+    pub(crate) grpc_error_count: IntCounter,
+}
+
+impl PubSubGrpcClientConnectionMetrics {
+    fn new(registry: &MetricsRegistry) -> Self {
+        Self {
+            connection_established_count: registry.register(metric!(
+                    name: "mz_persist_pubsub_client_grpc_connection_established_count",
+                    help: "count of grpc connection establishments to pubsub server",
+            )),
+            connect_call_attempt_count: registry.register(metric!(
+                    name: "mz_persist_pubsub_client_grpc_connect_call_attempt_count",
+                    help: "count of connection call attempts (including retries) to pubsub server",
+            )),
+            broadcast_recv_lagged_count: registry.register(metric!(
+                    name: "mz_persist_pubsub_client_grpc_broadcast_recv_lagged_count",
+                    help: "times a message was missed by broadcast receiver due to lag",
+            )),
+            grpc_error_count: registry.register(metric!(
+                    name: "mz_persist_pubsub_client_grpc_error_count",
+                    help: "count of grpc errors received",
+            )),
         }
     }
 }
@@ -1562,7 +1595,6 @@ impl PubSubClientMetrics {
 pub struct PubSubClientReceiverMetrics {
     pub(crate) connected: UIntGauge,
     pub(crate) push_received: IntCounter,
-    pub(crate) errors_received: IntCounter,
     pub(crate) unknown_message_received: IntCounter,
     pub(crate) approx_diff_latency: Histogram,
 }
@@ -1578,10 +1610,9 @@ impl PubSubClientReceiverMetrics {
         Self {
             connected: registry.register(metric!(
                     name: "mz_persist_pubsub_client_receiver_connected",
-                    help: "WIP",
+                    help: "whether the pubsub receiver is connected to an input channel",
             )),
             push_received: call_received.with_label_values(&["push"]),
-            errors_received: call_received.with_label_values(&["error"]),
             unknown_message_received: call_received.with_label_values(&["unknown"]),
             approx_diff_latency: registry.register(metric!(
                 name: "mz_persist_pubsub_client_approx_diff_apply_latency",
@@ -1594,7 +1625,6 @@ impl PubSubClientReceiverMetrics {
 
 #[derive(Debug)]
 pub struct PubSubClientSenderMetrics {
-    // WIP: probably want pushed per shard, as well as byte size
     pub push: PubSubClientCallMetrics,
     pub subscribe: PubSubClientCallMetrics,
     pub unsubscribe: PubSubClientCallMetrics,
@@ -1609,7 +1639,6 @@ pub struct PubSubClientCallMetrics {
 
 impl PubSubClientSenderMetrics {
     fn new(registry: &MetricsRegistry) -> Self {
-        // WIP: metrics structure
         let call_bytes_sent: IntCounterVec = registry.register(metric!(
                 name: "mz_persist_pubsub_client_call_bytes_sent",
                 help: "number of bytes sent for a given pubsub client call",
