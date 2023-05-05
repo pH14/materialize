@@ -99,8 +99,7 @@ use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
 use mz_persist_client::rpc::{
-    MetricsDirectPubSubSender, PersistGrpcPubSubServer, PersistPubSubClient,
-    PubSubClientConnection, PubSubReceiver, PubSubSender,
+    MetricsDirectPubSubSender, PersistGrpcPubSubServer, PubSubClientConnection, PubSubSender,
 };
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;

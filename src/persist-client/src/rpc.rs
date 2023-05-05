@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+//! gRPC-based implementations of Persist PubSub client and server.
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -126,27 +128,41 @@ impl Drop for ShardSubscriptionToken {
 /// A gRPC-based implementation of a Persist PubSub server.
 #[derive(Debug)]
 pub struct PersistGrpcPubSubServer {
-    service: PersistService,
+    state: Arc<PubSubState>,
 }
 
 impl PersistGrpcPubSubServer {
     /// Creates a new [PersistGrpcPubSubServer].
     pub fn new(metrics_registry: &MetricsRegistry) -> Self {
         let metrics = PubSubServerMetrics::new(metrics_registry);
-        let service = PersistService::new(metrics);
-        PersistGrpcPubSubServer { service }
+        let state = Arc::new(PubSubState {
+            connection_id_counter: AtomicUsize::new(0),
+            shard_subscribers: Default::default(),
+            connections: Default::default(),
+            metrics: Arc::new(metrics),
+        });
+        PersistGrpcPubSubServer { state }
     }
 
     /// Creates a client to [PersistGrpcPubSubServer] that is directly connected
     /// to the server, avoiding the need for network calls or message serde.
     pub fn new_direct_client(&self) -> PubSubClientConnection {
-        self.service.new_direct_client()
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender: Arc<dyn PubSubSender> = Arc::new(Arc::clone(&self.state).new_connection(tx));
+
+        PubSubClientConnection {
+            sender,
+            receiver: Box::new(
+                UnboundedReceiverStream::new(rx)
+                    .filter_map(|x| Some(x.expect("cannot receive grpc errors locally"))),
+            ),
+        }
     }
 
     /// Starts the gRPC server. Consumes `self` and runs until the task is cancelled.
     pub async fn serve(self, listen_addr: SocketAddr) -> Result<(), anyhow::Error> {
         tonic::transport::Server::builder()
-            .add_service(ProtoPersistPubSubServer::new(self.service))
+            .add_service(ProtoPersistPubSubServer::new(self))
             .serve(listen_addr)
             .await?;
         Ok(())
@@ -159,11 +175,17 @@ pub const PERSIST_PUBSUB_CALLER_KEY: &str = "persist-pubsub-caller-id";
 /// Client configuration for connecting to a remote PubSub server.
 #[derive(Debug)]
 pub struct PersistPubSubClientConfig {
+    /// Connection address for the pubsub server, e.g. `http://localhost:6879`
     pub addr: String,
+    /// A caller ID for the client. Used for debugging.
     pub caller_id: String,
 }
 
 /// A [PersistPubSubClient] implementation backed by gRPC.
+///
+/// Returns a [PubSubClientConnection] backed by channels that submit and receive
+/// messages to and from a long-lived bidirectional gRPC stream. The gRPC stream
+/// will be transparently reconnected if the connection is lost.
 #[derive(Debug)]
 pub struct GrpcPubSubClient;
 
@@ -184,87 +206,94 @@ impl PersistPubSubClient for GrpcPubSubClient {
         let sender = Arc::clone(&pubsub_sender);
 
         // WIP: return join handle so we can keep track of its existence a little more easily?
-        mz_ore::task::spawn(|| format!("persist_pubsub_client_connection"), async move {
-            let mut metadata = MetadataMap::new();
-            metadata.insert(
-                AsciiMetadataKey::from_static(PERSIST_PUBSUB_CALLER_KEY),
-                AsciiMetadataValue::try_from(&config.caller_id)
-                    .unwrap_or_else(|_| AsciiMetadataValue::from_static("unknown")),
-            );
-
-            loop {
-                // WIP: count connections made
-                // WIP: connect with retries and a timeout
-                let client = mz_ore::retry::Retry::default()
-                    .clamp_backoff(Duration::from_secs(60))
-                    .retry_async(|_| async {
-                        info!("connecting to pubsub");
-                        let endpoint =
-                            Endpoint::from_str(&config.addr)?.timeout(Duration::from_secs(5));
-                        Ok::<_, anyhow::Error>(ProtoPersistPubSubClient::connect(endpoint).await?)
-                    })
-                    .await;
-
-                let mut client = match client {
-                    Ok(client) => client,
-                    Err(err) => {
-                        warn!("error connecting to persist pubsub: {:?}", err);
-                        continue;
-                    }
-                };
-
-                info!("Created pubsub client to: {:?}", config.addr);
-                let mut broadcast = BroadcastStream::new(rpc_requests.subscribe());
-                let pubsub_request = Request::from_parts(
-                    metadata.clone(),
-                    Extensions::default(),
-                    async_stream::stream! {
-                        while let Some(x) = broadcast.next().await {
-                            match x {
-                                Ok(x) => yield x,
-                                // WIP: metrics for broadcast recv errors, # of messages lagged
-                                Err(err) => {}
-                            }
-                        }
-                    },
+        mz_ore::task::spawn(
+            || format!("persist::pubsub::grpc::connection"),
+            async move {
+                let mut metadata = MetadataMap::new();
+                metadata.insert(
+                    AsciiMetadataKey::from_static(PERSIST_PUBSUB_CALLER_KEY),
+                    AsciiMetadataValue::try_from(&config.caller_id)
+                        .unwrap_or_else(|_| AsciiMetadataValue::from_static("unknown")),
                 );
 
-                let mut responses = match client.pub_sub(pubsub_request).await {
-                    Ok(response) => response.into_inner(),
-                    Err(err) => {
-                        warn!("pub_sub rpc error: {:?}", err);
-                        continue;
-                    }
-                };
-
-                sender.reconnect();
-                info!("reconnected");
-
                 loop {
-                    info!("awaiting responses");
-                    match responses.next().await {
-                        None => break,
-                        Some(Ok(x)) => {
-                            // WIP
-                            info!("got response: {:?}", x);
-                            match receiver_input.send(x).await {
-                                Ok(()) => {}
-                                Err(err) => {
-                                    warn!("pubsub client receiver input failure: {:?}", err);
+                    // WIP: count connections made
+                    // WIP: connect with retries and a timeout
+                    let client = mz_ore::retry::Retry::default()
+                        .clamp_backoff(Duration::from_secs(60))
+                        .retry_async(|_| async {
+                            debug!("connecting to pubsub");
+                            let endpoint =
+                                Endpoint::from_str(&config.addr)?.timeout(Duration::from_secs(5));
+                            Ok::<_, anyhow::Error>(
+                                ProtoPersistPubSubClient::connect(endpoint).await?,
+                            )
+                        })
+                        .await;
+
+                    let mut client = match client {
+                        Ok(client) => client,
+                        Err(err) => {
+                            warn!("error connecting to persist pubsub: {:?}", err);
+                            continue;
+                        }
+                    };
+
+                    debug!("created pubsub client to: {:?}", config.addr);
+                    let mut broadcast = BroadcastStream::new(rpc_requests.subscribe());
+                    let pubsub_request = Request::from_parts(
+                        metadata.clone(),
+                        Extensions::default(),
+                        async_stream::stream! {
+                            while let Some(x) = broadcast.next().await {
+                                match x {
+                                    Ok(x) => yield x,
+                                    // WIP: metrics for broadcast recv errors, # of messages lagged
+                                    Err(err) => {
+
+                                    }
                                 }
                             }
+                        },
+                    );
+
+                    let mut responses = match client.pub_sub(pubsub_request).await {
+                        Ok(response) => response.into_inner(),
+                        Err(err) => {
+                            warn!("pub_sub rpc error: {:?}", err);
+                            continue;
                         }
-                        Some(Err(err)) => {
-                            // WIP count errors
-                            warn!("pubsub client error: {:?}", err);
-                            break;
+                    };
+
+                    sender.reconnect();
+                    info!("reconnected");
+
+                    loop {
+                        info!("awaiting responses");
+                        match responses.next().await {
+                            None => break,
+                            Some(Ok(x)) => {
+                                // WIP
+                                info!("got response: {:?}", x);
+                                match receiver_input.send(x).await {
+                                    Ok(()) => {}
+                                    Err(err) => {
+                                        warn!("pubsub client receiver input failure: {:?}", err);
+                                    }
+                                }
+                            }
+                            Some(Err(err)) => {
+                                // WIP count errors
+                                warn!("pubsub client error: {:?}", err);
+                                break;
+                            }
                         }
                     }
-                }
 
-                info!("need to reconnect");
-            }
-        });
+                    info!("need to reconnect");
+                }
+            },
+        );
 
         PubSubClientConnection {
             sender: pubsub_sender,
@@ -470,7 +499,7 @@ impl PubSubSender for GrpcPubSubSender {
 
 /// A wrapper intended to provide client-side metrics for a client
 /// directly that communicates directly with the server state, such
-/// as one created by [PersistService::new_direct_client].
+/// as one created by [PersistGrpcPubSubServer::new_direct_client].
 #[derive(Debug)]
 pub struct MetricsDirectPubSubSender {
     metrics: Arc<Metrics>,
@@ -776,51 +805,17 @@ impl Drop for PubSubConnection {
     }
 }
 
-/// Entrypoint for running a Persist PubSub gRPC service.
-#[derive(Debug)]
-pub struct PersistService {
-    state: Arc<PubSubState>,
-}
-
-impl PersistService {
-    /// Creates a new [PersistService].
-    pub fn new(metrics: PubSubServerMetrics) -> Self {
-        PersistService {
-            state: Arc::new(PubSubState {
-                connection_id_counter: AtomicUsize::new(0),
-                shard_subscribers: Default::default(),
-                connections: Default::default(),
-                metrics: Arc::new(metrics),
-            }),
-        }
-    }
-
-    /// Creates a direct [PubSubClientConnection] to this service.
-    pub fn new_direct_client(&self) -> PubSubClientConnection {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let sender: Arc<dyn PubSubSender> = Arc::new(Arc::clone(&self.state).new_connection(tx));
-
-        PubSubClientConnection {
-            sender,
-            receiver: Box::new(
-                UnboundedReceiverStream::new(rx)
-                    .filter_map(|x| Some(x.expect("cannot receive grpc errors locally"))),
-            ),
-        }
-    }
-}
-
 #[async_trait]
-impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
+impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServer {
     type PubSubStream = Pin<Box<dyn Stream<Item = Result<ProtoPubSubMessage, Status>> + Send>>;
 
     async fn pub_sub(
         &self,
-        req: Request<Streaming<ProtoPubSubMessage>>,
+        request: Request<Streaming<ProtoPubSubMessage>>,
     ) -> Result<Response<Self::PubSubStream>, Status> {
         let root_span = info_span!("persist::push::server");
         let _guard = root_span.enter();
-        let caller_id = req
+        let caller_id = request
             .metadata()
             .get(AsciiMetadataKey::from_static(PERSIST_PUBSUB_CALLER_KEY))
             .map(|key| key.to_str().ok())
@@ -829,7 +824,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
             .unwrap_or_else(|| "unknown".to_string());
         info!("incoming push from: {:?}", caller_id);
 
-        let mut in_stream = req.into_inner();
+        let mut in_stream = request.into_inner();
 
         // WIP not unbounded
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
