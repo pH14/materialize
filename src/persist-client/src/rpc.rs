@@ -10,6 +10,7 @@
 #![allow(missing_docs, dead_code)] // WIP
 
 use std::collections::BTreeMap;
+use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
@@ -34,10 +35,12 @@ use mz_proto::{ProtoType, RustType};
 use crate::cache::StateCache;
 use crate::internal::metrics::PubSubServerMetrics;
 use crate::internal::service::proto_persist_pub_sub_client::ProtoPersistPubSubClient;
-use crate::internal::service::proto_persist_pub_sub_server::ProtoPersistPubSubServer;
+use crate::internal::service::proto_persist_pub_sub_server::{
+    ProtoPersistPubSub, ProtoPersistPubSubServer,
+};
 use crate::internal::service::{
     proto_pub_sub_message, PersistService, ProtoPubSubMessage, ProtoPushDiff, ProtoSubscribe,
-    ProtoUnsubscribe,
+    ProtoUnsubscribe, PubSubConnection,
 };
 use crate::metrics::Metrics;
 use crate::ShardId;
@@ -80,8 +83,8 @@ impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> + Send +
 
 #[derive(Debug)]
 pub struct PubSubToken {
-    shard_id: ShardId,
-    pubsub_sender: Arc<dyn PubSubSender>,
+    pub(crate) shard_id: ShardId,
+    pub(crate) pubsub_sender: Arc<dyn PubSubSender>,
 }
 
 impl Drop for PubSubToken {
@@ -104,6 +107,10 @@ impl PersistPubSubServer {
         let metrics = PubSubServerMetrics::new(metrics_registry);
         let service = PersistService::new(metrics);
         PersistPubSubServer { service }
+    }
+
+    pub fn local_connection(&self) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
+        self.service.local_connection()
     }
 
     pub async fn serve(self, listen_addr: SocketAddr) -> Result<(), anyhow::Error> {
@@ -427,4 +434,50 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
         }
         cache.metrics.pubsub_client.receiver.connected.set(0);
     })
+}
+
+/// WIP: Used to provide client statistics even for a local connection
+#[derive(Debug)]
+pub struct MetricsPubSubConnection {
+    metrics: Arc<Metrics>,
+    pubsub_sender: Arc<dyn PubSubSender>,
+}
+
+impl MetricsPubSubConnection {
+    pub fn new(pubsub_sender: Arc<dyn PubSubSender>, metrics: Arc<Metrics>) -> Self {
+        Self {
+            pubsub_sender,
+            metrics,
+        }
+    }
+}
+
+impl PubSubSender for MetricsPubSubConnection {
+    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
+        self.metrics
+            .pubsub_client
+            .sender
+            .push
+            .bytes_sent
+            .inc_by(u64::cast_from(diff.data.len()));
+        self.pubsub_sender.push(shard_id, diff);
+        self.metrics.pubsub_client.sender.push.succeeded.inc();
+    }
+
+    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<PubSubToken> {
+        // WIP: shard vs shard_id
+        let token = Arc::clone(&self.pubsub_sender).subscribe(shard);
+        self.metrics.pubsub_client.sender.subscribe.succeeded.inc();
+        token
+    }
+
+    fn unsubscribe(&self, shard: &ShardId) {
+        self.pubsub_sender.unsubscribe(shard);
+        self.metrics
+            .pubsub_client
+            .sender
+            .unsubscribe
+            .succeeded
+            .inc();
+    }
 }

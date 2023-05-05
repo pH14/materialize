@@ -275,10 +275,13 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
         PersistClientCache::new(
             PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
             &metrics_registry,
-            Some(PersistPubSubClientConfig {
-                addr: args.persist_pubsub_addr,
-                caller_id: pubsub_caller_id,
-            }),
+            |_persist_cfg, metrics| async {
+                let cfg = PersistPubSubClientConfig {
+                    addr: args.persist_pubsub_addr,
+                    caller_id: pubsub_caller_id,
+                };
+                Some(PersistPubSubClient::connect(cfg, metrics).await)
+            },
         )
         .await,
     );

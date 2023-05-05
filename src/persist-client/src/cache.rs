@@ -78,18 +78,15 @@ impl Drop for RttLatencyTask {
 
 impl PersistClientCache {
     /// Returns a new [PersistClientCache].
-    pub async fn new(
-        cfg: PersistConfig,
-        registry: &MetricsRegistry,
-        pubsub: Option<PersistPubSubClientConfig>,
-    ) -> Self {
+    pub async fn new<F, Fut>(cfg: PersistConfig, registry: &MetricsRegistry, pubsub: F) -> Self
+    where
+        F: FnOnce(&PersistConfig, Arc<Metrics>) -> Fut,
+        Fut: Future<Output = Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>>,
+    {
         let metrics = Arc::new(Metrics::new(&cfg, registry));
-        let (pubsub_sender, pubsub_receiver) = if let Some(config) = pubsub {
-            let (pubsub_sender, pubsub_receiver) =
-                PersistPubSubClient::connect(config, Arc::clone(&metrics)).await;
-            (Some(pubsub_sender), Some(pubsub_receiver))
-        } else {
-            (None, None)
+        let (pubsub_sender, pubsub_receiver) = match pubsub(&cfg, Arc::clone(&metrics)).await {
+            None => (None, None),
+            Some((sender, receiver)) => (Some(sender), Some(receiver)),
         };
 
         let state_cache = StateCache::new(&cfg, Arc::clone(&metrics), pubsub_sender.clone());
@@ -120,7 +117,7 @@ impl PersistClientCache {
         Self::new(
             PersistConfig::new_for_tests(),
             &MetricsRegistry::new(),
-            None,
+            |_, _| async { None },
         )
         .await
     }

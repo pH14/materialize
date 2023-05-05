@@ -32,7 +32,7 @@ use mz_persist::location::VersionedData;
 use mz_proto::{ProtoType, RustType};
 
 use crate::internal::metrics::PubSubServerMetrics;
-use crate::rpc::PERSIST_PUBSUB_CALLER_KEY;
+use crate::rpc::{PubSubReceiver, PubSubSender, PubSubToken, PERSIST_PUBSUB_CALLER_KEY};
 use crate::ShardId;
 
 include!(concat!(
@@ -41,7 +41,7 @@ include!(concat!(
 ));
 
 #[derive(Debug)]
-struct PubSubState {
+pub(crate) struct PubSubState {
     /// Assigns a unique ID to each incoming connection.
     connection_id_counter: AtomicUsize,
     /// Maintains a mapping of `ShardId --> [ConnectionId -> Tx]`.
@@ -54,8 +54,6 @@ struct PubSubState {
 }
 
 impl PubSubState {
-    // WIP: newtype for connection id
-    // WIP: call disconnect when the ID token is dropped
     fn new_connection(
         self: Arc<Self>,
         notifier: UnboundedSender<Result<ProtoPubSubMessage, Status>>,
@@ -184,23 +182,46 @@ impl PubSubState {
 }
 
 #[derive(Debug)]
-struct PubSubConnection {
+pub(crate) struct PubSubConnection {
     connection_id: usize,
     notifier: UnboundedSender<Result<ProtoPubSubMessage, Status>>,
     state: Arc<PubSubState>,
 }
 
+impl PubSubSender for PubSubConnection {
+    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
+        // WIP: fix up the String vs ShardId
+        PubSubConnection::push_diff(self, shard_id.to_string(), diff)
+    }
+
+    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<PubSubToken> {
+        PubSubConnection::subscribe(self.as_ref(), shard.to_string());
+
+        let pubsub_sender = Arc::clone(&self);
+        let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
+
+        Arc::new(PubSubToken {
+            shard_id: shard.clone(),
+            pubsub_sender,
+        })
+    }
+
+    fn unsubscribe(&self, shard: &ShardId) {
+        PubSubConnection::unsubscribe(self, &shard.to_string());
+    }
+}
+
 impl PubSubConnection {
-    fn push_diff(&mut self, shard_id: String, data: &VersionedData) {
+    pub(crate) fn push_diff(&self, shard_id: String, data: &VersionedData) {
         self.state.push_diff(self.connection_id, shard_id, data)
     }
 
-    fn subscribe(&mut self, shard_id: String) {
+    pub(crate) fn subscribe(&self, shard_id: String) {
         self.state
             .subscribe(self.connection_id, self.notifier.clone(), shard_id)
     }
 
-    fn unsubscribe(&mut self, shard_id: &String) {
+    pub(crate) fn unsubscribe(&self, shard_id: &String) {
         self.state.unsubscribe(self.connection_id, shard_id)
     }
 }
@@ -225,6 +246,18 @@ impl PersistService {
                 metrics: Arc::new(metrics),
             }),
         }
+    }
+
+    pub fn local_connection(&self) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender: Arc<dyn PubSubSender> = Arc::new(Arc::clone(&self.state).new_connection(tx));
+        (
+            sender,
+            Box::new(
+                UnboundedReceiverStream::new(rx)
+                    .filter_map(|x| Some(x.expect("cannot receive grpc errors locally"))),
+            ),
+        )
     }
 }
 

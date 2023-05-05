@@ -99,8 +99,8 @@ use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
 use mz_persist_client::rpc::{
-    PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig, PersistPubSubServer,
-    PubSubReceiver, PubSubSender,
+    MetricsPubSubConnection, PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig,
+    PersistPubSubServer, PubSubReceiver, PubSubSender,
 };
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
@@ -740,6 +740,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     );
     eprintln!("persist_push_addr {}", persist_pubsub_addr);
     let persist_push_server = PersistPubSubServer::new(&metrics_registry);
+    let persist_pubsub_client = persist_push_server.local_connection();
     let _server = runtime.spawn_named(|| "persist::push::server", async move {
         let span = tracing::info_span!("persist::push::server");
         let _guard = span.enter();
@@ -764,10 +765,12 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     let persist_clients = runtime.block_on(PersistClientCache::new(
         PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
         &metrics_registry,
-        Some(PersistPubSubClientConfig {
-            addr: format!("http://{}", args.internal_persist_pubsub_listen_addr),
-            caller_id: "environmentd".to_string(),
-        }),
+        |_, metrics| async {
+            let (sender, receiver) = persist_pubsub_client;
+            let sender: Arc<dyn PubSubSender> =
+                Arc::new(MetricsPubSubConnection::new(sender, metrics));
+            Some((sender, receiver))
+        },
     ));
 
     let persist_clients = Arc::new(persist_clients);
