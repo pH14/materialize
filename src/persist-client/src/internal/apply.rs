@@ -279,7 +279,7 @@ where
                     self.update_state(new_state);
                     if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
                         if self.cfg.dynamic.pubsub_push_enabled() {
-                            pubsub_sender.push(&self.shard_id, &diff);
+                            pubsub_sender.push_diff(&self.shard_id, &diff);
                         }
                     }
                     return Ok((seqno, Ok(res), maintenance));

@@ -72,7 +72,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             let mut i = 0;
             loop {
                 info!("writing");
-                sender.push(
+                sender.push_diff(
                     &shard_id,
                     &VersionedData {
                         seqno: SeqNo(i),

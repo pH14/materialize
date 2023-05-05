@@ -48,7 +48,7 @@ pub(crate) struct PubSubState {
     /// Maintains a mapping of `ShardId --> [ConnectionId -> Tx]`.
     shard_subscribers: Arc<
         RwLock<
-            BTreeMap<String, BTreeMap<usize, UnboundedSender<Result<ProtoPubSubMessage, Status>>>>,
+            BTreeMap<ShardId, BTreeMap<usize, UnboundedSender<Result<ProtoPubSubMessage, Status>>>>,
         >,
     >,
     /// Active connections.
@@ -98,7 +98,7 @@ impl PubSubState {
         self.metrics.active_connections.dec();
     }
 
-    fn push_diff(&self, connection_id: usize, shard_id: String, data: &VersionedData) {
+    fn push_diff(&self, connection_id: usize, shard_id: &ShardId, data: &VersionedData) {
         let now = Instant::now();
         self.metrics.push_call_count.inc();
 
@@ -111,7 +111,7 @@ impl PubSubState {
         let (num_sent, data_size) = {
             let subscribers = self.shard_subscribers.read().expect("lock poisoned");
 
-            match subscribers.get(&shard_id) {
+            match subscribers.get(shard_id) {
                 None => (0, 0),
                 Some(subscribed_connections) => {
                     let mut num_sent = 0;
@@ -165,7 +165,7 @@ impl PubSubState {
         &self,
         connection_id: usize,
         notifier: UnboundedSender<Result<ProtoPubSubMessage, Status>>,
-        shard_id: String,
+        shard_id: &ShardId,
     ) {
         let now = Instant::now();
         self.metrics.subscribe_call_count.inc();
@@ -180,7 +180,7 @@ impl PubSubState {
         {
             let mut subscribed_shards = self.shard_subscribers.write().expect("lock poisoned");
             subscribed_shards
-                .entry(shard_id)
+                .entry(*shard_id)
                 .or_default()
                 .insert(connection_id, notifier);
         }
@@ -190,7 +190,7 @@ impl PubSubState {
             .inc_by(now.elapsed().as_secs_f64());
     }
 
-    fn unsubscribe(&self, connection_id: usize, shard_id: &String) {
+    fn unsubscribe(&self, connection_id: usize, shard_id: &ShardId) {
         let now = Instant::now();
         self.metrics.unsubscribe_call_count.inc();
 
@@ -224,40 +224,39 @@ pub(crate) struct PubSubConnection {
 }
 
 impl PubSubConnection {
-    pub(crate) fn push_diff(&self, shard_id: String, data: &VersionedData) {
+    pub(crate) fn push_diff(&self, shard_id: &ShardId, data: &VersionedData) {
         self.state.push_diff(self.connection_id, shard_id, data)
     }
 
-    pub(crate) fn subscribe(&self, shard_id: String) {
+    pub(crate) fn subscribe(&self, shard_id: &ShardId) {
         self.state
             .subscribe(self.connection_id, self.notifier.clone(), shard_id)
     }
 
-    pub(crate) fn unsubscribe(&self, shard_id: &String) {
+    pub(crate) fn unsubscribe(&self, shard_id: &ShardId) {
         self.state.unsubscribe(self.connection_id, shard_id)
     }
 }
 
 impl PubSubSender for PubSubConnection {
-    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
-        // WIP: fix up the String vs ShardId
-        PubSubConnection::push_diff(self, shard_id.to_string(), diff)
+    fn push_diff(&self, shard_id: &ShardId, diff: &VersionedData) {
+        PubSubConnection::push_diff(self, shard_id, diff)
     }
 
-    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<ShardSubscriptionToken> {
-        PubSubConnection::subscribe(self.as_ref(), shard.to_string());
+    fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<ShardSubscriptionToken> {
+        PubSubConnection::subscribe(self.as_ref(), shard_id);
 
         let pubsub_sender = Arc::clone(&self);
         let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
 
         Arc::new(ShardSubscriptionToken {
-            shard_id: shard.clone(),
+            shard_id: shard_id.clone(),
             pubsub_sender,
         })
     }
 
-    fn unsubscribe(&self, shard: &ShardId) {
-        PubSubConnection::unsubscribe(self, &shard.to_string());
+    fn unsubscribe(&self, shard_id: &ShardId) {
+        PubSubConnection::unsubscribe(self, shard_id);
     }
 }
 
@@ -344,17 +343,20 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
                     None => {}
                     Some(proto_pub_sub_message::Message::PushDiff(req)) => {
                         info!("server received diff");
+                        let shard_id = req.shard_id.parse().expect("valid shard id");
                         let diff = VersionedData {
                             seqno: req.seqno.into_rust().expect("WIP"),
                             data: req.diff.clone(),
                         };
-                        connection.push_diff(req.shard_id, &diff);
+                        connection.push_diff(&shard_id, &diff);
                     }
                     Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
-                        connection.subscribe(diff.shard);
+                        let shard_id = diff.shard_id.parse().expect("valid shard id");
+                        connection.subscribe(&shard_id);
                     }
                     Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
-                        connection.unsubscribe(&diff.shard);
+                        let shard_id = diff.shard_id.parse().expect("valid shard id");
+                        connection.unsubscribe(&shard_id);
                     }
                 }
             }

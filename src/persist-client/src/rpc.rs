@@ -14,7 +14,6 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use async_trait::async_trait;
 use futures::Stream;
 use futures_util::StreamExt;
 use prost::Message;
@@ -61,14 +60,14 @@ pub struct PubSubClientConnection {
 /// commands to the PubSub service.
 pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     /// Push a diff to subscribers.
-    fn push(&self, shard_id: &ShardId, diff: &VersionedData);
+    fn push_diff(&self, shard_id: &ShardId, diff: &VersionedData);
 
     /// Subscribe the corresponding [PubSubReceiver] to diffs for the given shard.
     /// Returns a token that, when dropped, will unsubscribe the client from the
     /// shard.
     ///
     /// This call is idempotent and is a no-op for an already subscribed shard.
-    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<ShardSubscriptionToken>;
+    fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<ShardSubscriptionToken>;
 
     /// Unsubscribe the corresponding [PubSubReceiver] from diffs for the given shard.
     /// Users should not need to call this method directly, as it will be called
@@ -76,7 +75,7 @@ pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     /// is dropped.
     ///
     /// This call is idempotent and is a no-op for already unsubscribed shards.
-    fn unsubscribe(&self, shard: &ShardId);
+    fn unsubscribe(&self, shard_id: &ShardId);
 }
 
 /// The receive-side client to Persist PubSub.
@@ -334,7 +333,7 @@ impl GrpcPubSubSender {
         })
     }
 
-    fn subscribe_locked(&self, shard: &ShardId) {
+    fn subscribe_locked(&self, shard_id: &ShardId) {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("failed to get millis since epoch")
@@ -342,7 +341,7 @@ impl GrpcPubSubSender {
         let msg = ProtoPubSubMessage {
             timestamp: now.to_le_bytes().to_vec(),
             message: Some(proto_pub_sub_message::Message::Subscribe(ProtoSubscribe {
-                shard: shard.to_string(),
+                shard_id: shard_id.into_proto(),
             })),
         };
         let size = msg.encoded_len();
@@ -351,18 +350,18 @@ impl GrpcPubSubSender {
             Ok(_) => {
                 metrics.succeeded.inc();
                 metrics.bytes_sent.inc_by(u64::cast_from(size));
-                info!("subscribed to {}", shard);
+                info!("subscribed to {}", shard_id);
             }
             Err(err) => {
                 metrics.failed.inc();
-                error!("error subscribing to {}: {}", shard, err);
+                error!("error subscribing to {}: {}", shard_id, err);
             }
         }
     }
 }
 
 impl PubSubSender for GrpcPubSubSender {
-    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
+    fn push_diff(&self, shard_id: &ShardId, diff: &VersionedData) {
         let seqno = diff.seqno.clone();
         let diff = ProtoPushDiff {
             shard_id: shard_id.into_proto(),
@@ -407,7 +406,7 @@ impl PubSubSender for GrpcPubSubSender {
         let pubsub_sender = Arc::clone(&self);
         let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
         let token = Arc::new(ShardSubscriptionToken {
-            shard_id: shard_id.clone(),
+            shard_id: *shard_id,
             pubsub_sender,
         });
         assert!(subscribes
@@ -433,7 +432,7 @@ impl PubSubSender for GrpcPubSubSender {
             timestamp: now.to_le_bytes().to_vec(),
             message: Some(proto_pub_sub_message::Message::Unsubscribe(
                 ProtoUnsubscribe {
-                    shard: shard.to_string(),
+                    shard_id: shard.into_proto(),
                 },
             )),
         };
@@ -470,14 +469,14 @@ impl MetricsPubSubLocalSender {
 }
 
 impl PubSubSender for MetricsPubSubLocalSender {
-    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
+    fn push_diff(&self, shard_id: &ShardId, diff: &VersionedData) {
         self.metrics
             .pubsub_client
             .sender
             .push
             .bytes_sent
             .inc_by(u64::cast_from(diff.data.len()));
-        self.pubsub_sender.push(shard_id, diff);
+        self.pubsub_sender.push_diff(shard_id, diff);
         self.metrics.pubsub_client.sender.push.succeeded.inc();
     }
 
