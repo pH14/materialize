@@ -58,7 +58,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             info!("server ded");
         }
         Role::Writer => {
-            let (sender, _receiver) = GrpcPubSubClient::connect(
+            let connection = GrpcPubSubClient::connect(
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "writer".to_string(),
@@ -72,7 +72,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             let mut i = 0;
             loop {
                 info!("writing");
-                sender.push_diff(
+                connection.sender.push_diff(
                     &shard_id,
                     &VersionedData {
                         seqno: SeqNo(i),
@@ -84,7 +84,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             }
         }
         Role::Reader => {
-            let (sender, mut receiver) = GrpcPubSubClient::connect(
+            let mut connection = GrpcPubSubClient::connect(
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "reader".to_string(),
@@ -95,8 +95,8 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                 )),
             );
 
-            let _token = sender.subscribe(&shard_id);
-            while let Some(message) = receiver.next().await {
+            let _token = connection.sender.subscribe(&shard_id);
+            while let Some(message) = connection.receiver.next().await {
                 info!("client res: {:?}", message);
             }
             info!("stream to client ded");

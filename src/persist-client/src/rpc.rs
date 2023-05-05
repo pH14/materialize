@@ -43,17 +43,23 @@ use crate::ShardId;
 /// WIP: Persist PubSub
 pub trait PersistPubSubClient {
     /// Receive handles with which to push and subscribe to diffs.
-    fn connect(
-        config: PersistPubSubClientConfig,
-        metrics: Arc<Metrics>,
-    ) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>);
+    fn connect(config: PersistPubSubClientConfig, metrics: Arc<Metrics>) -> PubSubClientConnection;
 }
 
-// WIP: thread this everywhere
+/// Wrapper type for a matching [PubSubSender] and [PubSubReceiver] client pair.
 #[derive(Debug)]
 pub struct PubSubClientConnection {
+    /// The sender client to Persist PubSub.
     pub sender: Arc<dyn PubSubSender>,
+    /// The receiver client to Persist PubSub.
     pub receiver: Box<dyn PubSubReceiver>,
+}
+
+impl PubSubClientConnection {
+    /// Creates a new [PubSubClientConnection] from a matching [PubSubSender] and [PubSubReceiver].
+    pub fn new(sender: Arc<dyn PubSubSender>, receiver: Box<dyn PubSubReceiver>) -> Self {
+        Self { sender, receiver }
+    }
 }
 
 /// The send-side client to Persist PubSub, responsible for issuing
@@ -125,7 +131,7 @@ impl PersistGrpcPubSubServer {
         PersistGrpcPubSubServer { service }
     }
 
-    pub fn new_direct_client(&self) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
+    pub fn new_direct_client(&self) -> PubSubClientConnection {
         self.service.new_direct_client()
     }
 
@@ -151,10 +157,7 @@ pub struct PersistPubSubClientConfig {
 pub struct GrpcPubSubClient;
 
 impl PersistPubSubClient for GrpcPubSubClient {
-    fn connect(
-        config: PersistPubSubClientConfig,
-        metrics: Arc<Metrics>,
-    ) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
+    fn connect(config: PersistPubSubClientConfig, metrics: Arc<Metrics>) -> PubSubClientConnection {
         // WIP: we use a broadcast so the Sender does not need to be replaced if the underlying connection is swapped out
         // drop the initial receiver... we'll create receivers on-demand from our sender in our reconnection loop
         // we should only ever have 1 receiver open at a time
@@ -252,13 +255,15 @@ impl PersistPubSubClient for GrpcPubSubClient {
             }
         });
 
-        (
-            pubsub_sender,
-            Box::new(ReceiverStream::new(receiver_output)),
-        )
+        PubSubClientConnection {
+            sender: pubsub_sender,
+            receiver: Box::new(ReceiverStream::new(receiver_output)),
+        }
     }
 }
 
+/// Spawns a Tokio task that reads a [PubSubReceiver], applying diffs to
+/// the [StateCache].
 pub(crate) fn subscribe_state_cache_to_pubsub(
     cache: Arc<StateCache>,
     mut pubsub_receiver: Box<dyn PubSubReceiver>,
@@ -272,9 +277,9 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
                 Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
                     info!("received diff: {:?}", diff);
                     cache.metrics.pubsub_client.receiver.push_received.inc();
-                    let shard_id = diff.shard_id.into_rust().expect("WIP");
+                    let shard_id = diff.shard_id.into_rust().expect("valid shard id");
                     let diff = VersionedData {
-                        seqno: diff.seqno.into_rust().expect("WIP"),
+                        seqno: diff.seqno.into_rust().expect("valid SeqNo"),
                         data: diff.diff,
                     };
                     debug!(

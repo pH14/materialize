@@ -32,7 +32,10 @@ use mz_persist::location::VersionedData;
 use mz_proto::{ProtoType, RustType};
 
 use crate::internal::metrics::PubSubServerMetrics;
-use crate::rpc::{PubSubReceiver, PubSubSender, ShardSubscriptionToken, PERSIST_PUBSUB_CALLER_KEY};
+use crate::rpc::{
+    PubSubClientConnection, PubSubReceiver, PubSubSender, ShardSubscriptionToken,
+    PERSIST_PUBSUB_CALLER_KEY,
+};
 use crate::ShardId;
 
 include!(concat!(
@@ -283,16 +286,17 @@ impl PersistService {
         }
     }
 
-    pub fn new_direct_client(&self) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
+    pub fn new_direct_client(&self) -> PubSubClientConnection {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let sender: Arc<dyn PubSubSender> = Arc::new(Arc::clone(&self.state).new_connection(tx));
-        (
+
+        PubSubClientConnection {
             sender,
-            Box::new(
+            receiver: Box::new(
                 UnboundedReceiverStream::new(rx)
                     .filter_map(|x| Some(x.expect("cannot receive grpc errors locally"))),
             ),
-        )
+        }
     }
 }
 

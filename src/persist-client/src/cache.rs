@@ -38,7 +38,10 @@ use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus, ShardMetrics};
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
-use crate::rpc::{PersistPubSubClient, PubSubReceiver, PubSubSender, ShardSubscriptionToken};
+use crate::rpc::{
+    PersistPubSubClient, PubSubClientConnection, PubSubReceiver, PubSubSender,
+    ShardSubscriptionToken,
+};
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
@@ -74,15 +77,12 @@ impl PersistClientCache {
     /// Returns a new [PersistClientCache].
     pub fn new<F>(cfg: PersistConfig, registry: &MetricsRegistry, pubsub: F) -> Self
     where
-        F: FnOnce(
-            &PersistConfig,
-            Arc<Metrics>,
-        ) -> Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>,
+        F: FnOnce(&PersistConfig, Arc<Metrics>) -> Option<PubSubClientConnection>,
     {
         let metrics = Arc::new(Metrics::new(&cfg, registry));
         let (pubsub_sender, pubsub_receiver) = match pubsub(&cfg, Arc::clone(&metrics)) {
             None => (None, None),
-            Some((sender, receiver)) => (Some(sender), Some(receiver)),
+            Some(connection) => (Some(connection.sender), Some(connection.receiver)),
         };
 
         let state_cache = StateCache::new(&cfg, Arc::clone(&metrics), pubsub_sender.clone());
@@ -92,6 +92,7 @@ impl PersistClientCache {
                 pubsub_receiver,
             ))
         } else {
+            metrics.pubsub_client.receiver.connected.set(0);
             None
         };
 
