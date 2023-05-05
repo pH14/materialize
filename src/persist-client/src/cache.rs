@@ -38,10 +38,7 @@ use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus, ShardMetrics};
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
-use crate::rpc::{
-    PersistPubSubClient, PubSubClientConnection, PubSubReceiver, PubSubSender,
-    ShardSubscriptionToken,
-};
+use crate::rpc::{PubSubClientConnection, PubSubSender, ShardSubscriptionToken};
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.

@@ -748,7 +748,7 @@ mod tests {
         }
     }
 
-    pub async fn new_test_client_cache() -> PersistClientCache {
+    pub fn new_test_client_cache() -> PersistClientCache {
         // Configure an aggressively small blob_target_size so we get some
         // amount of coverage of that in tests. Similarly, for max_outstanding.
         let mut cache = PersistClientCache::new_no_metrics();

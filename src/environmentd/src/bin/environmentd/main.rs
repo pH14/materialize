@@ -99,13 +99,12 @@ use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
 use mz_persist_client::rpc::{
-    GrpcPubSubClient, MetricsPubSubLocalSender, PersistGrpcPubSubServer, PersistPubSubClient,
-    PersistPubSubClientConfig, PubSubClientConnection, PubSubReceiver, PubSubSender,
+    MetricsPubSubLocalSender, PersistGrpcPubSubServer, PersistPubSubClient, PubSubClientConnection,
+    PubSubReceiver, PubSubSender,
 };
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
 use prometheus::IntGauge;
-use tokio::runtime;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
