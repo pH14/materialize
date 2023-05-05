@@ -99,8 +99,8 @@ use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
 use mz_persist_client::rpc::{
-    MetricsPubSubConnection, PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig,
-    PersistPubSubServer, PubSubReceiver, PubSubSender,
+    GrpcPubSub, MetricsPubSubConnection, PersistGrpcPubSubServer, PersistPubSub,
+    PersistPubSubClientConfig, PubSubReceiver, PubSubSender,
 };
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
@@ -739,8 +739,8 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         args.internal_persist_pubsub_listen_addr.port()
     );
     eprintln!("persist_push_addr {}", persist_pubsub_addr);
-    let persist_push_server = PersistPubSubServer::new(&metrics_registry);
-    let persist_pubsub_client = persist_push_server.local_connection();
+    let persist_push_server = PersistGrpcPubSubServer::new(&metrics_registry);
+    let persist_pubsub_client = persist_push_server.new_direct_client();
     let _server = runtime.spawn_named(|| "persist::push::server", async move {
         let span = tracing::info_span!("persist::push::server");
         let _guard = span.enter();

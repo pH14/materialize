@@ -54,10 +54,6 @@ pub trait PersistPubSub {
     async fn connect(
         config: PersistPubSubClientConfig,
         metrics: Arc<Metrics>,
-        // WIP: do we really want 3 traits here,
-        // Arc<dyn PubSubPush>
-        // Box<dyn PubSubSubscriber> - make subscribe/unsubscribe take &mut self to serialize
-        // Box<dyn PubSubReceiver>
     ) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>);
 }
 
@@ -98,19 +94,19 @@ impl Drop for PubSubToken {
 }
 
 #[derive(Debug)]
-pub struct PersistPubSubServer {
+pub struct PersistGrpcPubSubServer {
     service: PersistService,
 }
 
-impl PersistPubSubServer {
+impl PersistGrpcPubSubServer {
     pub fn new(metrics_registry: &MetricsRegistry) -> Self {
         let metrics = PubSubServerMetrics::new(metrics_registry);
         let service = PersistService::new(metrics);
-        PersistPubSubServer { service }
+        PersistGrpcPubSubServer { service }
     }
 
-    pub fn local_connection(&self) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
-        self.service.local_connection()
+    pub fn new_direct_client(&self) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
+        self.service.new_direct_client()
     }
 
     pub async fn serve(self, listen_addr: SocketAddr) -> Result<(), anyhow::Error> {
@@ -123,13 +119,13 @@ impl PersistPubSubServer {
 }
 
 #[derive(Debug)]
-struct PubSubSenderClient {
+struct GrpcPubSubSender {
     metrics: Arc<Metrics>,
     requests: tokio::sync::broadcast::Sender<ProtoPubSubMessage>,
     subscribes: Arc<Mutex<BTreeMap<ShardId, Weak<PubSubToken>>>>,
 }
 
-impl PubSubSenderClient {
+impl GrpcPubSubSender {
     fn reconnect(&self) {
         let mut subscribes = self.subscribes.lock().expect("lock");
         subscribes.retain(|shard_id, token| {
@@ -170,7 +166,7 @@ impl PubSubSenderClient {
     }
 }
 
-impl PubSubSender for PubSubSenderClient {
+impl PubSubSender for GrpcPubSubSender {
     fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
         let seqno = diff.seqno.clone();
         let diff = ProtoPushDiff {
@@ -272,10 +268,10 @@ pub struct PersistPubSubClientConfig {
 
 /// A [PersistPubSub] implementation backed by gRPC.
 #[derive(Debug)]
-pub struct PersistPubSubClient;
+pub struct GrpcPubSub;
 
 #[async_trait]
-impl PersistPubSub for PersistPubSubClient {
+impl PersistPubSub for GrpcPubSub {
     async fn connect(
         config: PersistPubSubClientConfig,
         metrics: Arc<Metrics>,
@@ -285,7 +281,7 @@ impl PersistPubSub for PersistPubSubClient {
         // we should only ever have 1 receiver open at a time
         let (rpc_requests, _) = tokio::sync::broadcast::channel(100);
 
-        let pubsub_sender = Arc::new(PubSubSenderClient {
+        let pubsub_sender = Arc::new(GrpcPubSubSender {
             metrics: Arc::clone(&metrics),
             requests: rpc_requests.clone(),
             subscribes: Default::default(),

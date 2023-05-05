@@ -42,8 +42,7 @@ use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsens
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
 use crate::rpc::{
-    PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig, PubSubReceiver, PubSubSender,
-    PubSubToken,
+    GrpcPubSub, PersistPubSub, PersistPubSubClientConfig, PubSubReceiver, PubSubSender, PubSubToken,
 };
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 

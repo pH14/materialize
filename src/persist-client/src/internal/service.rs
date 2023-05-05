@@ -248,7 +248,7 @@ impl PersistService {
         }
     }
 
-    pub fn local_connection(&self) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
+    pub fn new_direct_client(&self) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let sender: Arc<dyn PubSubSender> = Arc::new(Arc::clone(&self.state).new_connection(tx));
         (

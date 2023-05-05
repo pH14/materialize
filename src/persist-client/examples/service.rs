@@ -23,7 +23,7 @@ use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::metrics::Metrics;
 use mz_persist_client::rpc::{
-    PersistPubSub, PersistPubSubClient, PersistPubSubClientConfig, PersistPubSubServer,
+    GrpcPubSub, PersistGrpcPubSubServer, PersistPubSub, PersistPubSubClientConfig,
 };
 use mz_persist_client::ShardId;
 
@@ -52,13 +52,13 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
         Role::Server => {
             let _guard = span.enter();
             info!("listening on {}", args.listen_addr);
-            PersistPubSubServer::new(&MetricsRegistry::new())
+            PersistGrpcPubSubServer::new(&MetricsRegistry::new())
                 .serve(args.listen_addr.clone())
                 .await;
             info!("server ded");
         }
         Role::Writer => {
-            let (sender, _receiver) = PersistPubSubClient::connect(
+            let (sender, _receiver) = GrpcPubSub::connect(
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "writer".to_string(),
@@ -85,7 +85,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             }
         }
         Role::Reader => {
-            let (sender, mut receiver) = PersistPubSubClient::connect(
+            let (sender, mut receiver) = GrpcPubSub::connect(
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "reader".to_string(),
