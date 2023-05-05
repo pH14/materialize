@@ -857,7 +857,7 @@ impl RunnerInner {
         let persist_clients = PersistClientCache::new(
             PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
             &metrics_registry,
-            None,
+            |_, _| None,
         )
         .await;
         let persist_clients = Arc::new(persist_clients);

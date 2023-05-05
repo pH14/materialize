@@ -91,7 +91,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Error};
+use anyhow::{bail, Context};
 use clap::{ArgEnum, Parser};
 use fail::FailScenario;
 use http::header::HeaderValue;
@@ -105,6 +105,7 @@ use mz_persist_client::rpc::{
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
 use prometheus::IntGauge;
+use tokio::runtime;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -756,22 +757,18 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         tracing::info!("persist push server exited {:?}", res);
     });
 
-    // WIP: should succeed even on failure
-    // WIP: this blocks start up :(
-    // WIP: timeout
-    // this server is hosted locally, so we'd expect the
-    // connection establishment time to be very quick
-    // WIP: log error if failed
-    let persist_clients = runtime.block_on(PersistClientCache::new(
-        PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
-        &metrics_registry,
-        |_, metrics| async {
-            let (sender, receiver) = persist_pubsub_client;
-            let sender: Arc<dyn PubSubSender> =
-                Arc::new(MetricsPubSubLocalSender::new(sender, metrics));
-            Some((sender, receiver))
-        },
-    ));
+    let persist_clients = runtime.block_on(async {
+        PersistClientCache::new(
+            PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
+            &metrics_registry,
+            |_, metrics| {
+                let (sender, receiver) = persist_pubsub_client;
+                let sender: Arc<dyn PubSubSender> =
+                    Arc::new(MetricsPubSubLocalSender::new(sender, metrics));
+                Some((sender, receiver))
+            },
+        )
+    });
 
     let persist_clients = Arc::new(persist_clients);
     let orchestrator = Arc::new(TracingOrchestrator::new(orchestrator, args.tracing.clone()));

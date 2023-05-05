@@ -206,7 +206,7 @@ where
             let persist_cache = mz_persist_client::cache::PersistClientCache::new(
                 persistcfg,
                 &metrics_registry,
-                None,
+                |_, _| None,
             );
 
             // create a client for use with the `until` closure later.

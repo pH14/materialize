@@ -19,21 +19,18 @@ use std::time::{Duration, Instant};
 
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
-use futures::StreamExt;
 use timely::progress::Timestamp;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::{debug, instrument};
 
 use mz_ore::metrics::MetricsRegistry;
-use mz_ore::now::SYSTEM_TIME;
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::{
     Blob, Consensus, ExternalError, VersionedData, BLOB_GET_LIVENESS_KEY,
     CONSENSUS_HEAD_LIVENESS_KEY,
 };
 use mz_persist_types::{Codec, Codec64};
-use mz_proto::ProtoType;
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
@@ -41,10 +38,7 @@ use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus, ShardMetrics};
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
-use crate::rpc::{
-    GrpcPubSubClient, PersistPubSubClient, PersistPubSubClientConfig, PubSubReceiver, PubSubSender,
-    ShardSubscriptionToken,
-};
+use crate::rpc::{PersistPubSubClient, PubSubReceiver, PubSubSender, ShardSubscriptionToken};
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
@@ -78,13 +72,15 @@ impl Drop for RttLatencyTask {
 
 impl PersistClientCache {
     /// Returns a new [PersistClientCache].
-    pub async fn new<F, Fut>(cfg: PersistConfig, registry: &MetricsRegistry, pubsub: F) -> Self
+    pub fn new<F>(cfg: PersistConfig, registry: &MetricsRegistry, pubsub: F) -> Self
     where
-        F: FnOnce(&PersistConfig, Arc<Metrics>) -> Fut,
-        Fut: Future<Output = Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>>,
+        F: FnOnce(
+            &PersistConfig,
+            Arc<Metrics>,
+        ) -> Option<(Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>)>,
     {
         let metrics = Arc::new(Metrics::new(&cfg, registry));
-        let (pubsub_sender, pubsub_receiver) = match pubsub(&cfg, Arc::clone(&metrics)).await {
+        let (pubsub_sender, pubsub_receiver) = match pubsub(&cfg, Arc::clone(&metrics)) {
             None => (None, None),
             Some((sender, receiver)) => (Some(sender), Some(receiver)),
         };
@@ -113,13 +109,12 @@ impl PersistClientCache {
 
     /// A test helper that returns a [PersistClientCache] disconnected from
     /// metrics.
-    pub async fn new_no_metrics() -> Self {
+    pub fn new_no_metrics() -> Self {
         Self::new(
             PersistConfig::new_for_tests(),
             &MetricsRegistry::new(),
-            |_, _| async { None },
+            |_, _| None,
         )
-        .await
     }
 
     /// Returns the [PersistConfig] being used by this cache.
@@ -652,9 +647,8 @@ mod tests {
         let cache = PersistClientCache::new(
             PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone()),
             &MetricsRegistry::new(),
-            None,
-        )
-        .await;
+            |_, _| None,
+        );
         assert_eq!(cache.blob_by_uri.lock().await.len(), 0);
         assert_eq!(cache.consensus_by_uri.lock().await.len(), 0);
 

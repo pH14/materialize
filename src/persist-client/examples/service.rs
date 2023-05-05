@@ -67,8 +67,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                     &PersistConfig::new_for_tests(),
                     &MetricsRegistry::new(),
                 )),
-            )
-            .await;
+            );
 
             let mut i = 0;
             loop {
@@ -94,8 +93,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                     &PersistConfig::new_for_tests(),
                     &MetricsRegistry::new(),
                 )),
-            )
-            .await;
+            );
 
             let _token = sender.subscribe(&shard_id);
             while let Some(message) = receiver.next().await {

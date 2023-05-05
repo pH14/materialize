@@ -7,10 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-#![allow(missing_docs, dead_code)] // WIP
-
 use std::collections::BTreeMap;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
@@ -35,27 +33,25 @@ use mz_proto::{ProtoType, RustType};
 use crate::cache::StateCache;
 use crate::internal::metrics::PubSubServerMetrics;
 use crate::internal::service::proto_persist_pub_sub_client::ProtoPersistPubSubClient;
-use crate::internal::service::proto_persist_pub_sub_server::{
-    ProtoPersistPubSub, ProtoPersistPubSubServer,
-};
+use crate::internal::service::proto_persist_pub_sub_server::ProtoPersistPubSubServer;
 use crate::internal::service::{
     proto_pub_sub_message, PersistService, ProtoPubSubMessage, ProtoPushDiff, ProtoSubscribe,
-    ProtoUnsubscribe, PubSubConnection,
+    ProtoUnsubscribe,
 };
 use crate::metrics::Metrics;
 use crate::ShardId;
 
 /// WIP: Persist PubSub
-#[async_trait]
 pub trait PersistPubSubClient {
     /// Receive handles with which to push and subscribe to diffs.
-    async fn connect(
+    fn connect(
         config: PersistPubSubClientConfig,
         metrics: Arc<Metrics>,
     ) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>);
 }
 
 // WIP: thread this everywhere
+#[derive(Debug)]
 pub struct PubSubClientConnection {
     pub sender: Arc<dyn PubSubSender>,
     pub receiver: Box<dyn PubSubReceiver>,
@@ -87,9 +83,15 @@ pub trait PubSubSender: std::fmt::Debug + Send + Sync {
 ///
 /// Returns diffs (and maybe in the future, blobs) for any shards subscribed to
 /// by the corresponding `PubSubSender`.
-pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
+pub trait PubSubReceiver:
+    Stream<Item = ProtoPubSubMessage> + Send + Unpin + std::fmt::Debug
+{
+}
 
-impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
+impl<T> PubSubReceiver for T where
+    T: Stream<Item = ProtoPubSubMessage> + Send + Unpin + std::fmt::Debug
+{
+}
 
 /// A token corresponding to a subscription to diffs for a particular shard.
 ///
@@ -149,9 +151,8 @@ pub struct PersistPubSubClientConfig {
 #[derive(Debug)]
 pub struct GrpcPubSubClient;
 
-#[async_trait]
 impl PersistPubSubClient for GrpcPubSubClient {
-    async fn connect(
+    fn connect(
         config: PersistPubSubClientConfig,
         metrics: Arc<Metrics>,
     ) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>) {

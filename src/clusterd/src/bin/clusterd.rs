@@ -271,20 +271,17 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
         .ok()
         .or_else(|| args.tracing.log_prefix.clone())
         .unwrap_or_default();
-    let persist_clients = Arc::new(
-        PersistClientCache::new(
-            PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
-            &metrics_registry,
-            |_persist_cfg, metrics| async {
-                let cfg = PersistPubSubClientConfig {
-                    addr: args.persist_pubsub_addr,
-                    caller_id: pubsub_caller_id,
-                };
-                Some(GrpcPubSubClient::connect(cfg, metrics).await)
-            },
-        )
-        .await,
-    );
+    let persist_clients = Arc::new(PersistClientCache::new(
+        PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
+        &metrics_registry,
+        |_persist_cfg, metrics| {
+            let cfg = PersistPubSubClientConfig {
+                addr: args.persist_pubsub_addr,
+                caller_id: pubsub_caller_id,
+            };
+            Some(GrpcPubSubClient::connect(cfg, metrics))
+        },
+    ));
 
     // Start storage server.
     let (_storage_server, storage_client) = mz_storage::serve(

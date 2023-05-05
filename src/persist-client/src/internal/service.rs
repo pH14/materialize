@@ -7,13 +7,12 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-#![allow(missing_docs, dead_code)] // WIP
 #![allow(clippy::clone_on_ref_ptr, clippy::disallowed_methods)] // Generated code does this
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -71,7 +70,7 @@ impl PubSubState {
 
         self.metrics.active_connections.inc();
         PubSubConnection {
-            connection_id: self.connection_id_counter.fetch_add(1, Ordering::SeqCst),
+            connection_id,
             notifier,
             state: self,
         }

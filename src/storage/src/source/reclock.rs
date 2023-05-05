@@ -640,7 +640,7 @@ mod tests {
         Arc::new(PersistClientCache::new(
             persistcfg,
             &MetricsRegistry::new(),
-            None,
+            |_, _| None,
         ))
     });
 
