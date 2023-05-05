@@ -42,7 +42,8 @@ use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsens
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
 use crate::rpc::{
-    GrpcPubSub, PersistPubSub, PersistPubSubClientConfig, PubSubReceiver, PubSubSender, PubSubToken,
+    GrpcPubSubClient, PersistPubSubClient, PersistPubSubClientConfig, PubSubReceiver, PubSubSender,
+    ShardSubscriptionToken,
 };
 use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 
@@ -546,7 +547,7 @@ pub(crate) struct LockingTypedState<K, V, T, D> {
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
     shard_metrics: Arc<ShardMetrics>,
-    _subscription_token: Option<Arc<PubSubToken>>,
+    _subscription_token: Option<Arc<ShardSubscriptionToken>>,
 }
 
 impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {

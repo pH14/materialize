@@ -45,11 +45,9 @@ use crate::internal::service::{
 use crate::metrics::Metrics;
 use crate::ShardId;
 
-// WIP: make versions that wrap connection details so we can call into them, but connect later non-blocking like
-
-/// WIP
+/// WIP: Persist PubSub
 #[async_trait]
-pub trait PersistPubSub {
+pub trait PersistPubSubClient {
     /// Receive handles with which to push and subscribe to diffs.
     async fn connect(
         config: PersistPubSubClientConfig,
@@ -57,33 +55,53 @@ pub trait PersistPubSub {
     ) -> (Arc<dyn PubSubSender>, Box<dyn PubSubReceiver>);
 }
 
-/// The send-side client to Persist PubSub.
+// WIP: thread this everywhere
+pub struct PubSubClientConnection {
+    pub sender: Arc<dyn PubSubSender>,
+    pub receiver: Box<dyn PubSubReceiver>,
+}
+
+/// The send-side client to Persist PubSub, responsible for issuing
+/// commands to the PubSub service.
 pub trait PubSubSender: std::fmt::Debug + Send + Sync {
     /// Push a diff to subscribers.
     fn push(&self, shard_id: &ShardId, diff: &VersionedData);
 
     /// Subscribe the corresponding [PubSubReceiver] to diffs for the given shard.
-    /// This call is idempotent and is a no-op for already subscribed shards.
-    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<PubSubToken>;
+    /// Returns a token that, when dropped, will unsubscribe the client from the
+    /// shard.
+    ///
+    /// This call is idempotent and is a no-op for an already subscribed shard.
+    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<ShardSubscriptionToken>;
 
-    /// Unsubscribe the corresponding [PubSubReceiver] to diffs for the given shard.
+    /// Unsubscribe the corresponding [PubSubReceiver] from diffs for the given shard.
+    /// Users should not need to call this method directly, as it will be called
+    /// automatically when the [ShardSubscriptionToken] returned by [PubSubSender::subscribe]
+    /// is dropped.
+    ///
     /// This call is idempotent and is a no-op for already unsubscribed shards.
-    /// WIP: not intended to be called explicitly, but needed for the token to work
     fn unsubscribe(&self, shard: &ShardId);
 }
 
 /// The receive-side client to Persist PubSub.
+///
+/// Returns diffs (and maybe in the future, blobs) for any shards subscribed to
+/// by the corresponding `PubSubSender`.
 pub trait PubSubReceiver: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
 
 impl<T> PubSubReceiver for T where T: Stream<Item = ProtoPubSubMessage> + Send + Unpin {}
 
+/// A token corresponding to a subscription to diffs for a particular shard.
+///
+/// When dropped, the client that originated the token will be unsubscribed
+/// from further diffs to the shard.
 #[derive(Debug)]
-pub struct PubSubToken {
+pub struct ShardSubscriptionToken {
     pub(crate) shard_id: ShardId,
     pub(crate) pubsub_sender: Arc<dyn PubSubSender>,
 }
 
-impl Drop for PubSubToken {
+impl Drop for ShardSubscriptionToken {
     fn drop(&mut self) {
         info!(
             "unsubscribing {} due to dropped pubsub token",
@@ -93,6 +111,7 @@ impl Drop for PubSubToken {
     }
 }
 
+/// A gRPC-based implementation of a Persist PubSub server.
 #[derive(Debug)]
 pub struct PersistGrpcPubSubServer {
     service: PersistService,
@@ -118,146 +137,6 @@ impl PersistGrpcPubSubServer {
     }
 }
 
-#[derive(Debug)]
-struct GrpcPubSubSender {
-    metrics: Arc<Metrics>,
-    requests: tokio::sync::broadcast::Sender<ProtoPubSubMessage>,
-    subscribes: Arc<Mutex<BTreeMap<ShardId, Weak<PubSubToken>>>>,
-}
-
-impl GrpcPubSubSender {
-    fn reconnect(&self) {
-        let mut subscribes = self.subscribes.lock().expect("lock");
-        subscribes.retain(|shard_id, token| {
-            if token.upgrade().is_none() {
-                false
-            } else {
-                info!("reconnecting to: {}", shard_id);
-                self.subscribe_locked(shard_id);
-                true
-            }
-        })
-    }
-
-    fn subscribe_locked(&self, shard: &ShardId) {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("failed to get millis since epoch")
-            .as_micros();
-        let msg = ProtoPubSubMessage {
-            timestamp: now.to_le_bytes().to_vec(),
-            message: Some(proto_pub_sub_message::Message::Subscribe(ProtoSubscribe {
-                shard: shard.to_string(),
-            })),
-        };
-        let size = msg.encoded_len();
-        let metrics = &self.metrics.pubsub_client.sender.subscribe;
-        match self.requests.send(msg) {
-            Ok(_) => {
-                metrics.succeeded.inc();
-                metrics.bytes_sent.inc_by(u64::cast_from(size));
-                info!("subscribed to {}", shard);
-            }
-            Err(err) => {
-                metrics.failed.inc();
-                error!("error subscribing to {}: {}", shard, err);
-            }
-        }
-    }
-}
-
-impl PubSubSender for GrpcPubSubSender {
-    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
-        let seqno = diff.seqno.clone();
-        let diff = ProtoPushDiff {
-            shard_id: shard_id.into_proto(),
-            seqno: diff.seqno.into_proto(),
-            diff: diff.data.clone(),
-        };
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("failed to get millis since epoch")
-            .as_micros();
-        let msg = ProtoPubSubMessage {
-            timestamp: now.to_le_bytes().to_vec(),
-            message: Some(proto_pub_sub_message::Message::PushDiff(diff)),
-        };
-        let size = msg.encoded_len();
-        let metrics = &self.metrics.pubsub_client.sender.push;
-        match self.requests.send(msg) {
-            Ok(i) => {
-                metrics.succeeded.inc();
-                metrics.bytes_sent.inc_by(u64::cast_from(size));
-                info!("pushed to {} listeners", i);
-                debug!("pushed ({}, {})", shard_id, seqno);
-            }
-            Err(err) => {
-                metrics.failed.inc();
-                error!("{}", err);
-            }
-        }
-    }
-
-    fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<PubSubToken> {
-        info!("creating new subscribe token");
-        let mut subscribes = self.subscribes.lock().expect("lock");
-        if let Some(token) = subscribes.get(shard_id) {
-            match token.upgrade() {
-                None => assert!(subscribes.remove(shard_id).is_some()),
-                Some(token) => {
-                    return Arc::clone(&token);
-                }
-            }
-        }
-        let pubsub_sender = Arc::clone(&self);
-        let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
-        let token = Arc::new(PubSubToken {
-            shard_id: shard_id.clone(),
-            pubsub_sender,
-        });
-        assert!(subscribes
-            .insert(*shard_id, Arc::downgrade(&token))
-            .is_none());
-        self.subscribe_locked(shard_id);
-        token
-    }
-
-    fn unsubscribe(&self, shard: &ShardId) {
-        let mut subscribes = self.subscribes.lock().expect("lock");
-        let removed_token = subscribes.remove(shard);
-
-        if let Some(removed_token) = removed_token {
-            assert!(removed_token.upgrade().is_none());
-        }
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("failed to get millis since epoch")
-            .as_micros();
-        let msg = ProtoPubSubMessage {
-            timestamp: now.to_le_bytes().to_vec(),
-            message: Some(proto_pub_sub_message::Message::Unsubscribe(
-                ProtoUnsubscribe {
-                    shard: shard.to_string(),
-                },
-            )),
-        };
-        let size = msg.encoded_len();
-        let metrics = &self.metrics.pubsub_client.sender.unsubscribe;
-        match self.requests.send(msg) {
-            Ok(_) => {
-                metrics.succeeded.inc();
-                metrics.bytes_sent.inc_by(u64::cast_from(size));
-                debug!("unsubscribed from {}", shard);
-            }
-            Err(err) => {
-                metrics.failed.inc();
-                error!("error unsubscribing from {}: {}", shard, err);
-            }
-        }
-    }
-}
-
 pub const PERSIST_PUBSUB_CALLER_KEY: &str = "persist-pubsub-caller-id";
 
 #[derive(Debug)]
@@ -266,12 +145,12 @@ pub struct PersistPubSubClientConfig {
     pub caller_id: String,
 }
 
-/// A [PersistPubSub] implementation backed by gRPC.
+/// A [PersistPubSubClient] implementation backed by gRPC.
 #[derive(Debug)]
-pub struct GrpcPubSub;
+pub struct GrpcPubSubClient;
 
 #[async_trait]
-impl PersistPubSub for GrpcPubSub {
+impl PersistPubSubClient for GrpcPubSubClient {
     async fn connect(
         config: PersistPubSubClientConfig,
         metrics: Arc<Metrics>,
@@ -432,14 +311,155 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
     })
 }
 
+/// An internal, gRPC-backed implementation of [PubSubSender].
+#[derive(Debug)]
+struct GrpcPubSubSender {
+    metrics: Arc<Metrics>,
+    requests: tokio::sync::broadcast::Sender<ProtoPubSubMessage>,
+    subscribes: Arc<Mutex<BTreeMap<ShardId, Weak<ShardSubscriptionToken>>>>,
+}
+
+impl GrpcPubSubSender {
+    fn reconnect(&self) {
+        let mut subscribes = self.subscribes.lock().expect("lock");
+        subscribes.retain(|shard_id, token| {
+            if token.upgrade().is_none() {
+                false
+            } else {
+                info!("reconnecting to: {}", shard_id);
+                self.subscribe_locked(shard_id);
+                true
+            }
+        })
+    }
+
+    fn subscribe_locked(&self, shard: &ShardId) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("failed to get millis since epoch")
+            .as_micros();
+        let msg = ProtoPubSubMessage {
+            timestamp: now.to_le_bytes().to_vec(),
+            message: Some(proto_pub_sub_message::Message::Subscribe(ProtoSubscribe {
+                shard: shard.to_string(),
+            })),
+        };
+        let size = msg.encoded_len();
+        let metrics = &self.metrics.pubsub_client.sender.subscribe;
+        match self.requests.send(msg) {
+            Ok(_) => {
+                metrics.succeeded.inc();
+                metrics.bytes_sent.inc_by(u64::cast_from(size));
+                info!("subscribed to {}", shard);
+            }
+            Err(err) => {
+                metrics.failed.inc();
+                error!("error subscribing to {}: {}", shard, err);
+            }
+        }
+    }
+}
+
+impl PubSubSender for GrpcPubSubSender {
+    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
+        let seqno = diff.seqno.clone();
+        let diff = ProtoPushDiff {
+            shard_id: shard_id.into_proto(),
+            seqno: diff.seqno.into_proto(),
+            diff: diff.data.clone(),
+        };
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("failed to get millis since epoch")
+            .as_micros();
+        let msg = ProtoPubSubMessage {
+            timestamp: now.to_le_bytes().to_vec(),
+            message: Some(proto_pub_sub_message::Message::PushDiff(diff)),
+        };
+        let size = msg.encoded_len();
+        let metrics = &self.metrics.pubsub_client.sender.push;
+        match self.requests.send(msg) {
+            Ok(i) => {
+                metrics.succeeded.inc();
+                metrics.bytes_sent.inc_by(u64::cast_from(size));
+                info!("pushed to {} listeners", i);
+                debug!("pushed ({}, {})", shard_id, seqno);
+            }
+            Err(err) => {
+                metrics.failed.inc();
+                error!("{}", err);
+            }
+        }
+    }
+
+    fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<ShardSubscriptionToken> {
+        info!("creating new subscribe token");
+        let mut subscribes = self.subscribes.lock().expect("lock");
+        if let Some(token) = subscribes.get(shard_id) {
+            match token.upgrade() {
+                None => assert!(subscribes.remove(shard_id).is_some()),
+                Some(token) => {
+                    return Arc::clone(&token);
+                }
+            }
+        }
+        let pubsub_sender = Arc::clone(&self);
+        let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
+        let token = Arc::new(ShardSubscriptionToken {
+            shard_id: shard_id.clone(),
+            pubsub_sender,
+        });
+        assert!(subscribes
+            .insert(*shard_id, Arc::downgrade(&token))
+            .is_none());
+        self.subscribe_locked(shard_id);
+        token
+    }
+
+    fn unsubscribe(&self, shard: &ShardId) {
+        let mut subscribes = self.subscribes.lock().expect("lock");
+        let removed_token = subscribes.remove(shard);
+
+        if let Some(removed_token) = removed_token {
+            assert!(removed_token.upgrade().is_none());
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("failed to get millis since epoch")
+            .as_micros();
+        let msg = ProtoPubSubMessage {
+            timestamp: now.to_le_bytes().to_vec(),
+            message: Some(proto_pub_sub_message::Message::Unsubscribe(
+                ProtoUnsubscribe {
+                    shard: shard.to_string(),
+                },
+            )),
+        };
+        let size = msg.encoded_len();
+        let metrics = &self.metrics.pubsub_client.sender.unsubscribe;
+        match self.requests.send(msg) {
+            Ok(_) => {
+                metrics.succeeded.inc();
+                metrics.bytes_sent.inc_by(u64::cast_from(size));
+                debug!("unsubscribed from {}", shard);
+            }
+            Err(err) => {
+                metrics.failed.inc();
+                error!("error unsubscribing from {}: {}", shard, err);
+            }
+        }
+    }
+}
+
 /// WIP: Used to provide client statistics even for a local connection
 #[derive(Debug)]
-pub struct MetricsPubSubConnection {
+pub struct MetricsPubSubLocalSender {
     metrics: Arc<Metrics>,
     pubsub_sender: Arc<dyn PubSubSender>,
 }
 
-impl MetricsPubSubConnection {
+impl MetricsPubSubLocalSender {
     pub fn new(pubsub_sender: Arc<dyn PubSubSender>, metrics: Arc<Metrics>) -> Self {
         Self {
             pubsub_sender,
@@ -448,7 +468,7 @@ impl MetricsPubSubConnection {
     }
 }
 
-impl PubSubSender for MetricsPubSubConnection {
+impl PubSubSender for MetricsPubSubLocalSender {
     fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
         self.metrics
             .pubsub_client
@@ -460,7 +480,7 @@ impl PubSubSender for MetricsPubSubConnection {
         self.metrics.pubsub_client.sender.push.succeeded.inc();
     }
 
-    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<PubSubToken> {
+    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<ShardSubscriptionToken> {
         // WIP: shard vs shard_id
         let token = Arc::clone(&self.pubsub_sender).subscribe(shard);
         self.metrics.pubsub_client.sender.subscribe.succeeded.inc();

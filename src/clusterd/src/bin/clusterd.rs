@@ -81,7 +81,7 @@ use anyhow::Context;
 use axum::routing;
 use fail::FailScenario;
 use futures::future;
-use mz_persist_client::rpc::{GrpcPubSub, PersistPubSub, PersistPubSubClientConfig};
+use mz_persist_client::rpc::{GrpcPubSubClient, PersistPubSubClient, PersistPubSubClientConfig};
 use once_cell::sync::Lazy;
 use tracing::info;
 
@@ -280,7 +280,7 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
                     addr: args.persist_pubsub_addr,
                     caller_id: pubsub_caller_id,
                 };
-                Some(GrpcPubSub::connect(cfg, metrics).await)
+                Some(GrpcPubSubClient::connect(cfg, metrics).await)
             },
         )
         .await,

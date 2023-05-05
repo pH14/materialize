@@ -10,10 +10,10 @@
 #![allow(missing_docs, dead_code)] // WIP
 #![allow(clippy::clone_on_ref_ptr, clippy::disallowed_methods)] // Generated code does this
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -25,14 +25,15 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::metadata::AsciiMetadataKey;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, info_span, warn};
+use tracing::{info, info_span, warn};
 
 use mz_ore::cast::CastFrom;
+use mz_ore::collections::HashSet;
 use mz_persist::location::VersionedData;
 use mz_proto::{ProtoType, RustType};
 
 use crate::internal::metrics::PubSubServerMetrics;
-use crate::rpc::{PubSubReceiver, PubSubSender, PubSubToken, PERSIST_PUBSUB_CALLER_KEY};
+use crate::rpc::{PubSubReceiver, PubSubSender, ShardSubscriptionToken, PERSIST_PUBSUB_CALLER_KEY};
 use crate::ShardId;
 
 include!(concat!(
@@ -40,6 +41,7 @@ include!(concat!(
     "/mz_persist_client.internal.service.rs"
 ));
 
+/// Internal state of a PubSub server implementation.
 #[derive(Debug)]
 pub(crate) struct PubSubState {
     /// Assigns a unique ID to each incoming connection.
@@ -50,6 +52,9 @@ pub(crate) struct PubSubState {
             BTreeMap<String, BTreeMap<usize, UnboundedSender<Result<ProtoPubSubMessage, Status>>>>,
         >,
     >,
+    /// Active connections.
+    connections: Arc<RwLock<HashSet<usize>>>,
+    /// Server-side metrics.
     metrics: Arc<PubSubServerMetrics>,
 }
 
@@ -58,6 +63,12 @@ impl PubSubState {
         self: Arc<Self>,
         notifier: UnboundedSender<Result<ProtoPubSubMessage, Status>>,
     ) -> PubSubConnection {
+        let connection_id = self.connection_id_counter.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut connections = self.connections.write().expect("lock");
+            assert!(connections.insert(connection_id));
+        }
+
         self.metrics.active_connections.inc();
         PubSubConnection {
             connection_id: self.connection_id_counter.fetch_add(1, Ordering::SeqCst),
@@ -67,8 +78,14 @@ impl PubSubState {
     }
 
     fn remove_connection(&self, connection_id: usize) {
-        info!("cleaning up state from: {}", connection_id);
         let now = Instant::now();
+
+        info!("cleaning up state from: {}", connection_id);
+        {
+            let mut connections = self.connections.write().expect("lock");
+            assert!(connections.remove(&connection_id));
+        }
+
         {
             // WIP: is it OK to lock this to probe every shard?
             let mut subscribers = self.shard_subscribers.write().expect("lock poisoned");
@@ -85,6 +102,12 @@ impl PubSubState {
     fn push_diff(&self, connection_id: usize, shard_id: String, data: &VersionedData) {
         let now = Instant::now();
         self.metrics.push_call_count.inc();
+
+        assert!(self
+            .connections
+            .read()
+            .expect("lock")
+            .contains(&connection_id));
 
         let (num_sent, data_size) = {
             let subscribers = self.shard_subscribers.read().expect("lock poisoned");
@@ -147,6 +170,13 @@ impl PubSubState {
     ) {
         let now = Instant::now();
         self.metrics.subscribe_call_count.inc();
+
+        assert!(self
+            .connections
+            .read()
+            .expect("lock")
+            .contains(&connection_id));
+
         // info!("conn {} adding subscription to {}", caller_id, diff.shard);
         {
             let mut subscribed_shards = self.shard_subscribers.write().expect("lock poisoned");
@@ -164,6 +194,12 @@ impl PubSubState {
     fn unsubscribe(&self, connection_id: usize, shard_id: &String) {
         let now = Instant::now();
         self.metrics.unsubscribe_call_count.inc();
+
+        assert!(self
+            .connections
+            .read()
+            .expect("lock")
+            .contains(&connection_id));
         // info!(
         //                     "conn {} removing subscription from {}",
         //                     caller_id, diff.shard
@@ -188,29 +224,6 @@ pub(crate) struct PubSubConnection {
     state: Arc<PubSubState>,
 }
 
-impl PubSubSender for PubSubConnection {
-    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
-        // WIP: fix up the String vs ShardId
-        PubSubConnection::push_diff(self, shard_id.to_string(), diff)
-    }
-
-    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<PubSubToken> {
-        PubSubConnection::subscribe(self.as_ref(), shard.to_string());
-
-        let pubsub_sender = Arc::clone(&self);
-        let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
-
-        Arc::new(PubSubToken {
-            shard_id: shard.clone(),
-            pubsub_sender,
-        })
-    }
-
-    fn unsubscribe(&self, shard: &ShardId) {
-        PubSubConnection::unsubscribe(self, &shard.to_string());
-    }
-}
-
 impl PubSubConnection {
     pub(crate) fn push_diff(&self, shard_id: String, data: &VersionedData) {
         self.state.push_diff(self.connection_id, shard_id, data)
@@ -223,6 +236,29 @@ impl PubSubConnection {
 
     pub(crate) fn unsubscribe(&self, shard_id: &String) {
         self.state.unsubscribe(self.connection_id, shard_id)
+    }
+}
+
+impl PubSubSender for PubSubConnection {
+    fn push(&self, shard_id: &ShardId, diff: &VersionedData) {
+        // WIP: fix up the String vs ShardId
+        PubSubConnection::push_diff(self, shard_id.to_string(), diff)
+    }
+
+    fn subscribe(self: Arc<Self>, shard: &ShardId) -> Arc<ShardSubscriptionToken> {
+        PubSubConnection::subscribe(self.as_ref(), shard.to_string());
+
+        let pubsub_sender = Arc::clone(&self);
+        let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
+
+        Arc::new(ShardSubscriptionToken {
+            shard_id: shard.clone(),
+            pubsub_sender,
+        })
+    }
+
+    fn unsubscribe(&self, shard: &ShardId) {
+        PubSubConnection::unsubscribe(self, &shard.to_string());
     }
 }
 
@@ -243,6 +279,7 @@ impl PersistService {
             state: Arc::new(PubSubState {
                 connection_id_counter: AtomicUsize::new(0),
                 shard_subscribers: Default::default(),
+                connections: Default::default(),
                 metrics: Arc::new(metrics),
             }),
         }
@@ -294,7 +331,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistService {
             let root_span = info_span!("persist::push::server_conn");
             let _guard = root_span.enter();
 
-            let mut connection = server_state.new_connection(tx);
+            let connection = server_state.new_connection(tx);
             while let Some(result) = in_stream.next().await {
                 let req = match result {
                     Ok(req) => req,

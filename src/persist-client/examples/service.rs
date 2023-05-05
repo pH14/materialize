@@ -23,7 +23,7 @@ use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::metrics::Metrics;
 use mz_persist_client::rpc::{
-    GrpcPubSub, PersistGrpcPubSubServer, PersistPubSub, PersistPubSubClientConfig,
+    GrpcPubSubClient, PersistGrpcPubSubServer, PersistPubSubClient, PersistPubSubClientConfig,
 };
 use mz_persist_client::ShardId;
 
@@ -58,7 +58,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             info!("server ded");
         }
         Role::Writer => {
-            let (sender, _receiver) = GrpcPubSub::connect(
+            let (sender, _receiver) = GrpcPubSubClient::connect(
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "writer".to_string(),
@@ -85,7 +85,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
             }
         }
         Role::Reader => {
-            let (sender, mut receiver) = GrpcPubSub::connect(
+            let (sender, mut receiver) = GrpcPubSubClient::connect(
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "reader".to_string(),

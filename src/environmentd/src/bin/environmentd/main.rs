@@ -99,7 +99,7 @@ use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
 use mz_persist_client::rpc::{
-    GrpcPubSub, MetricsPubSubConnection, PersistGrpcPubSubServer, PersistPubSub,
+    GrpcPubSubClient, MetricsPubSubLocalSender, PersistGrpcPubSubServer, PersistPubSubClient,
     PersistPubSubClientConfig, PubSubReceiver, PubSubSender,
 };
 use once_cell::sync::Lazy;
@@ -768,7 +768,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         |_, metrics| async {
             let (sender, receiver) = persist_pubsub_client;
             let sender: Arc<dyn PubSubSender> =
-                Arc::new(MetricsPubSubConnection::new(sender, metrics));
+                Arc::new(MetricsPubSubLocalSender::new(sender, metrics));
             Some((sender, receiver))
         },
     ));
