@@ -22,12 +22,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::Stream;
 use prost::Message;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::{
-    BroadcastStream, ReceiverStream, TcpListenerStream, UnboundedReceiverStream,
-};
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, TcpListenerStream};
 use tokio_stream::StreamExt;
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
 use tonic::transport::Endpoint;
@@ -138,8 +137,6 @@ impl Drop for ShardSubscriptionToken {
 #[derive(Debug)]
 pub struct PersistGrpcPubSubServer {
     state: Arc<PubSubState>,
-    #[cfg(test)]
-    connection_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl PersistGrpcPubSubServer {
@@ -153,23 +150,19 @@ impl PersistGrpcPubSubServer {
             metrics: Arc::new(metrics),
         });
 
-        PersistGrpcPubSubServer {
-            state,
-            #[cfg(test)]
-            connection_tasks: Default::default(),
-        }
+        PersistGrpcPubSubServer { state }
     }
 
     /// Creates a client to [PersistGrpcPubSubServer] that is directly connected
     /// to the server, avoiding the need for network calls or message serde.
     pub fn new_direct_client(&self) -> PubSubClientConnection {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
         let sender: Arc<dyn PubSubSender> = Arc::new(Arc::clone(&self.state).new_connection(tx));
 
         PubSubClientConnection {
             sender,
             receiver: Box::new(
-                UnboundedReceiverStream::new(rx)
+                ReceiverStream::new(rx)
                     .filter_map(|x| Some(x.expect("cannot receive grpc errors locally"))),
             ),
         }
@@ -234,7 +227,6 @@ impl PersistPubSubClient for GrpcPubSubClient {
             subscribes: Default::default(),
         });
         let sender = Arc::clone(&pubsub_sender);
-        // WIP: return join handle so we can keep track of its existence a little more easily?
         mz_ore::task::spawn(
             || format!("persist::pubsub::grpc::connection"),
             async move {
@@ -614,11 +606,8 @@ pub(crate) struct PubSubState {
     /// Assigns a unique ID to each incoming connection.
     connection_id_counter: AtomicUsize,
     /// Maintains a mapping of `ShardId --> [ConnectionId -> Tx]`.
-    shard_subscribers: Arc<
-        RwLock<
-            BTreeMap<ShardId, BTreeMap<usize, UnboundedSender<Result<ProtoPubSubMessage, Status>>>>,
-        >,
-    >,
+    shard_subscribers:
+        Arc<RwLock<BTreeMap<ShardId, BTreeMap<usize, Sender<Result<ProtoPubSubMessage, Status>>>>>>,
     /// Active connections.
     connections: Arc<RwLock<HashSet<usize>>>,
     /// Server-side metrics.
@@ -628,14 +617,13 @@ pub(crate) struct PubSubState {
 impl PubSubState {
     fn new_connection(
         self: Arc<Self>,
-        notifier: UnboundedSender<Result<ProtoPubSubMessage, Status>>,
+        notifier: Sender<Result<ProtoPubSubMessage, Status>>,
     ) -> PubSubConnection {
         let connection_id = self.connection_id_counter.fetch_add(1, Ordering::SeqCst);
         {
             let mut connections = self.connections.write().expect("lock");
-            println!("inserting connid: {}", connection_id);
+            debug!("inserting connid: {}", connection_id);
             assert!(connections.insert(connection_id));
-            println!("connections: {:?}", connections);
         }
 
         self.metrics.active_connections.inc();
@@ -650,7 +638,7 @@ impl PubSubState {
         let now = Instant::now();
 
         {
-            println!("removing connid: {}", connection_id);
+            debug!("removing connid: {}", connection_id);
             let mut connections = self.connections.write().expect("lock");
             assert!(
                 connections.remove(&connection_id),
@@ -716,8 +704,15 @@ impl PubSubState {
                     })),
                 };
                 data_size = req.encoded_len();
-                num_sent += 1;
-                let _ = tx.send(Ok(req));
+                match tx.try_send(Ok(req)) {
+                    Ok(_) => {
+                        num_sent += 1;
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        self.metrics.broadcasted_diff_dropped_channel_full.inc();
+                    }
+                    Err(TrySendError::Closed(_)) => {}
+                };
             }
 
             self.metrics.broadcasted_diff_count.inc_by(num_sent);
@@ -734,7 +729,7 @@ impl PubSubState {
     fn subscribe(
         &self,
         connection_id: usize,
-        notifier: UnboundedSender<Result<ProtoPubSubMessage, Status>>,
+        notifier: Sender<Result<ProtoPubSubMessage, Status>>,
         shard_id: &ShardId,
     ) {
         let now = Instant::now();
@@ -835,7 +830,7 @@ impl PubSubState {
 #[derive(Debug)]
 pub(crate) struct PubSubConnection {
     connection_id: usize,
-    notifier: UnboundedSender<Result<ProtoPubSubMessage, Status>>,
+    notifier: Sender<Result<ProtoPubSubMessage, Status>>,
     state: Arc<PubSubState>,
 }
 
@@ -862,6 +857,8 @@ impl PubSubSender for PubSubConnection {
     fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<ShardSubscriptionToken> {
         PubSubConnection::subscribe(self.as_ref(), shard_id);
 
+        // WIP: this is wrong if `subscribe` is called multiple times. can we abstract
+        // the token tracking into something else?
         let pubsub_sender = Arc::clone(&self);
         let pubsub_sender: Arc<dyn PubSubSender> = pubsub_sender;
 
@@ -903,15 +900,13 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
 
         let mut in_stream = request.into_inner();
 
-        // WIP not unbounded
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
 
-        // WIP: store the handles in a map somewhere? what would remove them
         let server_state = Arc::clone(&self.state);
         // this spawn here to cleanup after connection error / disconnect, otherwise the stream
         // would not be polled after the connection drops. in our case, we want to clear the
         // connection and its subscriptions from our shared state when it drops.
-        let connection_task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let root_span = info_span!("persist::push::server_conn");
             let _guard = root_span.enter();
 
@@ -952,15 +947,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
             println!("push stream to {} ended", caller_id);
         });
 
-        #[cfg(test)]
-        {
-            self.connection_tasks
-                .lock()
-                .expect("lock")
-                .push(connection_task);
-        }
-
-        let out_stream: Self::PubSubStream = Box::pin(UnboundedReceiverStream::new(rx));
+        let out_stream: Self::PubSubStream = Box::pin(ReceiverStream::new(rx));
         Ok(Response::new(out_stream))
     }
 }
@@ -972,7 +959,7 @@ mod pubsub_state {
     use bytes::Bytes;
     use mz_ore::collections::HashSet;
     use tokio::sync::mpsc::error::TryRecvError;
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::Receiver;
     use tonic::Status;
 
     use mz_persist::location::{SeqNo, VersionedData};
@@ -1007,7 +994,7 @@ mod pubsub_state {
     #[should_panic(expected = "unknown connection id: 100")]
     fn test_zero_connections_subscribe() {
         let state = Arc::new(PubSubState::new_for_test());
-        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _) = tokio::sync::mpsc::channel(100);
         state.subscribe(100, tx, &SHARD_ID_0);
     }
 
@@ -1029,7 +1016,7 @@ mod pubsub_state {
     fn test_single_connection() {
         let state = Arc::new(PubSubState::new_for_test());
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let connection = Arc::clone(&state).new_connection(tx);
 
         assert_eq!(
@@ -1089,13 +1076,13 @@ mod pubsub_state {
     fn test_many_connection() {
         let state = Arc::new(PubSubState::new_for_test());
 
-        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, mut rx1) = tokio::sync::mpsc::channel(100);
         let conn1 = Arc::clone(&state).new_connection(tx1);
 
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(100);
         let conn2 = Arc::clone(&state).new_connection(tx2);
 
-        let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel();
+        let (tx3, mut rx3) = tokio::sync::mpsc::channel(100);
         let conn3 = Arc::clone(&state).new_connection(tx3);
 
         conn1.subscribe(&SHARD_ID_0);
@@ -1157,7 +1144,7 @@ mod pubsub_state {
     }
 
     fn assert_push(
-        rx: &mut UnboundedReceiver<Result<ProtoPubSubMessage, Status>>,
+        rx: &mut Receiver<Result<ProtoPubSubMessage, Status>>,
         shard: &ShardId,
         data: &VersionedData,
     ) {
@@ -1532,6 +1519,8 @@ mod grpc {
         });
         assert!(client_2.receiver.next().now_or_never().is_none());
     }
+
+    // WIP: test that client connection is dropped when receiver is dropped
 
     async fn new_tcp_listener() -> (SocketAddr, TcpListenerStream) {
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));

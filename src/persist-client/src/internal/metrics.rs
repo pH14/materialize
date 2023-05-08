@@ -1492,6 +1492,7 @@ pub struct PubSubServerMetrics {
     pub(crate) active_connections: UIntGauge,
     pub(crate) broadcasted_diff_count: IntCounter,
     pub(crate) broadcasted_diff_bytes: IntCounter,
+    pub(crate) broadcasted_diff_dropped_channel_full: IntCounter,
 
     pub(crate) push_seconds: Counter,
     pub(crate) subscribe_seconds: Counter,
@@ -1528,6 +1529,10 @@ impl PubSubServerMetrics {
             broadcasted_diff_bytes: registry.register(metric!(
                     name: "mz_persist_pubsub_server_broadcasted_diff_bytes",
                     help: "WIP",
+            )),
+            broadcasted_diff_dropped_channel_full: registry.register(metric!(
+                    name: "mz_persist_pubsub_server_broadcasted_diff_dropped_channel_full",
+                    help: "count of diffs dropped due to full connection channel",
             )),
 
             push_seconds: op_timings.with_label_values(&["push"]),
