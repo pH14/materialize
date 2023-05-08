@@ -24,6 +24,7 @@ use futures::Stream;
 use prost::Message;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, TcpListenerStream};
@@ -129,6 +130,7 @@ impl<T> PubSubReceiver for T where
 pub struct ShardSubscriptionToken {
     pub(crate) shard_id: ShardId,
     sender: Arc<dyn PubSubSenderInternal>,
+    on_drop_fn: Arc<OnceCell<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Debug for ShardSubscriptionToken {
@@ -237,7 +239,6 @@ impl PersistPubSubClient for GrpcPubSubClient {
             GrpcPubSubSender {
                 metrics: Arc::clone(&metrics),
                 requests: rpc_requests.clone(),
-                subscribes: Default::default(),
             },
         )));
         let sender = Arc::clone(&pubsub_sender);
@@ -510,6 +511,8 @@ impl PubSubSenderInternal for GrpcPubSubSender {
     }
 }
 
+/// An wrapper for a [PubSubSenderInternal] that implements [PubSubSender]
+/// by maintaining a map of active shard subscriptions to their tokens.
 #[derive(Debug)]
 struct SubscriptionTrackingSender {
     delegate: Arc<dyn PubSubSenderInternal>,
@@ -558,6 +561,7 @@ impl PubSubSender for SubscriptionTrackingSender {
         let token = Arc::new(ShardSubscriptionToken {
             shard_id: *shard_id,
             sender: pubsub_sender,
+            on_drop_fn: Arc::new(OnceCell::new()),
         });
 
         assert!(subscribes
@@ -576,7 +580,7 @@ impl PubSubSender for SubscriptionTrackingSender {
 #[derive(Debug)]
 pub struct MetricsDirectPubSubSender {
     metrics: Arc<Metrics>,
-    pubsub_sender: Arc<dyn PubSubSender>,
+    delegate: Arc<dyn PubSubSender>,
 }
 
 impl MetricsDirectPubSubSender {
@@ -584,7 +588,7 @@ impl MetricsDirectPubSubSender {
     /// `Arc<dyn PubSubSender>`'s calls to provide client-side metrics.
     pub fn new(pubsub_sender: Arc<dyn PubSubSender>, metrics: Arc<Metrics>) -> Self {
         Self {
-            pubsub_sender,
+            delegate: pubsub_sender,
             metrics,
         }
     }
@@ -592,19 +596,22 @@ impl MetricsDirectPubSubSender {
 
 impl PubSubSender for MetricsDirectPubSubSender {
     fn push_diff(&self, shard_id: &ShardId, diff: &VersionedData) {
-        self.metrics
-            .pubsub_client
-            .sender
-            .push
-            .bytes_sent
-            .inc_by(u64::cast_from(diff.data.len()));
-        self.pubsub_sender.push_diff(shard_id, diff);
+        self.delegate.push_diff(shard_id, diff);
         self.metrics.pubsub_client.sender.push.succeeded.inc();
     }
 
     fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<ShardSubscriptionToken> {
-        let token = Arc::clone(&self.pubsub_sender).subscribe(shard_id);
-        self.metrics.pubsub_client.sender.subscribe.succeeded.inc();
+        let token = Arc::clone(&self.delegate).subscribe(shard_id);
+        let unsubscribe_metric = self
+            .metrics
+            .pubsub_client
+            .sender
+            .unsubscribe
+            .succeeded
+            .clone();
+        let _ = token
+            .on_drop_fn
+            .set(Box::new(move || unsubscribe_metric.inc()));
         token
     }
 }
