@@ -1195,12 +1195,10 @@ mod grpc {
     use mz_ore::metrics::MetricsRegistry;
     use mz_persist::location::{SeqNo, VersionedData};
     use mz_proto::RustType;
-    use serde::ser;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::net::TcpListener;
-    use tokio::task::JoinHandle;
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_stream::StreamExt;
 
@@ -1215,124 +1213,9 @@ mod grpc {
         data: Bytes::from_static(&[4, 5, 6, 7]),
     };
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn grpc_client_receiver() {
-        let metrics = Arc::new(Metrics::new(
-            &PersistConfig::new_for_tests(),
-            &MetricsRegistry::new(),
-        ));
-
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7334));
-
-        let mut client_1 = GrpcPubSubClient::connect(
-            PersistPubSubClientConfig {
-                addr: format!("http://{}", addr.to_string()),
-                caller_id: "client_1".to_string(),
-            },
-            Arc::clone(&metrics),
-        );
-
-        let mut client_2 = GrpcPubSubClient::connect(
-            PersistPubSubClientConfig {
-                addr: format!("http://{}", addr.to_string()),
-                caller_id: "client_2".to_string(),
-            },
-            metrics,
-        );
-
-        // we can check our receiver output before connecting to the server
-        assert!(client_1.receiver.next().now_or_never().is_none());
-        assert!(client_2.receiver.next().now_or_never().is_none());
-
-        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
-        let server_state = Arc::clone(&server.state);
-        let connection_tasks = Arc::clone(&server.connection_tasks);
-        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7334));
-        let server_task = tokio::spawn(async move { server.serve(addr2).await });
-
-        // wait until both clients are connected
-        poll_until_true(Duration::from_secs(10), || {
-            server_state.active_connections().len() == 2
-        })
-        .await;
-
-        // no messages have been broadcast yet
-        assert!(client_1.receiver.next().now_or_never().is_none());
-        assert!(client_2.receiver.next().now_or_never().is_none());
-
-        // subscribe and send a diff
-        let _token_client_1 = Arc::clone(&client_1.sender).subscribe(&SHARD_ID_0);
-        let _token_client_2 = Arc::clone(&client_2.sender).subscribe(&SHARD_ID_0);
-        poll_until_true(Duration::from_secs(2), || {
-            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 2)])
-        })
-        .await;
-
-        client_1.sender.push_diff(&SHARD_ID_0, &VERSIONED_DATA_1);
-        assert!(client_1.receiver.next().now_or_never().is_none());
-        assert_push(
-            client_2.receiver.next().await.expect("has diff"),
-            &SHARD_ID_0,
-            &VERSIONED_DATA_1,
-        );
-
-        // kill the server (and each spawned task managing its connections)
-        connection_tasks
-            .lock()
-            .expect("lock")
-            .iter()
-            .for_each(|connection| connection.abort());
-        server_task.abort();
-
-        // client receives can still be polled without error
-        assert!(client_1.receiver.next().now_or_never().is_none());
-        assert!(client_2.receiver.next().now_or_never().is_none());
-
-        // create a new server
-        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
-        let server_state = Arc::clone(&server.state);
-        assert!(server_state.active_connections().is_empty());
-        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7334));
-        let _server_task = tokio::spawn(async move { server.serve(addr2).await });
-
-        // client automatically reconnects to new server and rehydrates subscriptions
-        poll_until_true(Duration::from_secs(10), || {
-            server_state.active_connections().len() == 2
-        })
-        .await;
-        poll_until_true(Duration::from_secs(2), || {
-            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 2)])
-        })
-        .await;
-
-        // pushing and receiving diffs works as expected
-        client_1.sender.push_diff(&SHARD_ID_0, &VERSIONED_DATA_0);
-        assert!(client_1.receiver.next().now_or_never().is_none());
-        assert_push(
-            client_2.receiver.next().await.expect("has diff"),
-            &SHARD_ID_0,
-            &VERSIONED_DATA_0,
-        );
-    }
-
-    async fn new_tcp_listener() -> (SocketAddr, TcpListenerStream) {
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-        let tcp_listener = TcpListener::bind(addr).await.expect("tcp listener");
-
-        (
-            tcp_listener.local_addr().expect("bound to local address"),
-            TcpListenerStream(tcp_listener),
-        )
-    }
-
-    async fn spawn_server(tcp_listener_stream: TcpListenerStream) -> Arc<PubSubState> {
-        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
-        let server_state = Arc::clone(&server.state);
-
-        let _server_task =
-            tokio::spawn(async move { server.serve_with_stream(tcp_listener_stream).await });
-        server_state
-    }
+    // NB: we use separate runtimes for client and server throughout these tests to cleanly drop
+    // ALL tasks (including spawned child tasks) associated with one end of a connection, to most
+    // closely model an actual disconnect.
 
     #[test]
     fn grpc_server() {
@@ -1340,13 +1223,14 @@ mod grpc {
             &PersistConfig::new_for_tests(),
             &MetricsRegistry::new(),
         ));
-
         let server_runtime = tokio::runtime::Runtime::new().expect("server runtime");
+        let client_runtime = tokio::runtime::Runtime::new().expect("client runtime");
+
+        // start the server
         let (addr, tcp_listener_stream) = server_runtime.block_on(new_tcp_listener());
         let server_state = server_runtime.block_on(spawn_server(tcp_listener_stream));
 
-        // start a client
-        let client_runtime = tokio::runtime::Runtime::new().expect("client runtime");
+        // start a client.
         client_runtime.spawn(async move {
             let client = GrpcPubSubClient::connect(
                 PersistPubSubClientConfig {
@@ -1371,7 +1255,7 @@ mod grpc {
             .await
         });
 
-        // drop the client (and its half of the grpc stream)
+        // drop the client
         client_runtime.shutdown_timeout(Duration::from_secs(2));
 
         // server should notice the client dropping and clean up its state
@@ -1387,95 +1271,94 @@ mod grpc {
         });
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn grpc_client_reconnection_sender() {
+    #[test]
+    fn grpc_client_sender_reconnects() {
         let metrics = Arc::new(Metrics::new(
             &PersistConfig::new_for_tests(),
             &MetricsRegistry::new(),
         ));
+        let server_runtime = tokio::runtime::Runtime::new().expect("server runtime");
+        let client_runtime = tokio::runtime::Runtime::new().expect("client runtime");
+        let (addr, tcp_listener_stream) = server_runtime.block_on(new_tcp_listener());
 
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7332));
-
-        let client = GrpcPubSubClient::connect(
-            PersistPubSubClientConfig {
-                addr: format!("http://{}", addr.to_string()),
-                caller_id: "client".to_string(),
-            },
-            metrics,
-        );
+        // start a client
+        let client = client_runtime.block_on(async {
+            GrpcPubSubClient::connect(
+                PersistPubSubClientConfig {
+                    addr: format!("http://{}", addr.to_string()),
+                    caller_id: "client".to_string(),
+                },
+                metrics,
+            )
+        });
 
         // we can subscribe before connecting to the pubsub server
         let _token = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
-        // we can subscribe and unsubscribe before connecting to the pubsub server;
+        // we can subscribe and unsubscribe before connecting to the pubsub server
         let _token_2 = Arc::clone(&client.sender).subscribe(&SHARD_ID_1);
         drop(_token_2);
 
         // create the server after the client is up
-        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
-        let server_state = Arc::clone(&server.state);
-        let connection_tasks = Arc::clone(&server.connection_tasks);
-        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7332));
-        let server_task = tokio::spawn(async move { server.serve(addr2).await });
+        let server_state = server_runtime.block_on(spawn_server(tcp_listener_stream));
 
-        // client connects automatically once the server is up
-        poll_until_true(Duration::from_secs(10), || {
-            server_state.active_connections().len() == 1
-        })
-        .await;
+        server_runtime.block_on(async {
+            // client connects automatically once the server is up
+            poll_until_true(Duration::from_secs(10), || {
+                server_state.active_connections().len() == 1
+            })
+            .await;
 
-        // client rehydrated its subscriptions. notably, only includes the shard that
-        // still has an active token
-        poll_until_true(Duration::from_secs(2), || {
-            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
-        })
-        .await;
+            // client rehydrated its subscriptions. notably, only includes the shard that
+            // still has an active token
+            poll_until_true(Duration::from_secs(2), || {
+                server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
+            })
+            .await;
+        });
 
-        // kill the server (and its spawned task managing this specific connection)
-        connection_tasks
-            .lock()
-            .expect("lock")
-            .get(0)
-            .expect("has 1 task")
-            .abort();
-        server_task.abort();
+        // kill the server
+        server_runtime.shutdown_timeout(Duration::from_secs(2));
 
         // client can still send requests without error
         let _token_2 = Arc::clone(&client.sender).subscribe(&SHARD_ID_1);
 
         // create a new server
-        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
-        let server_state = Arc::clone(&server.state);
-        assert!(server_state.active_connections().is_empty());
-        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7332));
-        let _server_task = tokio::spawn(async move { server.serve(addr2).await });
+        let server_runtime = tokio::runtime::Runtime::new().expect("server runtime");
+        let tcp_listener_stream = server_runtime.block_on(async {
+            TcpListenerStream::new(
+                TcpListener::bind(addr)
+                    .await
+                    .expect("can bind to previous addr"),
+            )
+        });
+        let server_state = server_runtime.block_on(spawn_server(tcp_listener_stream));
 
-        // client automatically reconnects to new server
-        poll_until_true(Duration::from_secs(10), || {
-            server_state.active_connections().len() == 1
-        })
-        .await;
+        server_runtime.block_on(async {
+            // client automatically reconnects to new server
+            poll_until_true(Duration::from_secs(5), || {
+                server_state.active_connections().len() == 1
+            })
+            .await;
 
-        // and rehydrates its subscriptions as before
-        poll_until_true(Duration::from_secs(5), || {
-            server_state.shard_subscription_counts()
-                == HashMap::from([(SHARD_ID_0, 1), (SHARD_ID_1, 1)])
-        })
-        .await;
+            // and rehydrates its subscriptions, including the new one that was sent
+            // while the server was unavailable.
+            poll_until_true(Duration::from_secs(3), || {
+                server_state.shard_subscription_counts()
+                    == HashMap::from([(SHARD_ID_0, 1), (SHARD_ID_1, 1)])
+            })
+            .await;
+        });
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn grpc_client_sender() {
+    async fn grpc_client_sender_subscription_tokens() {
         let metrics = Arc::new(Metrics::new(
             &PersistConfig::new_for_tests(),
             &MetricsRegistry::new(),
         ));
 
-        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
-        let server_state = Arc::clone(&server.state);
-
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7331));
-        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7331));
-        let _server_task = tokio::spawn(async move { server.serve(addr2).await });
+        let (addr, tcp_listener_stream) = new_tcp_listener().await;
+        let server_state = spawn_server(tcp_listener_stream).await;
 
         let client = GrpcPubSubClient::connect(
             PersistPubSubClientConfig {
@@ -1493,21 +1376,21 @@ mod grpc {
 
         // we can subscribe to a shard, receiving back a token
         let token = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
-        poll_until_true(Duration::from_secs(2), || {
+        poll_until_true(Duration::from_secs(3), || {
             server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
         })
         .await;
 
         // dropping the token will unsubscribe our client
         drop(token);
-        poll_until_true(Duration::from_secs(2), || {
+        poll_until_true(Duration::from_secs(3), || {
             server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 0)])
         })
         .await;
 
         // we can resubscribe to a shard
         let token = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
-        poll_until_true(Duration::from_secs(2), || {
+        poll_until_true(Duration::from_secs(3), || {
             server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
         })
         .await;
@@ -1516,7 +1399,7 @@ mod grpc {
         let token2 = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
         let token3 = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
         assert_eq!(Arc::strong_count(&token), 3);
-        poll_until_true(Duration::from_secs(2), || {
+        poll_until_true(Duration::from_secs(3), || {
             server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
         })
         .await;
@@ -1525,7 +1408,7 @@ mod grpc {
         drop(token);
         drop(token2);
         drop(token3);
-        poll_until_true(Duration::from_secs(2), || {
+        poll_until_true(Duration::from_secs(3), || {
             server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 0)])
         })
         .await;
@@ -1533,11 +1416,140 @@ mod grpc {
         // we can subscribe to many shards
         let _token0 = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
         let _token1 = Arc::clone(&client.sender).subscribe(&SHARD_ID_1);
-        poll_until_true(Duration::from_secs(2), || {
+        poll_until_true(Duration::from_secs(3), || {
             server_state.shard_subscription_counts()
                 == HashMap::from([(SHARD_ID_0, 1), (SHARD_ID_1, 1)])
         })
         .await;
+    }
+
+    #[test]
+    fn grpc_client_receiver() {
+        let metrics = Arc::new(Metrics::new(
+            &PersistConfig::new_for_tests(),
+            &MetricsRegistry::new(),
+        ));
+        let server_runtime = tokio::runtime::Runtime::new().expect("server runtime");
+        let client_runtime = tokio::runtime::Runtime::new().expect("client runtime");
+        let (addr, tcp_listener_stream) = server_runtime.block_on(new_tcp_listener());
+
+        // create two clients, so we can test that broadcast messages are received by the other
+        let mut client_1 = client_runtime.block_on(async {
+            GrpcPubSubClient::connect(
+                PersistPubSubClientConfig {
+                    addr: format!("http://{}", addr.to_string()),
+                    caller_id: "client_1".to_string(),
+                },
+                Arc::clone(&metrics),
+            )
+        });
+        let mut client_2 = client_runtime.block_on(async {
+            GrpcPubSubClient::connect(
+                PersistPubSubClientConfig {
+                    addr: format!("http://{}", addr.to_string()),
+                    caller_id: "client_2".to_string(),
+                },
+                metrics,
+            )
+        });
+
+        // we can check our receiver output before connecting to the server.
+        // these calls are race-y, since there's no guarantee on the time it
+        // would take for a message to be received were one to have been sent,
+        // but, better than nothing?
+        assert!(client_1.receiver.next().now_or_never().is_none());
+        assert!(client_2.receiver.next().now_or_never().is_none());
+
+        // start the server
+        let server_state = server_runtime.block_on(spawn_server(tcp_listener_stream));
+
+        // wait until both clients are connected
+        server_runtime.block_on(poll_until_true(Duration::from_secs(10), || {
+            server_state.active_connections().len() == 2
+        }));
+
+        // no messages have been broadcast yet
+        assert!(client_1.receiver.next().now_or_never().is_none());
+        assert!(client_2.receiver.next().now_or_never().is_none());
+
+        // subscribe and send a diff
+        let _token_client_1 = Arc::clone(&client_1.sender).subscribe(&SHARD_ID_0);
+        let _token_client_2 = Arc::clone(&client_2.sender).subscribe(&SHARD_ID_0);
+        server_runtime.block_on(poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 2)])
+        }));
+
+        // the subscriber non-sender client receives the diff
+        client_1.sender.push_diff(&SHARD_ID_0, &VERSIONED_DATA_1);
+        assert!(client_1.receiver.next().now_or_never().is_none());
+        client_runtime.block_on(async {
+            assert_push(
+                client_2.receiver.next().await.expect("has diff"),
+                &SHARD_ID_0,
+                &VERSIONED_DATA_1,
+            )
+        });
+
+        // kill the server
+        server_runtime.shutdown_timeout(Duration::from_secs(2));
+
+        // receivers can still be polled without error
+        assert!(client_1.receiver.next().now_or_never().is_none());
+        assert!(client_2.receiver.next().now_or_never().is_none());
+
+        // create a new server
+        let server_runtime = tokio::runtime::Runtime::new().expect("server runtime");
+        let tcp_listener_stream = server_runtime.block_on(async {
+            TcpListenerStream::new(
+                TcpListener::bind(addr)
+                    .await
+                    .expect("can bind to previous addr"),
+            )
+        });
+        let server_state = server_runtime.block_on(spawn_server(tcp_listener_stream));
+
+        // client automatically reconnects to new server and rehydrates subscriptions
+        server_runtime.block_on(async {
+            poll_until_true(Duration::from_secs(10), || {
+                server_state.active_connections().len() == 2
+            })
+            .await;
+            poll_until_true(Duration::from_secs(2), || {
+                server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 2)])
+            })
+            .await;
+        });
+
+        // pushing and receiving diffs works as expected.
+        // this time we'll push from the other client.
+        client_2.sender.push_diff(&SHARD_ID_0, &VERSIONED_DATA_0);
+        client_runtime.block_on(async {
+            assert_push(
+                client_1.receiver.next().await.expect("has diff"),
+                &SHARD_ID_0,
+                &VERSIONED_DATA_0,
+            )
+        });
+        assert!(client_2.receiver.next().now_or_never().is_none());
+    }
+
+    async fn new_tcp_listener() -> (SocketAddr, TcpListenerStream) {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let tcp_listener = TcpListener::bind(addr).await.expect("tcp listener");
+
+        (
+            tcp_listener.local_addr().expect("bound to local address"),
+            TcpListenerStream::new(tcp_listener),
+        )
+    }
+
+    async fn spawn_server(tcp_listener_stream: TcpListenerStream) -> Arc<PubSubState> {
+        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
+        let server_state = Arc::clone(&server.state);
+
+        let _server_task =
+            tokio::spawn(async move { server.serve_with_stream(tcp_listener_stream).await });
+        server_state
     }
 
     async fn poll_until_true<F>(timeout: Duration, f: F)
@@ -1562,7 +1574,6 @@ mod grpc {
         let message = message.message.expect("proto contains message");
         match message {
             Message::PushDiff(x) => {
-                println!("received diff: {:?}", x);
                 assert_eq!(x.shard_id, shard.into_proto());
                 assert_eq!(x.seqno, data.seqno.into_proto());
                 assert_eq!(x.diff, data.data);
