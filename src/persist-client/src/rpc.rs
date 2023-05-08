@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::BTreeMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -33,7 +33,7 @@ use tonic::{Extensions, Request, Response, Status, Streaming};
 use tracing::{debug, error, info, info_span, warn};
 
 use mz_ore::cast::CastFrom;
-use mz_ore::collections::HashSet;
+use mz_ore::collections::{HashMap, HashSet};
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::retry::RetryResult;
 use mz_persist::location::VersionedData;
@@ -115,10 +115,15 @@ impl<T> PubSubReceiver for T where
 ///
 /// When dropped, the client that originated the token will be unsubscribed
 /// from further diffs to the shard.
-#[derive(Debug)]
 pub struct ShardSubscriptionToken {
     pub(crate) shard_id: ShardId,
     pub(crate) pubsub_sender: Arc<dyn PubSubSender>,
+}
+
+impl Debug for ShardSubscriptionToken {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ShardSubscriptionToken({})", self.shard_id)
+    }
 }
 
 impl Drop for ShardSubscriptionToken {
@@ -131,6 +136,7 @@ impl Drop for ShardSubscriptionToken {
 #[derive(Debug)]
 pub struct PersistGrpcPubSubServer {
     state: Arc<PubSubState>,
+    connection_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl PersistGrpcPubSubServer {
@@ -143,7 +149,11 @@ impl PersistGrpcPubSubServer {
             connections: Default::default(),
             metrics: Arc::new(metrics),
         });
-        PersistGrpcPubSubServer { state }
+
+        PersistGrpcPubSubServer {
+            state,
+            connection_tasks: Default::default(),
+        }
     }
 
     /// Creates a client to [PersistGrpcPubSubServer] that is directly connected
@@ -221,10 +231,11 @@ impl PersistPubSubClient for GrpcPubSubClient {
                 );
 
                 loop {
+                    println!("trying to connect");
                     let client = mz_ore::retry::Retry::default()
                         .clamp_backoff(Duration::from_secs(60))
                         .retry_async(|_| async {
-                            debug!("connecting to pubsub");
+                            println!("connecting to pubsub");
                             metrics
                                 .pubsub_client
                                 .grpc_connection
@@ -255,7 +266,7 @@ impl PersistPubSubClient for GrpcPubSubClient {
                         .grpc_connection
                         .connection_established_count
                         .inc();
-                    debug!("created pubsub client to: {:?}", config.addr);
+                    println!("created pubsub client to: {:?}", config.addr);
 
                     let mut broadcast = BroadcastStream::new(rpc_requests.subscribe());
                     let broadcast_errors = metrics
@@ -268,6 +279,7 @@ impl PersistPubSubClient for GrpcPubSubClient {
                         Extensions::default(),
                         async_stream::stream! {
                             while let Some(x) = broadcast.next().await {
+                                println!("sending message: {:?}", x);
                                 match x {
                                     Ok(x) => yield x,
                                     Err(BroadcastStreamRecvError::Lagged(i)) => {
@@ -334,8 +346,8 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
     mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
         cache.metrics.pubsub_client.receiver.connected.set(1);
         while let Some(res) = pubsub_receiver.next().await {
-            let timestamp =
-                u128::from_le_bytes(<[u8; 16]>::try_from(res.timestamp.as_slice()).expect("WIP"));
+            // let timestamp =
+            //     u128::from_le_bytes(<[u8; 16]>::try_from(res.timestamp.as_slice()).expect("WIP"));
             match res.message {
                 Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
                     info!("received diff: {:?}", diff);
@@ -352,17 +364,17 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
                         diff.data.len()
                     );
                     cache.apply_diff(&shard_id, diff);
-                    let now = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .expect("failed to get millis since epoch")
-                        .as_micros();
-                    let latency = now.saturating_sub(timestamp) as f64;
-                    cache
-                        .metrics
-                        .pubsub_client
-                        .receiver
-                        .approx_diff_latency
-                        .observe(latency);
+                    // let now = SystemTime::now()
+                    //     .duration_since(SystemTime::UNIX_EPOCH)
+                    //     .expect("failed to get millis since epoch")
+                    //     .as_micros();
+                    // let latency = now.saturating_sub(timestamp) as f64;
+                    // cache
+                    //     .metrics
+                    //     .pubsub_client
+                    //     .receiver
+                    //     .approx_diff_latency
+                    //     .observe(latency);
                 }
                 ref msg @ None | ref msg @ Some(_) => {
                     warn!("pubsub client received unexpected message: {:?}", msg);
@@ -380,11 +392,18 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
 }
 
 /// An internal, gRPC-backed implementation of [PubSubSender].
-#[derive(Debug)]
 struct GrpcPubSubSender {
     metrics: Arc<Metrics>,
     requests: tokio::sync::broadcast::Sender<ProtoPubSubMessage>,
     subscribes: Arc<Mutex<BTreeMap<ShardId, Weak<ShardSubscriptionToken>>>>,
+}
+
+impl Debug for GrpcPubSubSender {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrpcPubSubSender")
+            .field("subscribes", &self.subscribes)
+            .finish()
+    }
 }
 
 impl GrpcPubSubSender {
@@ -599,7 +618,9 @@ impl PubSubState {
         let connection_id = self.connection_id_counter.fetch_add(1, Ordering::SeqCst);
         {
             let mut connections = self.connections.write().expect("lock");
+            println!("inserting connid: {}", connection_id);
             assert!(connections.insert(connection_id));
+            println!("connections: {:?}", connections);
         }
 
         self.metrics.active_connections.inc();
@@ -614,6 +635,7 @@ impl PubSubState {
         let now = Instant::now();
 
         {
+            println!("removing connid: {}", connection_id);
             let mut connections = self.connections.write().expect("lock");
             assert!(
                 connections.remove(&connection_id),
@@ -778,6 +800,18 @@ impl PubSubState {
 
         shards
     }
+
+    #[cfg(test)]
+    fn shard_subscription_counts(&self) -> HashMap<ShardId, usize> {
+        let mut shards = HashMap::new();
+
+        let subscribers = self.shard_subscribers.read().expect("lock");
+        for (shard, subscribed_connections) in subscribers.iter() {
+            shards.insert(*shard, subscribed_connections.len());
+        }
+
+        shards
+    }
 }
 
 /// An active connection of [PubSubState].
@@ -850,7 +884,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
             .flatten()
             .map(|key| key.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        info!("incoming pubsub stream from: {:?}", caller_id);
+        println!("incoming pubsub stream from: {:?}", caller_id);
 
         let mut in_stream = request.into_inner();
 
@@ -862,10 +896,11 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
         // this spawn here to cleanup after connection error / disconnect, otherwise the stream
         // would not be polled after the connection drops. in our case, we want to clear the
         // connection and its subscriptions from our shared state when it drops.
-        tokio::spawn(async move {
+        let connection_task = tokio::spawn(async move {
             let root_span = info_span!("persist::push::server_conn");
             let _guard = root_span.enter();
 
+            println!("new connection task");
             let connection = server_state.new_connection(tx);
             while let Some(result) = in_stream.next().await {
                 let req = match result {
@@ -879,7 +914,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
                 match req.message {
                     None => {}
                     Some(proto_pub_sub_message::Message::PushDiff(req)) => {
-                        info!("server received diff");
+                        println!("server received diff");
                         let shard_id = req.shard_id.parse().expect("valid shard id");
                         let diff = VersionedData {
                             seqno: req.seqno.into_rust().expect("WIP"),
@@ -888,17 +923,27 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
                         connection.push_diff(&shard_id, &diff);
                     }
                     Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
+                        println!("server received subscribe");
                         let shard_id = diff.shard_id.parse().expect("valid shard id");
                         connection.subscribe(&shard_id);
                     }
                     Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
+                        println!("server received unsubscribe");
                         let shard_id = diff.shard_id.parse().expect("valid shard id");
                         connection.unsubscribe(&shard_id);
                     }
                 }
             }
-            info!("push stream to {} ended", caller_id);
+            println!("push stream to {} ended", caller_id);
         });
+
+        #[cfg(test)]
+        {
+            self.connection_tasks
+                .lock()
+                .expect("lock")
+                .push(connection_task);
+        }
 
         let out_stream: Self::PubSubStream = Box::pin(UnboundedReceiverStream::new(rx));
         Ok(Response::new(out_stream))
@@ -1115,5 +1160,247 @@ mod pubsub_state {
             }
             Message::Subscribe(_) | Message::Unsubscribe(_) => panic!("unexpected message type"),
         };
+    }
+}
+
+#[cfg(test)]
+mod grpc {
+    use crate::cfg::PersistConfig;
+    use crate::metrics::Metrics;
+    use crate::rpc::{
+        GrpcPubSubClient, PersistGrpcPubSubServer, PersistPubSubClient, PersistPubSubClientConfig,
+    };
+    use crate::ShardId;
+    use mz_ore::collections::HashMap;
+    use mz_ore::metrics::MetricsRegistry;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const SHARD_ID_0: ShardId = ShardId([0u8; 16]);
+    const SHARD_ID_1: ShardId = ShardId([1u8; 16]);
+
+    // remaining tests: receiver + reconnections
+    //   server cleans up when clients are dropped
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grpc_server() {
+        let metrics = Arc::new(Metrics::new(
+            &PersistConfig::new_for_tests(),
+            &MetricsRegistry::new(),
+        ));
+
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7333));
+
+        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
+        let server_state = Arc::clone(&server.state);
+        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7333));
+        let _server_task = tokio::spawn(async move { server.serve(addr2).await });
+
+        // start a client
+        let client_task = tokio::spawn(async move {
+            let client = GrpcPubSubClient::connect(
+                PersistPubSubClientConfig {
+                    addr: format!("http://{}", addr.to_string()),
+                    caller_id: "client".to_string(),
+                },
+                metrics,
+            );
+            client.sender.subscribe(&SHARD_ID_0);
+            tokio::time::sleep(Duration::MAX).await;
+        });
+
+        poll_until_true(Duration::from_secs(10), || {
+            server_state.active_connections().len() == 1
+        })
+        .await;
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
+        })
+        .await;
+
+        // dropping a client (and its end of the grpc stream) should
+        // prompt the server to clean up connection state
+        client_task.abort();
+
+        poll_until_true(Duration::from_secs(10), || {
+            server_state.active_connections().is_empty()
+        })
+        .await;
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 0)])
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grpc_client_reconnection_sender() {
+        let metrics = Arc::new(Metrics::new(
+            &PersistConfig::new_for_tests(),
+            &MetricsRegistry::new(),
+        ));
+
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7332));
+
+        let client = GrpcPubSubClient::connect(
+            PersistPubSubClientConfig {
+                addr: format!("http://{}", addr.to_string()),
+                caller_id: "client".to_string(),
+            },
+            metrics,
+        );
+
+        // we can subscribe before connecting to the pubsub server
+        let _token = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
+        // we can subscribe and unsubscribe before connecting to the pubsub server;
+        let _token_2 = Arc::clone(&client.sender).subscribe(&SHARD_ID_1);
+        drop(_token_2);
+
+        // create the server after the client is up
+        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
+        let server_state = Arc::clone(&server.state);
+        let connection_tasks = Arc::clone(&server.connection_tasks);
+        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7332));
+        let server_task = tokio::spawn(async move { server.serve(addr2).await });
+
+        // client connects automatically once the server is up
+        poll_until_true(Duration::from_secs(10), || {
+            server_state.active_connections().len() == 1
+        })
+        .await;
+
+        // client rehydrated its subscriptions. notably, only includes the shard that
+        // still has an active token
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
+        })
+        .await;
+
+        // kill the server (and its spawned task managing this specific connection)
+        connection_tasks
+            .lock()
+            .expect("lock")
+            .get(0)
+            .expect("has 1 task")
+            .abort();
+        server_task.abort();
+
+        // client can still send requests without error
+        let _token_2 = Arc::clone(&client.sender).subscribe(&SHARD_ID_1);
+
+        // create a new server
+        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
+        let server_state = Arc::clone(&server.state);
+        assert!(server_state.active_connections().is_empty());
+        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7332));
+        let _server_task = tokio::spawn(async move { server.serve(addr2).await });
+
+        // client automatically reconnects to new server
+        poll_until_true(Duration::from_secs(10), || {
+            server_state.active_connections().len() == 1
+        })
+        .await;
+
+        // and rehydrates its subscriptions as before
+        poll_until_true(Duration::from_secs(5), || {
+            server_state.shard_subscription_counts()
+                == HashMap::from([(SHARD_ID_0, 1), (SHARD_ID_1, 1)])
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grpc_client_sender() {
+        let metrics = Arc::new(Metrics::new(
+            &PersistConfig::new_for_tests(),
+            &MetricsRegistry::new(),
+        ));
+
+        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
+        let server_state = Arc::clone(&server.state);
+
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7331));
+        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7331));
+        let _server_task = tokio::spawn(async move { server.serve(addr2).await });
+
+        let client = GrpcPubSubClient::connect(
+            PersistPubSubClientConfig {
+                addr: format!("http://{}", addr.to_string()),
+                caller_id: "client".to_string(),
+            },
+            metrics,
+        );
+
+        // our client connects
+        poll_until_true(Duration::from_secs(5), || {
+            server_state.active_connections().len() == 1
+        })
+        .await;
+
+        // we can subscribe to a shard, receiving back a token
+        let token = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
+        })
+        .await;
+
+        // dropping the token will unsubscribe our client
+        drop(token);
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 0)])
+        })
+        .await;
+
+        // we can resubscribe to a shard
+        let token = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
+        })
+        .await;
+
+        // we can subscribe many times idempotently, receiving back Arcs to the same token
+        let token2 = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
+        let token3 = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
+        assert_eq!(Arc::strong_count(&token), 3);
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 1)])
+        })
+        .await;
+
+        // dropping all of the tokens will unsubscribe the shard
+        drop(token);
+        drop(token2);
+        drop(token3);
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts() == HashMap::from([(SHARD_ID_0, 0)])
+        })
+        .await;
+
+        // we can subscribe to many shards
+        let _token0 = Arc::clone(&client.sender).subscribe(&SHARD_ID_0);
+        let _token1 = Arc::clone(&client.sender).subscribe(&SHARD_ID_1);
+        poll_until_true(Duration::from_secs(2), || {
+            server_state.shard_subscription_counts()
+                == HashMap::from([(SHARD_ID_0, 1), (SHARD_ID_1, 1)])
+        })
+        .await;
+    }
+
+    async fn poll_until_true<F>(timeout: Duration, f: F)
+    where
+        F: Fn() -> bool,
+    {
+        let now = Instant::now();
+        loop {
+            if f() {
+                return;
+            }
+
+            if now.elapsed() > timeout {
+                panic!("timed out");
+            }
+
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 }
