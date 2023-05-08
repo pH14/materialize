@@ -1520,8 +1520,6 @@ mod grpc {
         assert!(client_2.receiver.next().now_or_never().is_none());
     }
 
-    // WIP: test that client connection is dropped when receiver is dropped
-
     async fn new_tcp_listener() -> (SocketAddr, TcpListenerStream) {
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
         let tcp_listener = TcpListener::bind(addr).await.expect("tcp listener");
