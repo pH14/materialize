@@ -479,7 +479,7 @@ impl PubSubSenderInternal for GrpcPubSubSender {
             Ok(_) => {
                 metrics.succeeded.inc();
                 metrics.bytes_sent.inc_by(u64::cast_from(size));
-                info!("subscribed to {}", shard_id);
+                debug!("subscribed to {}", shard_id);
             }
             Err(err) => {
                 metrics.failed.inc();
@@ -945,7 +945,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
                     }
                 }
 
-                info!("Finished Persist PubSub connection to: {:?}", caller_id);
+                info!("Persist PubSub connection dropped from: {:?}", caller_id);
             },
         );
 
