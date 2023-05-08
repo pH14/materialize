@@ -99,8 +99,7 @@ use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
 use mz_persist_client::rpc::{
-    MetricsDirectPubSubSender, PersistGrpcPubSubServer, PubSubClientConnection,
-    PubSubSenderInternal,
+    MetricsDirectPubSubSender, PersistGrpcPubSubServer, PubSubClientConnection, PubSubSender,
 };
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
@@ -760,9 +759,10 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
             PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
             &metrics_registry,
             |_, metrics| {
-                let sender: Arc<dyn PubSubSenderInternal> = Arc::new(
-                    MetricsDirectPubSubSender::new(persist_pubsub_client.sender, metrics),
-                );
+                let sender: Arc<dyn PubSubSender> = Arc::new(MetricsDirectPubSubSender::new(
+                    persist_pubsub_client.sender,
+                    metrics,
+                ));
                 Some(PubSubClientConnection::new(
                     sender,
                     persist_pubsub_client.receiver,

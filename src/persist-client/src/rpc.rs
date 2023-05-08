@@ -27,7 +27,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::StreamExt;
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
 use tonic::transport::Endpoint;
@@ -35,7 +35,7 @@ use tonic::{Extensions, Request, Response, Status, Streaming};
 use tracing::{debug, error, info, info_span, warn};
 
 use mz_ore::cast::CastFrom;
-use mz_ore::collections::{HashMap, HashSet};
+use mz_ore::collections::HashSet;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::retry::RetryResult;
 use mz_persist::location::VersionedData;
@@ -194,7 +194,10 @@ impl PersistGrpcPubSubServer {
     /// Starts the gRPC server with the given listener stream.
     /// Consumes `self` and runs until the task is cancelled.
     #[cfg(test)]
-    pub async fn serve_with_stream(self, listener: TcpListenerStream) -> Result<(), anyhow::Error> {
+    pub async fn serve_with_stream(
+        self,
+        listener: tokio_stream::wrappers::TcpListenerStream,
+    ) -> Result<(), anyhow::Error> {
         tonic::transport::Server::builder()
             .add_service(ProtoPersistPubSubServer::new(self))
             .serve_with_incoming(listener)
@@ -368,8 +371,6 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
     mz_ore::task::spawn(|| "persist::rpc::push_responses", async move {
         cache.metrics.pubsub_client.receiver.connected.set(1);
         while let Some(res) = pubsub_receiver.next().await {
-            // let timestamp =
-            //     u128::from_le_bytes(<[u8; 16]>::try_from(res.timestamp.as_slice()).expect("WIP"));
             match res.message {
                 Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
                     info!("received diff: {:?}", diff);
@@ -386,17 +387,19 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
                         diff.data.len()
                     );
                     cache.apply_diff(&shard_id, diff);
-                    // let now = SystemTime::now()
-                    //     .duration_since(SystemTime::UNIX_EPOCH)
-                    //     .expect("failed to get millis since epoch")
-                    //     .as_micros();
-                    // let latency = now.saturating_sub(timestamp) as f64;
-                    // cache
-                    //     .metrics
-                    //     .pubsub_client
-                    //     .receiver
-                    //     .approx_diff_latency
-                    //     .observe(latency);
+
+                    if let Some(send_timestamp) = res.timestamp {
+                        let send_timestamp = send_timestamp.into_rust().expect("valid timestamp");
+                        let now = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .expect("failed to get millis since epoch");
+                        cache
+                            .metrics
+                            .pubsub_client
+                            .receiver
+                            .approx_diff_latency
+                            .observe((now.saturating_sub(send_timestamp)).as_secs_f64());
+                    }
                 }
                 ref msg @ None | ref msg @ Some(_) => {
                     warn!("pubsub client received unexpected message: {:?}", msg);
@@ -435,10 +438,9 @@ impl PubSubSenderInternal for GrpcPubSubSender {
         };
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("failed to get millis since epoch")
-            .as_micros();
+            .expect("failed to get millis since epoch");
         let msg = ProtoPubSubMessage {
-            timestamp: now.to_le_bytes().to_vec(),
+            timestamp: Some(now.into_proto()),
             message: Some(proto_pub_sub_message::Message::PushDiff(diff)),
         };
         let size = msg.encoded_len();
@@ -459,10 +461,9 @@ impl PubSubSenderInternal for GrpcPubSubSender {
     fn subscribe(&self, shard_id: &ShardId) {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("failed to get millis since epoch")
-            .as_micros();
+            .expect("failed to get millis since epoch");
         let msg = ProtoPubSubMessage {
-            timestamp: now.to_le_bytes().to_vec(),
+            timestamp: Some(now.into_proto()),
             message: Some(proto_pub_sub_message::Message::Subscribe(ProtoSubscribe {
                 shard_id: shard_id.into_proto(),
             })),
@@ -485,10 +486,9 @@ impl PubSubSenderInternal for GrpcPubSubSender {
     fn unsubscribe(&self, shard_id: &ShardId) {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("failed to get millis since epoch")
-            .as_micros();
+            .expect("failed to get millis since epoch");
         let msg = ProtoPubSubMessage {
-            timestamp: now.to_le_bytes().to_vec(),
+            timestamp: Some(now.into_proto()),
             message: Some(proto_pub_sub_message::Message::Unsubscribe(
                 ProtoUnsubscribe {
                     shard_id: shard_id.into_proto(),
@@ -707,12 +707,12 @@ impl PubSubState {
                     data.data.len()
                 );
                 let req = ProtoPubSubMessage {
-                    timestamp: SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .expect("failed to get millis since epoch")
-                        .as_micros()
-                        .to_le_bytes()
-                        .to_vec(),
+                    timestamp: Some(
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .expect("failed to get millis since epoch")
+                            .into_proto(),
+                    ),
                     message: Some(proto_pub_sub_message::Message::PushDiff(ProtoPushDiff {
                         seqno: data.seqno.into_proto(),
                         shard_id: shard_id.to_string(),
