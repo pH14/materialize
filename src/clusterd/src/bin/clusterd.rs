@@ -139,7 +139,7 @@ struct Args {
         default_value = "127.0.0.1:6878"
     )]
     internal_http_listen_addr: SocketAddr,
-    /// WIP
+    /// The address for the Persist PubSub service.
     #[clap(
         long,
         env = "PERSIST_PUBSUB_ADDR",
@@ -266,7 +266,6 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
         )
     });
 
-    info!("WIP persist_pubsub_addr {}", args.persist_pubsub_addr);
     let pubsub_caller_id = std::env::var("HOSTNAME")
         .ok()
         .or_else(|| args.tracing.log_prefix.clone())

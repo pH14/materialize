@@ -231,7 +231,7 @@ pub struct Controller<T = mz_repr::Timestamp> {
     metrics_tx: UnboundedSender<(ReplicaId, Vec<ServiceProcessMetrics>)>,
     /// Receiver for the channel over which replica metrics are sent.
     metrics_rx: Peekable<UnboundedReceiverStream<(ReplicaId, Vec<ServiceProcessMetrics>)>>,
-    /// WIP
+    /// The URL for Persist PubSub.
     persist_pubsub_addr: String,
 }
 

@@ -405,7 +405,7 @@ pub struct Args {
     /// The PostgreSQL URL for the storage stash.
     #[clap(long, env = "STORAGE_STASH_URL", value_name = "POSTGRES_URL")]
     storage_stash_url: String,
-    /// WIP
+    /// The Persist PubSub service hostname.
     #[clap(long, env = "PERSIST_PUBSUB_HOSTNAME", default_value = "localhost")]
     persist_pubsub_hostname: String,
 
@@ -737,39 +737,38 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         args.persist_pubsub_hostname,
         args.internal_persist_pubsub_listen_addr.port()
     );
-    let persist_push_server = PersistGrpcPubSubServer::new(&metrics_registry);
-    let persist_pubsub_client = persist_push_server.new_direct_client();
+    let persist_config = PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone());
+    let persist_pubsub_server = PersistGrpcPubSubServer::new(&persist_config, &metrics_registry);
+    let persist_pubsub_client = persist_pubsub_server.new_direct_client();
     let _server = runtime.spawn_named(|| "persist::push::server", async move {
         let span = tracing::info_span!("persist::push::server");
         let _guard = span.enter();
-        tracing::info!(
-            "persist push server listening on {}",
+        info!(
+            "listening for Persist PubSub connections on {}",
             args.internal_persist_pubsub_listen_addr
         );
         // Intentionally do not bubble up errors here, we don't want to take
         // down environmentd if there are any issues with the pubsub server.
-        let res = persist_push_server
+        let res = persist_pubsub_server
             .serve(args.internal_persist_pubsub_listen_addr)
             .await;
-        tracing::info!("persist push server exited {:?}", res);
+        info!("Persist Pubsub server exited {:?}", res);
     });
 
-    let persist_clients = runtime.block_on(async {
-        PersistClientCache::new(
-            PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
-            &metrics_registry,
-            |_, metrics| {
-                let sender: Arc<dyn PubSubSender> = Arc::new(MetricsDirectPubSubSender::new(
-                    persist_pubsub_client.sender,
-                    metrics,
-                ));
-                Some(PubSubClientConnection::new(
-                    sender,
-                    persist_pubsub_client.receiver,
-                ))
-            },
-        )
-    });
+    let persist_clients = {
+        // PersistClientCache may spawn tasks, so run within a tokio runtime context
+        let _tokio_guard = runtime.enter();
+        PersistClientCache::new(persist_config, &metrics_registry, |_, metrics| {
+            let sender: Arc<dyn PubSubSender> = Arc::new(MetricsDirectPubSubSender::new(
+                persist_pubsub_client.sender,
+                metrics,
+            ));
+            Some(PubSubClientConnection::new(
+                sender,
+                persist_pubsub_client.receiver,
+            ))
+        })
+    };
 
     let persist_clients = Arc::new(persist_clients);
     let orchestrator = Arc::new(TracingOrchestrator::new(orchestrator, args.tracing.clone()));
@@ -880,6 +879,10 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     println!(
         " Internal HTTP address: {}",
         server.internal_http_local_addr()
+    );
+    println!(
+        " Internal Persist PubSub address: {}",
+        args.internal_persist_pubsub_listen_addr
     );
 
     println!(" Root trace ID: {id}");

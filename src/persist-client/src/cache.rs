@@ -442,7 +442,7 @@ impl StateCache {
                         .get_or_try_init::<Box<CodecMismatch>, _, _>(|| async {
                             let init_res = init_fn().await;
                             let token = if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                                Some(Arc::clone(&pubsub_sender).subscribe(&shard_id))
+                                Some(Arc::clone(pubsub_sender).subscribe(&shard_id))
                             } else {
                                 None
                             };
