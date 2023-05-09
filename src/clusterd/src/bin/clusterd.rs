@@ -279,7 +279,7 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
                 caller_id: pubsub_caller_id,
                 persist_cfg: persist_cfg.clone(),
             };
-            Some(GrpcPubSubClient::connect(cfg, metrics))
+            GrpcPubSubClient::connect(cfg, metrics)
         },
     ));
 

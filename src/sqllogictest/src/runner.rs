@@ -71,6 +71,7 @@ use mz_ore::thread::{JoinHandleExt, JoinOnDropHandle};
 use mz_ore::tracing::TracingHandle;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::cfg::PersistConfig;
+use mz_persist_client::rpc::PubSubClientConnection;
 use mz_persist_client::PersistLocation;
 use mz_pgrepr::{oid, Interval, Jsonb, Numeric, UInt2, UInt4, UInt8, Value};
 use mz_repr::adt::date::Date;
@@ -857,7 +858,7 @@ impl RunnerInner {
         let persist_clients = PersistClientCache::new(
             PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone()),
             &metrics_registry,
-            |_, _| None,
+            |_, _| PubSubClientConnection::noop(),
         )
         .await;
         let persist_clients = Arc::new(persist_clients);

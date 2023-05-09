@@ -764,10 +764,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
                 persist_pubsub_client.sender,
                 metrics,
             ));
-            Some(PubSubClientConnection::new(
-                sender,
-                persist_pubsub_client.receiver,
-            ))
+            PubSubClientConnection::new(sender, persist_pubsub_client.receiver)
         })
     };
 

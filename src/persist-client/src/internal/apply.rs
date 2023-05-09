@@ -50,7 +50,7 @@ pub struct Applier<K, V, T, D> {
     pub(crate) shard_metrics: Arc<ShardMetrics>,
     pub(crate) state_versions: Arc<StateVersions>,
     shared_states: Arc<StateCache>,
-    pubsub_sender: Option<Arc<dyn PubSubSender>>,
+    pubsub_sender: Arc<dyn PubSubSender>,
     pub(crate) shard_id: ShardId,
 
     // Access to the shard's state, shared across all handles created by the same
@@ -73,7 +73,7 @@ impl<K, V, T: Clone, D> Clone for Applier<K, V, T, D> {
             shard_metrics: Arc::clone(&self.shard_metrics),
             state_versions: Arc::clone(&self.state_versions),
             shared_states: Arc::clone(&self.shared_states),
-            pubsub_sender: self.pubsub_sender.clone(),
+            pubsub_sender: Arc::clone(&self.pubsub_sender),
             shard_id: self.shard_id,
             state: Arc::clone(&self.state),
         }
@@ -93,7 +93,7 @@ where
         metrics: Arc<Metrics>,
         state_versions: Arc<StateVersions>,
         shared_states: Arc<StateCache>,
-        pubsub_sender: Option<Arc<dyn PubSubSender>>,
+        pubsub_sender: Arc<dyn PubSubSender>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let shard_metrics = metrics.shards.shard(&shard_id);
         let state = shared_states
@@ -277,10 +277,8 @@ where
                     cmd.succeeded.inc();
                     self.shard_metrics.cmd_succeeded.inc();
                     self.update_state(new_state);
-                    if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                        if self.cfg.dynamic.pubsub_push_diff_enabled() {
-                            pubsub_sender.push_diff(&self.shard_id, &diff);
-                        }
+                    if self.cfg.dynamic.pubsub_push_diff_enabled() {
+                        self.pubsub_sender.push_diff(&self.shard_id, &diff);
                     }
                     return Ok((diff.seqno, Ok(res), maintenance));
                 }

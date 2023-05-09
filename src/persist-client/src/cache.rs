@@ -57,8 +57,8 @@ pub struct PersistClientCache {
     consensus_by_uri: Mutex<BTreeMap<String, (RttLatencyTask, Arc<dyn Consensus + Send + Sync>)>>,
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
     pub(crate) state_cache: Arc<StateCache>,
-    pubsub_sender: Option<Arc<dyn PubSubSender>>,
-    _pubsub_receiver_task: Option<JoinHandle<()>>,
+    pubsub_sender: Arc<dyn PubSubSender>,
+    _pubsub_receiver_task: JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -74,27 +74,20 @@ impl PersistClientCache {
     /// Returns a new [PersistClientCache].
     pub fn new<F>(cfg: PersistConfig, registry: &MetricsRegistry, pubsub: F) -> Self
     where
-        F: FnOnce(&PersistConfig, Arc<Metrics>) -> Option<PubSubClientConnection>,
+        F: FnOnce(&PersistConfig, Arc<Metrics>) -> PubSubClientConnection,
     {
         let metrics = Arc::new(Metrics::new(&cfg, registry));
-        let (pubsub_sender, pubsub_receiver) = match pubsub(&cfg, Arc::clone(&metrics)) {
-            None => (None, None),
-            Some(connection) => (Some(connection.sender), Some(connection.receiver)),
-        };
+        let pubsub_client = pubsub(&cfg, Arc::clone(&metrics));
 
         let state_cache = Arc::new(StateCache::new(
             &cfg,
             Arc::clone(&metrics),
-            pubsub_sender.clone(),
+            Arc::clone(&pubsub_client.sender),
         ));
-        let receiver_task = if let Some(pubsub_receiver) = pubsub_receiver {
-            Some(crate::rpc::subscribe_state_cache_to_pubsub(
-                Arc::clone(&state_cache),
-                pubsub_receiver,
-            ))
-        } else {
-            None
-        };
+        let _pubsub_receiver_task = crate::rpc::subscribe_state_cache_to_pubsub(
+            Arc::clone(&state_cache),
+            pubsub_client.receiver,
+        );
 
         PersistClientCache {
             cfg,
@@ -103,8 +96,8 @@ impl PersistClientCache {
             consensus_by_uri: Mutex::new(BTreeMap::new()),
             cpu_heavy_runtime: Arc::new(CpuHeavyRuntime::new()),
             state_cache,
-            pubsub_sender,
-            _pubsub_receiver_task: receiver_task,
+            pubsub_sender: pubsub_client.sender,
+            _pubsub_receiver_task,
         }
     }
 
@@ -115,7 +108,7 @@ impl PersistClientCache {
         Self::new(
             PersistConfig::new_for_tests(),
             &MetricsRegistry::new(),
-            |_, _| None,
+            |_, _| PubSubClientConnection::noop(),
         )
     }
 
@@ -139,7 +132,7 @@ impl PersistClientCache {
             Arc::clone(&self.metrics),
             Arc::clone(&self.cpu_heavy_runtime),
             Arc::clone(&self.state_cache),
-            self.pubsub_sender.clone(),
+            Arc::clone(&self.pubsub_sender),
         )
     }
 
@@ -363,7 +356,7 @@ pub struct StateCache {
     cfg: Arc<PersistConfig>,
     pub(crate) metrics: Arc<Metrics>,
     states: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<OnceCell<Weak<dyn DynState>>>>>>,
-    pubsub_sender: Option<Arc<dyn PubSubSender>>,
+    pubsub_sender: Arc<dyn PubSubSender>,
 }
 
 #[derive(Debug)]
@@ -377,7 +370,7 @@ impl StateCache {
     pub fn new(
         cfg: &PersistConfig,
         metrics: Arc<Metrics>,
-        pubsub_sender: Option<Arc<dyn PubSubSender>>,
+        pubsub_sender: Arc<dyn PubSubSender>,
     ) -> Self {
         StateCache {
             cfg: Arc::new(cfg.clone()),
@@ -395,7 +388,7 @@ impl StateCache {
                 &PersistConfig::new_for_tests(),
                 &MetricsRegistry::new(),
             )),
-            None,
+            Arc::new(NoopPubSubSender),
         )
     }
 
@@ -444,17 +437,12 @@ impl StateCache {
                     let state = init_once
                         .get_or_try_init::<Box<CodecMismatch>, _, _>(|| async {
                             let init_res = init_fn().await;
-                            let token = if let Some(pubsub_sender) = self.pubsub_sender.as_ref() {
-                                Some(Arc::clone(pubsub_sender).subscribe(&shard_id))
-                            } else {
-                                None
-                            };
                             let state = Arc::new(LockingTypedState::new(
                                 shard_id,
                                 init_res?,
                                 Arc::clone(&self.metrics),
                                 Arc::clone(&self.cfg),
-                                token,
+                                Arc::clone(&self.pubsub_sender).subscribe(&shard_id),
                             ));
                             let ret = Arc::downgrade(&state);
                             did_init = Some(state);
@@ -541,7 +529,7 @@ pub(crate) struct LockingTypedState<K, V, T, D> {
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
     shard_metrics: Arc<ShardMetrics>,
-    _subscription_token: Option<Arc<ShardSubscriptionToken>>,
+    _subscription_token: Arc<ShardSubscriptionToken>,
 }
 
 impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {
@@ -569,7 +557,7 @@ impl<K, V, T, D> LockingTypedState<K, V, T, D> {
         initial_state: TypedState<K, V, T, D>,
         metrics: Arc<Metrics>,
         cfg: Arc<PersistConfig>,
-        subscription_token: Option<Arc<ShardSubscriptionToken>>,
+        subscription_token: Arc<ShardSubscriptionToken>,
     ) -> Self {
         Self {
             shard_id,
@@ -664,7 +652,7 @@ mod tests {
         let cache = PersistClientCache::new(
             PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone()),
             &MetricsRegistry::new(),
-            |_, _| None,
+            |_, _| PubSubClientConnection::noop(),
         );
         assert_eq!(cache.blob_by_uri.lock().await.len(), 0);
         assert_eq!(cache.consensus_by_uri.lock().await.len(), 0);

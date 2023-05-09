@@ -256,7 +256,7 @@ pub struct PersistClient {
     metrics: Arc<Metrics>,
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
     shared_states: Arc<StateCache>,
-    pubsub_sender: Option<Arc<dyn PubSubSender>>,
+    pubsub_sender: Arc<dyn PubSubSender>,
 }
 
 impl PersistClient {
@@ -272,7 +272,7 @@ impl PersistClient {
         metrics: Arc<Metrics>,
         cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
         shared_states: Arc<StateCache>,
-        pubsub_sender: Option<Arc<dyn PubSubSender>>,
+        pubsub_sender: Arc<dyn PubSubSender>,
     ) -> Result<Self, ExternalError> {
         // TODO: Verify somehow that blob matches consensus to prevent
         // accidental misuse.
@@ -365,7 +365,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             Arc::clone(&self.shared_states),
-            self.pubsub_sender.clone(),
+            Arc::clone(&self.pubsub_sender),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());
@@ -519,7 +519,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             Arc::clone(&self.shared_states),
-            self.pubsub_sender.clone(),
+            Arc::clone(&self.pubsub_sender),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());
@@ -573,7 +573,7 @@ impl PersistClient {
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
             Arc::clone(&self.shared_states),
-            self.pubsub_sender.clone(),
+            Arc::clone(&self.pubsub_sender),
         )
         .await?;
         let gc = GarbageCollector::new(machine.clone());

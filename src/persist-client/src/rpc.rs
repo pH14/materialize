@@ -79,6 +79,14 @@ impl PubSubClientConnection {
     pub fn new(sender: Arc<dyn PubSubSender>, receiver: Box<dyn PubSubReceiver>) -> Self {
         Self { sender, receiver }
     }
+
+    /// Creates a no-op [PubSubClientConnection] that neither sends nor receives messages.
+    pub fn noop() -> Self {
+        Self {
+            sender: Arc::new(NoopPubSubSender),
+            receiver: Box::new(futures::stream::empty()),
+        }
+    }
 }
 
 /// The public send-side client to Persist PubSub.
@@ -153,150 +161,6 @@ impl Drop for ShardSubscriptionToken {
         if let Some(f) = self.on_drop_fn.get() {
             f();
         }
-    }
-}
-
-/// A gRPC-based implementation of a Persist PubSub server.
-#[derive(Debug)]
-pub struct PersistGrpcPubSubServer {
-    cfg: PersistConfig,
-    state: Arc<PubSubState>,
-}
-
-impl PersistGrpcPubSubServer {
-    /// Creates a new [PersistGrpcPubSubServer].
-    pub fn new(cfg: &PersistConfig, metrics_registry: &MetricsRegistry) -> Self {
-        let metrics = PubSubServerMetrics::new(metrics_registry);
-        let state = Arc::new(PubSubState {
-            connection_id_counter: AtomicUsize::new(0),
-            shard_subscribers: Default::default(),
-            connections: Default::default(),
-            metrics: Arc::new(metrics),
-        });
-
-        PersistGrpcPubSubServer {
-            cfg: cfg.clone(),
-            state,
-        }
-    }
-
-    /// Creates a connection to [PersistGrpcPubSubServer] that is directly connected
-    /// to the server state. Calls into this connection do not go over the network
-    /// nor require message serde.
-    pub fn new_same_process_connection(&self) -> PubSubClientConnection {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-        let sender: Arc<dyn PubSubSender> = Arc::new(SubscriptionTrackingSender::new(Arc::new(
-            Arc::clone(&self.state).new_connection(tx),
-        )));
-
-        PubSubClientConnection {
-            sender,
-            receiver: Box::new(
-                ReceiverStream::new(rx)
-                    .filter_map(|x| Some(x.expect("cannot receive grpc errors locally"))),
-            ),
-        }
-    }
-
-    /// Starts the gRPC server. Consumes `self` and runs until the task is cancelled.
-    pub async fn serve(self, listen_addr: SocketAddr) -> Result<(), anyhow::Error> {
-        tonic::transport::Server::builder()
-            .add_service(ProtoPersistPubSubServer::new(self))
-            .serve(listen_addr)
-            .await?;
-        Ok(())
-    }
-
-    /// Starts the gRPC server with the given listener stream.
-    /// Consumes `self` and runs until the task is cancelled.
-    #[cfg(test)]
-    pub async fn serve_with_stream(
-        self,
-        listener: tokio_stream::wrappers::TcpListenerStream,
-    ) -> Result<(), anyhow::Error> {
-        tonic::transport::Server::builder()
-            .add_service(ProtoPersistPubSubServer::new(self))
-            .serve_with_incoming(listener)
-            .await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServer {
-    type PubSubStream = Pin<Box<dyn Stream<Item = Result<ProtoPubSubMessage, Status>> + Send>>;
-
-    async fn pub_sub(
-        &self,
-        request: Request<Streaming<ProtoPubSubMessage>>,
-    ) -> Result<Response<Self::PubSubStream>, Status> {
-        let root_span = info_span!("persist::push::server");
-        let _guard = root_span.enter();
-        let caller_id = request
-            .metadata()
-            .get(AsciiMetadataKey::from_static(PERSIST_PUBSUB_CALLER_KEY))
-            .map(|key| key.to_str().ok())
-            .flatten()
-            .map(|key| key.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        info!("Received Persist PubSub connection from: {:?}", caller_id);
-
-        let mut in_stream = request.into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-        let caller = caller_id.clone();
-        let dynamic_cfg = Arc::clone(&self.cfg.dynamic);
-        let server_state = Arc::clone(&self.state);
-        // this spawn here to cleanup after connection error / disconnect, otherwise the stream
-        // would not be polled after the connection drops. in our case, we want to clear the
-        // connection and its subscriptions from our shared state when it drops.
-        mz_ore::task::spawn(
-            || format!("persist_pubsub_connection({})", caller),
-            async move {
-                let root_span = info_span!("persist::rpc::server::connection", caller_id);
-                let _guard = root_span.enter();
-
-                let connection = server_state.new_connection(tx);
-                while let Some(result) = in_stream.next().await {
-                    let req = match result {
-                        Ok(req) => req,
-                        Err(err) => {
-                            warn!("pubsub connection err: {}", err);
-                            break;
-                        }
-                    };
-
-                    match req.message {
-                        None => {
-                            warn!("received empty message from: {}", caller_id);
-                        }
-                        Some(proto_pub_sub_message::Message::PushDiff(req)) => {
-                            let shard_id = req.shard_id.parse().expect("valid shard id");
-                            let diff = VersionedData {
-                                seqno: req.seqno.into_rust().expect("WIP"),
-                                data: req.diff.clone(),
-                            };
-                            if dynamic_cfg.pubsub_push_diff_enabled() {
-                                connection.push_diff(&shard_id, &diff);
-                            }
-                        }
-                        Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
-                            let shard_id = diff.shard_id.parse().expect("valid shard id");
-                            connection.subscribe(&shard_id);
-                        }
-                        Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
-                            let shard_id = diff.shard_id.parse().expect("valid shard id");
-                            connection.unsubscribe(&shard_id);
-                        }
-                    }
-                }
-
-                info!("Persist PubSub connection ended: {:?}", caller_id);
-            },
-        );
-
-        let out_stream: Self::PubSubStream = Box::pin(ReceiverStream::new(rx));
-        Ok(Response::new(out_stream))
     }
 }
 
@@ -470,60 +334,6 @@ impl PersistPubSubClient for GrpcPubSubClient {
             receiver: Box::new(ReceiverStream::new(receiver_output)),
         }
     }
-}
-
-/// Spawns a Tokio task that consumes a [PubSubReceiver], applying its diffs to a [StateCache].
-pub(crate) fn subscribe_state_cache_to_pubsub(
-    cache: Arc<StateCache>,
-    mut pubsub_receiver: Box<dyn PubSubReceiver>,
-) -> JoinHandle<()> {
-    mz_ore::task::spawn(
-        || "persist::rpc::client::state_cache_diff_apply",
-        async move {
-            while let Some(res) = pubsub_receiver.next().await {
-                match res.message {
-                    Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
-                        cache.metrics.pubsub_client.receiver.push_received.inc();
-                        let shard_id = diff.shard_id.into_rust().expect("valid shard id");
-                        let diff = VersionedData {
-                            seqno: diff.seqno.into_rust().expect("valid SeqNo"),
-                            data: diff.diff,
-                        };
-                        debug!(
-                            "applying pubsub diff {} {} {}",
-                            shard_id,
-                            diff.seqno,
-                            diff.data.len()
-                        );
-                        cache.apply_diff(&shard_id, diff);
-
-                        if let Some(send_timestamp) = res.timestamp {
-                            let send_timestamp =
-                                send_timestamp.into_rust().expect("valid timestamp");
-                            let now = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .expect("failed to get millis since epoch");
-                            cache
-                                .metrics
-                                .pubsub_client
-                                .receiver
-                                .approx_diff_latency
-                                .observe((now.saturating_sub(send_timestamp)).as_secs_f64());
-                        }
-                    }
-                    ref msg @ None | ref msg @ Some(_) => {
-                        warn!("pubsub client received unexpected message: {:?}", msg);
-                        cache
-                            .metrics
-                            .pubsub_client
-                            .receiver
-                            .unknown_message_received
-                            .inc();
-                    }
-                }
-            }
-        },
-    )
 }
 
 /// An internal, gRPC-backed implementation of [PubSubSender].
@@ -724,6 +534,81 @@ impl PubSubSender for MetricsSameProcessPubSubSender {
             .set(Box::new(move || unsubscribe_metric.inc()));
         token
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct NoopPubSubSender;
+
+impl PubSubSenderInternal for NoopPubSubSender {
+    fn push_diff(&self, _shard_id: &ShardId, _diff: &VersionedData) {}
+    fn subscribe(&self, _shard_id: &ShardId) {}
+    fn unsubscribe(&self, _shard_id: &ShardId) {}
+}
+
+impl PubSubSender for NoopPubSubSender {
+    fn push_diff(&self, _shard_id: &ShardId, _diff: &VersionedData) {}
+
+    fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<ShardSubscriptionToken> {
+        Arc::new(ShardSubscriptionToken {
+            shard_id: *shard_id,
+            sender: self,
+            on_drop_fn: Default::default(),
+        })
+    }
+}
+
+/// Spawns a Tokio task that consumes a [PubSubReceiver], applying its diffs to a [StateCache].
+pub(crate) fn subscribe_state_cache_to_pubsub(
+    cache: Arc<StateCache>,
+    mut pubsub_receiver: Box<dyn PubSubReceiver>,
+) -> JoinHandle<()> {
+    mz_ore::task::spawn(
+        || "persist::rpc::client::state_cache_diff_apply",
+        async move {
+            while let Some(res) = pubsub_receiver.next().await {
+                match res.message {
+                    Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
+                        cache.metrics.pubsub_client.receiver.push_received.inc();
+                        let shard_id = diff.shard_id.into_rust().expect("valid shard id");
+                        let diff = VersionedData {
+                            seqno: diff.seqno.into_rust().expect("valid SeqNo"),
+                            data: diff.diff,
+                        };
+                        debug!(
+                            "applying pubsub diff {} {} {}",
+                            shard_id,
+                            diff.seqno,
+                            diff.data.len()
+                        );
+                        cache.apply_diff(&shard_id, diff);
+
+                        if let Some(send_timestamp) = res.timestamp {
+                            let send_timestamp =
+                                send_timestamp.into_rust().expect("valid timestamp");
+                            let now = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .expect("failed to get millis since epoch");
+                            cache
+                                .metrics
+                                .pubsub_client
+                                .receiver
+                                .approx_diff_latency
+                                .observe((now.saturating_sub(send_timestamp)).as_secs_f64());
+                        }
+                    }
+                    ref msg @ None | ref msg @ Some(_) => {
+                        warn!("pubsub client received unexpected message: {:?}", msg);
+                        cache
+                            .metrics
+                            .pubsub_client
+                            .receiver
+                            .unknown_message_received
+                            .inc();
+                    }
+                }
+            }
+        },
+    )
 }
 
 /// Internal state of a PubSub server implementation.
@@ -947,6 +832,150 @@ impl PubSubState {
         }
 
         shards
+    }
+}
+
+/// A gRPC-based implementation of a Persist PubSub server.
+#[derive(Debug)]
+pub struct PersistGrpcPubSubServer {
+    cfg: PersistConfig,
+    state: Arc<PubSubState>,
+}
+
+impl PersistGrpcPubSubServer {
+    /// Creates a new [PersistGrpcPubSubServer].
+    pub fn new(cfg: &PersistConfig, metrics_registry: &MetricsRegistry) -> Self {
+        let metrics = PubSubServerMetrics::new(metrics_registry);
+        let state = Arc::new(PubSubState {
+            connection_id_counter: AtomicUsize::new(0),
+            shard_subscribers: Default::default(),
+            connections: Default::default(),
+            metrics: Arc::new(metrics),
+        });
+
+        PersistGrpcPubSubServer {
+            cfg: cfg.clone(),
+            state,
+        }
+    }
+
+    /// Creates a connection to [PersistGrpcPubSubServer] that is directly connected
+    /// to the server state. Calls into this connection do not go over the network
+    /// nor require message serde.
+    pub fn new_same_process_connection(&self) -> PubSubClientConnection {
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let sender: Arc<dyn PubSubSender> = Arc::new(SubscriptionTrackingSender::new(Arc::new(
+            Arc::clone(&self.state).new_connection(tx),
+        )));
+
+        PubSubClientConnection {
+            sender,
+            receiver: Box::new(
+                ReceiverStream::new(rx)
+                    .filter_map(|x| Some(x.expect("cannot receive grpc errors locally"))),
+            ),
+        }
+    }
+
+    /// Starts the gRPC server. Consumes `self` and runs until the task is cancelled.
+    pub async fn serve(self, listen_addr: SocketAddr) -> Result<(), anyhow::Error> {
+        tonic::transport::Server::builder()
+            .add_service(ProtoPersistPubSubServer::new(self))
+            .serve(listen_addr)
+            .await?;
+        Ok(())
+    }
+
+    /// Starts the gRPC server with the given listener stream.
+    /// Consumes `self` and runs until the task is cancelled.
+    #[cfg(test)]
+    pub async fn serve_with_stream(
+        self,
+        listener: tokio_stream::wrappers::TcpListenerStream,
+    ) -> Result<(), anyhow::Error> {
+        tonic::transport::Server::builder()
+            .add_service(ProtoPersistPubSubServer::new(self))
+            .serve_with_incoming(listener)
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServer {
+    type PubSubStream = Pin<Box<dyn Stream<Item = Result<ProtoPubSubMessage, Status>> + Send>>;
+
+    async fn pub_sub(
+        &self,
+        request: Request<Streaming<ProtoPubSubMessage>>,
+    ) -> Result<Response<Self::PubSubStream>, Status> {
+        let root_span = info_span!("persist::rpc::server");
+        let _guard = root_span.enter();
+        let caller_id = request
+            .metadata()
+            .get(AsciiMetadataKey::from_static(PERSIST_PUBSUB_CALLER_KEY))
+            .map(|key| key.to_str().ok())
+            .flatten()
+            .map(|key| key.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        info!("Received Persist PubSub connection from: {:?}", caller_id);
+
+        let mut in_stream = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        let caller = caller_id.clone();
+        let dynamic_cfg = Arc::clone(&self.cfg.dynamic);
+        let server_state = Arc::clone(&self.state);
+        // this spawn here to cleanup after connection error / disconnect, otherwise the stream
+        // would not be polled after the connection drops. in our case, we want to clear the
+        // connection and its subscriptions from our shared state when it drops.
+        mz_ore::task::spawn(
+            || format!("persist_pubsub_connection({})", caller),
+            async move {
+                let root_span = info_span!("connection", caller_id);
+                let _guard = root_span.enter();
+
+                let connection = server_state.new_connection(tx);
+                while let Some(result) = in_stream.next().await {
+                    let req = match result {
+                        Ok(req) => req,
+                        Err(err) => {
+                            warn!("pubsub connection err: {}", err);
+                            break;
+                        }
+                    };
+
+                    match req.message {
+                        None => {
+                            warn!("received empty message from: {}", caller_id);
+                        }
+                        Some(proto_pub_sub_message::Message::PushDiff(req)) => {
+                            let shard_id = req.shard_id.parse().expect("valid shard id");
+                            let diff = VersionedData {
+                                seqno: req.seqno.into_rust().expect("WIP"),
+                                data: req.diff.clone(),
+                            };
+                            if dynamic_cfg.pubsub_push_diff_enabled() {
+                                connection.push_diff(&shard_id, &diff);
+                            }
+                        }
+                        Some(proto_pub_sub_message::Message::Subscribe(diff)) => {
+                            let shard_id = diff.shard_id.parse().expect("valid shard id");
+                            connection.subscribe(&shard_id);
+                        }
+                        Some(proto_pub_sub_message::Message::Unsubscribe(diff)) => {
+                            let shard_id = diff.shard_id.parse().expect("valid shard id");
+                            connection.unsubscribe(&shard_id);
+                        }
+                    }
+                }
+
+                info!("Persist PubSub connection ended: {:?}", caller_id);
+            },
+        );
+
+        let out_stream: Self::PubSubStream = Box::pin(ReceiverStream::new(rx));
+        Ok(Response::new(out_stream))
     }
 }
 

@@ -81,7 +81,7 @@ where
         metrics: Arc<Metrics>,
         state_versions: Arc<StateVersions>,
         shared_states: Arc<StateCache>,
-        pubsub_sender: Option<Arc<dyn PubSubSender>>,
+        pubsub_sender: Arc<dyn PubSubSender>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let applier = Applier::new(
             cfg,
