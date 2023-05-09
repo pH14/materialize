@@ -82,7 +82,11 @@ impl PersistClientCache {
             Some(connection) => (Some(connection.sender), Some(connection.receiver)),
         };
 
-        let state_cache = StateCache::new(&cfg, Arc::clone(&metrics), pubsub_sender.clone());
+        let state_cache = Arc::new(StateCache::new(
+            &cfg,
+            Arc::clone(&metrics),
+            pubsub_sender.clone(),
+        ));
         let receiver_task = if let Some(pubsub_receiver) = pubsub_receiver {
             Some(crate::rpc::subscribe_state_cache_to_pubsub(
                 Arc::clone(&state_cache),
@@ -374,18 +378,17 @@ impl StateCache {
         cfg: &PersistConfig,
         metrics: Arc<Metrics>,
         pubsub_sender: Option<Arc<dyn PubSubSender>>,
-    ) -> Arc<Self> {
-        // WIP: remove Arc again
-        Arc::new(StateCache {
+    ) -> Self {
+        StateCache {
             cfg: Arc::new(cfg.clone()),
             metrics,
             states: Default::default(),
             pubsub_sender,
-        })
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn new_no_metrics() -> Arc<Self> {
+    pub(crate) fn new_no_metrics() -> Self {
         Self::new(
             &PersistConfig::new_for_tests(),
             Arc::new(Metrics::new(
@@ -734,7 +737,7 @@ mod tests {
         }
 
         let s1 = ShardId::new();
-        let states = StateCache::new_no_metrics();
+        let states = Arc::new(StateCache::new_no_metrics());
 
         // The cache starts empty.
         assert_eq!(states.states.lock().expect("lock").len(), 0);

@@ -1533,7 +1533,8 @@ mod grpc {
     }
 
     async fn spawn_server(tcp_listener_stream: TcpListenerStream) -> Arc<PubSubState> {
-        let server = PersistGrpcPubSubServer::new(&MetricsRegistry::new());
+        let server =
+            PersistGrpcPubSubServer::new(&PersistConfig::new_for_tests(), &MetricsRegistry::new());
         let server_state = Arc::clone(&server.state);
 
         let _server_task =
