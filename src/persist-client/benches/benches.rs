@@ -80,7 +80,7 @@ use criterion::{criterion_group, criterion_main, Bencher, BenchmarkGroup, Benchm
 use mz_build_info::DUMMY_BUILD_INFO;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::SYSTEM_TIME;
-use mz_persist_client::cache::StateCache;
+use mz_persist_client::cache::{PersistClientCache, StateCache};
 use mz_persist_client::metrics::Metrics;
 use tempfile::TempDir;
 use timely::progress::{Antichain, Timestamp};
@@ -94,6 +94,7 @@ use mz_persist::s3::{S3Blob, S3BlobConfig};
 use mz_persist::workload::DataGenerator;
 use mz_persist_client::async_runtime::CpuHeavyRuntime;
 use mz_persist_client::cfg::PersistConfig;
+use mz_persist_client::rpc::PubSubClientConnection;
 use mz_persist_client::write::WriteHandle;
 use mz_persist_client::PersistClient;
 use mz_persist_types::Codec64;
@@ -201,6 +202,7 @@ async fn create_file_pg_client(
     let metrics = Arc::new(Metrics::new(&cfg, &MetricsRegistry::new()));
     let cpu_heavy_runtime = Arc::new(CpuHeavyRuntime::new());
     let shared_states = Arc::new(StateCache::new(&cfg, Arc::clone(&metrics), None));
+    let pubsub_sender = PubSubClientConnection::noop().sender;
     let client = PersistClient::new(
         cfg,
         blob,
@@ -208,7 +210,7 @@ async fn create_file_pg_client(
         metrics,
         cpu_heavy_runtime,
         shared_states,
-        None,
+        pubsub_sender,
     )?;
     Ok(Some((postgres_consensus, client, dir)))
 }
@@ -231,6 +233,7 @@ async fn create_s3_pg_client(
     let metrics = Arc::new(Metrics::new(&cfg, &MetricsRegistry::new()));
     let cpu_heavy_runtime = Arc::new(CpuHeavyRuntime::new());
     let shared_states = Arc::new(StateCache::new(&cfg, Arc::clone(&metrics), None));
+    let pubsub_sender = PubSubClientConnection::noop().sender;
     let client = PersistClient::new(
         cfg,
         blob,
@@ -238,7 +241,7 @@ async fn create_s3_pg_client(
         metrics,
         cpu_heavy_runtime,
         shared_states,
-        None,
+        pubsub_sender,
     )?;
     Ok(Some((postgres_consensus, client)))
 }
