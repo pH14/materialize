@@ -80,7 +80,7 @@ where
         shard_id: ShardId,
         metrics: Arc<Metrics>,
         state_versions: Arc<StateVersions>,
-        shared_states: &Arc<StateCache>,
+        shared_states: Arc<StateCache>,
         pubsub_sender: Option<Arc<dyn PubSubSender>>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let applier = Applier::new(
@@ -88,7 +88,7 @@ where
             shard_id,
             metrics,
             state_versions,
-            Arc::clone(shared_states),
+            shared_states,
             pubsub_sender,
         )
         .await?;
@@ -1111,7 +1111,7 @@ pub mod datadriven {
                 shard_id,
                 Arc::clone(&client.metrics),
                 Arc::clone(&state_versions),
-                &client.shared_states,
+                Arc::clone(&client.shared_states),
                 None,
             )
             .await

@@ -96,7 +96,7 @@ where
         pubsub_sender: Option<Arc<dyn PubSubSender>>,
     ) -> Result<Self, Box<CodecMismatch>> {
         let shard_metrics = metrics.shards.shard(&shard_id);
-        let state = Arc::clone(&shared_states)
+        let state = shared_states
             .get::<K, V, T, D, _, _>(shard_id, || {
                 metrics.cmds.init_state.run_cmd(&shard_metrics, || {
                     state_versions.maybe_init_shard(&shard_metrics)
@@ -273,7 +273,7 @@ where
             cmd.seconds.inc_by(now.elapsed().as_secs_f64());
 
             match ret {
-                ApplyCmdResult::Committed((seqno, diff, new_state, res, maintenance)) => {
+                ApplyCmdResult::Committed((diff, new_state, res, maintenance)) => {
                     cmd.succeeded.inc();
                     self.shard_metrics.cmd_succeeded.inc();
                     self.update_state(new_state);
@@ -282,7 +282,7 @@ where
                             pubsub_sender.push_diff(&self.shard_id, &diff);
                         }
                     }
-                    return Ok((seqno, Ok(res), maintenance));
+                    return Ok((diff.seqno, Ok(res), maintenance));
                 }
                 ApplyCmdResult::SkippedStateTransition((seqno, err, maintenance)) => {
                     cmd.succeeded.inc();
@@ -371,7 +371,7 @@ where
                     write_rollup: state.need_rollup(),
                 };
 
-                ApplyCmdResult::Committed((state.seqno, diff, state, work_ret, maintenance))
+                ApplyCmdResult::Committed((diff, state, work_ret, maintenance))
             }
             Ok((CaSResult::ExpectationMismatch, _diff)) => {
                 ApplyCmdResult::ExpectationMismatch(expected)
@@ -557,15 +557,7 @@ where
 }
 
 enum ApplyCmdResult<K, V, T, D, R, E> {
-    Committed(
-        (
-            SeqNo,
-            VersionedData,
-            TypedState<K, V, T, D>,
-            R,
-            RoutineMaintenance,
-        ),
-    ),
+    Committed((VersionedData, TypedState<K, V, T, D>, R, RoutineMaintenance)),
     SkippedStateTransition((SeqNo, E, RoutineMaintenance)),
     Indeterminate(Indeterminate),
     ExpectationMismatch(SeqNo),

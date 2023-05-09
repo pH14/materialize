@@ -355,6 +355,7 @@ impl PersistPubSubClient for GrpcPubSubClient {
                 'reconnect_forever: loop {
                     if !dynamic_cfg.pubsub_client_enabled() {
                         tokio::time::sleep(Duration::from_secs(60)).await;
+                        continue 'reconnect_forever;
                     }
 
                     info!("Connecting to Persist PubSub: {}", config.addr);
@@ -562,7 +563,7 @@ impl PubSubSenderInternal for GrpcPubSubSender {
             }
             Err(err) => {
                 metrics.failed.inc();
-                error!("{}", err);
+                debug!("error pushing diff: {}", err);
             }
         }
     }
@@ -587,7 +588,7 @@ impl PubSubSenderInternal for GrpcPubSubSender {
             }
             Err(err) => {
                 metrics.failed.inc();
-                error!("error subscribing to {}: {}", shard_id, err);
+                debug!("error subscribing to {}: {}", shard_id, err);
             }
         }
     }
@@ -614,7 +615,7 @@ impl PubSubSenderInternal for GrpcPubSubSender {
             }
             Err(err) => {
                 metrics.failed.inc();
-                error!("error unsubscribing from {}: {}", shard_id, err);
+                debug!("error unsubscribing from {}: {}", shard_id, err);
             }
         }
     }

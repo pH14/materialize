@@ -364,7 +364,7 @@ impl PersistClient {
             shard_id,
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
-            &self.shared_states,
+            Arc::clone(&self.shared_states),
             self.pubsub_sender.clone(),
         )
         .await?;
@@ -518,7 +518,7 @@ impl PersistClient {
             shard_id,
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
-            &self.shared_states,
+            Arc::clone(&self.shared_states),
             self.pubsub_sender.clone(),
         )
         .await?;
@@ -572,7 +572,7 @@ impl PersistClient {
             shard_id,
             Arc::clone(&self.metrics),
             Arc::new(state_versions),
-            &self.shared_states,
+            Arc::clone(&self.shared_states),
             self.pubsub_sender.clone(),
         )
         .await?;

@@ -111,6 +111,7 @@ impl PersistClientCache {
 
     /// A test helper that returns a [PersistClientCache] disconnected from
     /// metrics.
+    #[cfg(test)]
     pub fn new_no_metrics() -> Self {
         Self::new(
             PersistConfig::new_for_tests(),
@@ -449,15 +450,13 @@ impl StateCache {
                             } else {
                                 None
                             };
-                            let state = Arc::new(LockingTypedState {
+                            let state = Arc::new(LockingTypedState::new(
                                 shard_id,
-                                notifier: StateWatchNotifier::new(Arc::clone(&self.metrics)),
-                                state: RwLock::new(init_res?),
-                                cfg: Arc::clone(&self.cfg),
-                                metrics: Arc::clone(&self.metrics),
-                                shard_metrics: self.metrics.shards.shard(&shard_id),
-                                _subscription_token: token,
-                            });
+                                init_res?,
+                                Arc::clone(&self.metrics),
+                                Arc::clone(&self.cfg),
+                                token,
+                            ));
                             let ret = Arc::downgrade(&state);
                             did_init = Some(state);
                             let ret: Weak<dyn DynState> = ret;
@@ -566,6 +565,24 @@ impl<K, V, T: Debug, D> Debug for LockingTypedState<K, V, T, D> {
 }
 
 impl<K, V, T, D> LockingTypedState<K, V, T, D> {
+    fn new(
+        shard_id: ShardId,
+        initial_state: TypedState<K, V, T, D>,
+        metrics: Arc<Metrics>,
+        cfg: Arc<PersistConfig>,
+        subscription_token: Option<Arc<ShardSubscriptionToken>>,
+    ) -> Self {
+        Self {
+            shard_id,
+            notifier: StateWatchNotifier::new(Arc::clone(&metrics)),
+            state: RwLock::new(initial_state),
+            cfg: Arc::clone(&cfg),
+            shard_metrics: metrics.shards.shard(&shard_id),
+            metrics,
+            _subscription_token: subscription_token,
+        }
+    }
+
     pub(crate) fn shard_id(&self) -> &ShardId {
         &self.shard_id
     }

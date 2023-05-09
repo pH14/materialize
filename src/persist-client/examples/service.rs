@@ -18,7 +18,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tracing::{info, Span};
 
+use crate::BUILD_INFO;
 use mz_ore::metrics::MetricsRegistry;
+use mz_ore::now::SYSTEM_TIME;
 use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::metrics::Metrics;
@@ -48,11 +50,12 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<(), anyhow::Error> {
     let span = Span::current();
     let shard_id = ShardId::from_str("s00000000-0000-0000-0000-000000000000").expect("shard id");
+    let config = PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone());
     match args.role {
         Role::Server => {
             let _guard = span.enter();
             info!("listening on {}", args.listen_addr);
-            PersistGrpcPubSubServer::new(&PersistConfig::new_for_tests(), MetricsRegistry::new())
+            PersistGrpcPubSubServer::new(&config, MetricsRegistry::new())
                 .serve(args.listen_addr.clone())
                 .await
                 .expect("server running");
@@ -63,7 +66,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "writer".to_string(),
-                    persist_cfg: PersistConfig::new_for_tests(),
+                    persist_cfg: config.clone(),
                 },
                 Arc::new(Metrics::new(
                     &PersistConfig::new_for_tests(),
@@ -90,7 +93,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "reader".to_string(),
-                    persist_cfg: PersistConfig::new_for_tests(),
+                    persist_cfg: config.clone(),
                 },
                 Arc::new(Metrics::new(
                     &PersistConfig::new_for_tests(),

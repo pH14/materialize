@@ -435,7 +435,7 @@ async fn make_machine(
         shard_id,
         Arc::clone(&metrics),
         state_versions,
-        &Arc::new(StateCache::new(&cfg, metrics, None)),
+        Arc::new(StateCache::new(&cfg, metrics, None)),
         None,
     )
     .await?;
