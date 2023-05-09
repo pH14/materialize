@@ -930,7 +930,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
                                 seqno: req.seqno.into_rust().expect("WIP"),
                                 data: req.diff.clone(),
                             };
-                            if dynamic_cfg.pubsub_push_enabled() {
+                            if dynamic_cfg.pubsub_push_diff_enabled() {
                                 connection.push_diff(&shard_id, &diff);
                             }
                         }

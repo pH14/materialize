@@ -740,6 +740,8 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     let persist_config = PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone());
     let persist_pubsub_server = PersistGrpcPubSubServer::new(&persist_config, &metrics_registry);
     let persist_pubsub_client = persist_pubsub_server.new_direct_client();
+
+    // WIP: can we even use the enabled at startup flag?
     let _server = runtime.spawn_named(|| "persist::push::server", async move {
         let span = tracing::info_span!("persist::push::server");
         let _guard = span.enter();

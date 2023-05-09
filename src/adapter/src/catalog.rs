@@ -6748,7 +6748,8 @@ impl Catalog {
             }),
             stats_collection_enabled: Some(config.persist_stats_collection_enabled()),
             stats_filter_enabled: Some(config.persist_stats_filter_enabled()),
-            pubsub_push_enabled: Some(config.persist_pubsub_push_enabled()),
+            pubsub_enabled_at_startup: Some(config.persist_pubsub_enabled_at_startup()),
+            pubsub_push_diff_enabled: Some(config.persist_pubsub_push_diff_enabled()),
         }
     }
 

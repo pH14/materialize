@@ -22,7 +22,8 @@ message ProtoPersistParameters {
     optional ProtoRetryParameters next_listen_batch_retryer = 5;
     optional bool stats_collection_enabled = 6;
     optional bool stats_filter_enabled = 7;
-    optional bool pubsub_push_enabled = 9;
+    optional bool pubsub_enabled_at_startup = 9;
+    optional bool pubsub_push_diff_enabled = 10;
 }
 
 message ProtoRetryParameters {
