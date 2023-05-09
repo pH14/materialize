@@ -636,12 +636,11 @@ const PERSIST_STATS_FILTER_ENABLED: ServerVar<bool> = ServerVar {
     safe: true,
 };
 
-/// Controls [`mz_persist_client::cfg::DynamicConfig::pubsub_enabled_at_startup`].
-const PERSIST_PUBSUB_ENABLED_AT_STARTUP: ServerVar<bool> = ServerVar {
-    name: UncasedStr::new("persist_pubsub_enabled_at_startup"),
-    value: &PersistConfig::DEFAULT_PUBSUB_ENABLED_AT_STARTUP,
-    description:
-        "Whether to serve/connect to Persist PubSub at startup. Processes must be restarted for changes to take effect.",
+/// Controls [`mz_persist_client::cfg::DynamicConfig::pubsub_client_enabled`].
+const PERSIST_PUBSUB_CLIENT_ENABLED: ServerVar<bool> = ServerVar {
+    name: UncasedStr::new("persist_pubsub_client_enabled"),
+    value: &PersistConfig::DEFAULT_PUBSUB_CLIENT_ENABLED,
+    description: "Whether to connect to the Persist PubSub service.",
     internal: true,
     safe: true,
 };
@@ -1503,7 +1502,7 @@ impl Default for SystemVars {
             .with_var(&PERSIST_NEXT_LISTEN_BATCH_RETRYER_CLAMP)
             .with_var(&PERSIST_STATS_COLLECTION_ENABLED)
             .with_var(&PERSIST_STATS_FILTER_ENABLED)
-            .with_var(&PERSIST_PUBSUB_ENABLED_AT_STARTUP)
+            .with_var(&PERSIST_PUBSUB_CLIENT_ENABLED)
             .with_var(&PERSIST_PUBSUB_PUSH_DIFF_ENABLED)
             .with_var(&METRICS_RETENTION)
             .with_var(&MOCK_AUDIT_EVENT_TIMESTAMP)
@@ -1817,9 +1816,9 @@ impl SystemVars {
         *self.expect_value(&PERSIST_STATS_FILTER_ENABLED)
     }
 
-    /// Returns the `persist_pubsub_enabled_at_startup` configuration parameter.
-    pub fn persist_pubsub_enabled_at_startup(&self) -> bool {
-        *self.expect_value(&PERSIST_PUBSUB_ENABLED_AT_STARTUP)
+    /// Returns the `persist_pubsub_client_enabled` configuration parameter.
+    pub fn persist_pubsub_client_enabled(&self) -> bool {
+        *self.expect_value(&PERSIST_PUBSUB_CLIENT_ENABLED)
     }
 
     /// Returns the `persist_pubsub_push_diff_enabled` configuration parameter.
@@ -2874,6 +2873,6 @@ fn is_persist_config_var(name: &str) -> bool {
         || name == PERSIST_NEXT_LISTEN_BATCH_RETRYER_CLAMP.name()
         || name == PERSIST_STATS_COLLECTION_ENABLED.name()
         || name == PERSIST_STATS_FILTER_ENABLED.name()
-        || name == PERSIST_PUBSUB_ENABLED_AT_STARTUP.name()
+        || name == PERSIST_PUBSUB_CLIENT_ENABLED.name()
         || name == PERSIST_PUBSUB_PUSH_DIFF_ENABLED.name()
 }

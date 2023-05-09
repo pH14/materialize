@@ -273,10 +273,11 @@ async fn run(args: Args) -> Result<(), anyhow::Error> {
     let persist_clients = Arc::new(PersistClientCache::new(
         PersistConfig::new(&BUILD_INFO, SYSTEM_TIME.clone()),
         &metrics_registry,
-        |_persist_cfg, metrics| {
+        |persist_cfg, metrics| {
             let cfg = PersistPubSubClientConfig {
                 addr: args.persist_pubsub_addr,
                 caller_id: pubsub_caller_id,
+                persist_cfg: persist_cfg.clone(),
             };
             Some(GrpcPubSubClient::connect(cfg, metrics))
         },

@@ -52,9 +52,10 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
         Role::Server => {
             let _guard = span.enter();
             info!("listening on {}", args.listen_addr);
-            PersistGrpcPubSubServer::new(&MetricsRegistry::new())
+            PersistGrpcPubSubServer::new(&PersistConfig::new_for_tests(), MetricsRegistry::new())
                 .serve(args.listen_addr.clone())
-                .await;
+                .await
+                .expect("server running");
             info!("server ded");
         }
         Role::Writer => {
@@ -62,6 +63,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "writer".to_string(),
+                    persist_cfg: PersistConfig::new_for_tests(),
                 },
                 Arc::new(Metrics::new(
                     &PersistConfig::new_for_tests(),
@@ -88,6 +90,7 @@ pub async fn run(args: Args) -> Result<(), anyhow::Error> {
                 PersistPubSubClientConfig {
                     addr: format!("http://{}", args.listen_addr),
                     caller_id: "reader".to_string(),
+                    persist_cfg: PersistConfig::new_for_tests(),
                 },
                 Arc::new(Metrics::new(
                     &PersistConfig::new_for_tests(),

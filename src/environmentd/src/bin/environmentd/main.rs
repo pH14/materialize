@@ -99,7 +99,7 @@ use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
 use mz_ore::task::RuntimeExt;
 use mz_persist_client::rpc::{
-    MetricsDirectPubSubSender, PersistGrpcPubSubServer, PubSubClientConnection, PubSubSender,
+    MetricsSameProcessPubSubSender, PersistGrpcPubSubServer, PubSubClientConnection, PubSubSender,
 };
 use once_cell::sync::Lazy;
 use opentelemetry::trace::TraceContextExt;
@@ -739,11 +739,10 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     );
     let persist_config = PersistConfig::new(&mz_environmentd::BUILD_INFO, now.clone());
     let persist_pubsub_server = PersistGrpcPubSubServer::new(&persist_config, &metrics_registry);
-    let persist_pubsub_client = persist_pubsub_server.new_direct_client();
+    let persist_pubsub_client = persist_pubsub_server.new_same_process_connection();
 
-    // WIP: can we even use the enabled at startup flag?
-    let _server = runtime.spawn_named(|| "persist::push::server", async move {
-        let span = tracing::info_span!("persist::push::server");
+    let _server = runtime.spawn_named(|| "persist::rpc::server", async move {
+        let span = tracing::info_span!("persist::rpc::server");
         let _guard = span.enter();
         info!(
             "listening for Persist PubSub connections on {}",
@@ -761,7 +760,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         // PersistClientCache may spawn tasks, so run within a tokio runtime context
         let _tokio_guard = runtime.enter();
         PersistClientCache::new(persist_config, &metrics_registry, |_, metrics| {
-            let sender: Arc<dyn PubSubSender> = Arc::new(MetricsDirectPubSubSender::new(
+            let sender: Arc<dyn PubSubSender> = Arc::new(MetricsSameProcessPubSubSender::new(
                 persist_pubsub_client.sender,
                 metrics,
             ));

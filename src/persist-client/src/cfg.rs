@@ -142,7 +142,7 @@ impl PersistConfig {
                 next_listen_batch_retryer: RwLock::new(Self::DEFAULT_NEXT_LISTEN_BATCH_RETRYER),
                 stats_collection_enabled: AtomicBool::new(Self::DEFAULT_STATS_COLLECTION_ENABLED),
                 stats_filter_enabled: AtomicBool::new(Self::DEFAULT_STATS_FILTER_ENABLED),
-                pubsub_enabled_at_startup: AtomicBool::new(Self::DEFAULT_PUBSUB_ENABLED_AT_STARTUP),
+                pubsub_client_enabled: AtomicBool::new(Self::DEFAULT_PUBSUB_CLIENT_ENABLED),
                 pubsub_push_diff_enabled: AtomicBool::new(Self::DEFAULT_PUBSUB_PUSH_DIFF_ENABLED),
             }),
             compaction_enabled: !compaction_disabled,
@@ -201,8 +201,8 @@ impl PersistConfig {
     pub const DEFAULT_STATS_COLLECTION_ENABLED: bool = false;
     /// Default value for [`DynamicConfig::stats_filter_enabled`].
     pub const DEFAULT_STATS_FILTER_ENABLED: bool = false;
-    /// Default value for [`DynamicConfig::pubsub_enabled_at_startup`].
-    pub const DEFAULT_PUBSUB_ENABLED_AT_STARTUP: bool = true;
+    /// Default value for [`DynamicConfig::pubsub_client_enabled`].
+    pub const DEFAULT_PUBSUB_CLIENT_ENABLED: bool = false;
     /// Default value for [`DynamicConfig::pubsub_push_diff_enabled`].
     pub const DEFAULT_PUBSUB_PUSH_DIFF_ENABLED: bool = true;
 
@@ -291,7 +291,7 @@ pub struct DynamicConfig {
     storage_sink_minimum_batch_updates: AtomicUsize,
     stats_collection_enabled: AtomicBool,
     stats_filter_enabled: AtomicBool,
-    pubsub_enabled_at_startup: AtomicBool,
+    pubsub_client_enabled: AtomicBool,
     pubsub_push_diff_enabled: AtomicBool,
 
     // NB: These parameters are not atomically updated together in LD.
@@ -470,14 +470,13 @@ impl DynamicConfig {
         self.stats_filter_enabled.load(Self::LOAD_ORDERING)
     }
 
-    /// Determines whether processes should load Persist PubSub
-    /// (either the server or client connections) at startup.
-    pub fn pubsub_enabled_at_startup(&self) -> bool {
-        self.pubsub_enabled_at_startup.load(Self::LOAD_ORDERING)
+    /// Determines whether PubSub clients should connect to the PubSub server.
+    pub fn pubsub_client_enabled(&self) -> bool {
+        self.pubsub_client_enabled.load(Self::LOAD_ORDERING)
     }
 
-    /// Determines if sending diffs to the PubSub server is enabled.
-    /// Does not determine whether the server or client connect (see [Self::pubsub_enabled_at_startup]).
+    /// For connected clients, determines whether to push state diffs to the PubSub server.
+    /// For the server, determines whether to broadcast state diffs to subscribed clients.
     pub fn pubsub_push_diff_enabled(&self) -> bool {
         self.pubsub_push_diff_enabled.load(Self::LOAD_ORDERING)
     }
@@ -558,8 +557,8 @@ pub struct PersistParameters {
     pub stats_collection_enabled: Option<bool>,
     /// Configures [`DynamicConfig::stats_filter_enabled`].
     pub stats_filter_enabled: Option<bool>,
-    /// Configures [`DynamicConfig::pubsub_enabled_at_startup`]
-    pub pubsub_enabled_at_startup: Option<bool>,
+    /// Configures [`DynamicConfig::pubsub_client_enabled`]
+    pub pubsub_client_enabled: Option<bool>,
     /// Configures [`DynamicConfig::pubsub_push_diff_enabled`]
     pub pubsub_push_diff_enabled: Option<bool>,
 }
@@ -578,7 +577,7 @@ impl PersistParameters {
             next_listen_batch_retryer: self_next_listen_batch_retryer,
             stats_collection_enabled: self_stats_collection_enabled,
             stats_filter_enabled: self_stats_filter_enabled,
-            pubsub_enabled_at_startup: self_pubsub_enabled_at_startup,
+            pubsub_client_enabled: self_pubsub_client_enabled,
             pubsub_push_diff_enabled: self_pubsub_push_diff_enabled,
         } = self;
         let Self {
@@ -590,7 +589,7 @@ impl PersistParameters {
             next_listen_batch_retryer: other_next_listen_batch_retryer,
             stats_collection_enabled: other_stats_collection_enabled,
             stats_filter_enabled: other_stats_filter_enabled,
-            pubsub_enabled_at_startup: other_pubsub_enabled_at_startup,
+            pubsub_client_enabled: other_pubsub_client_enabled,
             pubsub_push_diff_enabled: other_pubsub_push_diff_enabled,
         } = other;
         if let Some(v) = other_blob_target_size {
@@ -617,8 +616,8 @@ impl PersistParameters {
         if let Some(v) = other_stats_filter_enabled {
             *self_stats_filter_enabled = Some(v)
         }
-        if let Some(v) = other_pubsub_enabled_at_startup {
-            *self_pubsub_enabled_at_startup = Some(v)
+        if let Some(v) = other_pubsub_client_enabled {
+            *self_pubsub_client_enabled = Some(v)
         }
         if let Some(v) = other_pubsub_push_diff_enabled {
             *self_pubsub_push_diff_enabled = Some(v)
@@ -640,7 +639,7 @@ impl PersistParameters {
             next_listen_batch_retryer,
             stats_collection_enabled,
             stats_filter_enabled,
-            pubsub_enabled_at_startup,
+            pubsub_client_enabled,
             pubsub_push_diff_enabled,
         } = self;
         blob_target_size.is_none()
@@ -651,7 +650,7 @@ impl PersistParameters {
             && next_listen_batch_retryer.is_none()
             && stats_collection_enabled.is_none()
             && stats_filter_enabled.is_none()
-            && pubsub_enabled_at_startup.is_none()
+            && pubsub_client_enabled.is_none()
             && pubsub_push_diff_enabled.is_none()
     }
 
@@ -671,7 +670,7 @@ impl PersistParameters {
             next_listen_batch_retryer,
             stats_collection_enabled,
             stats_filter_enabled,
-            pubsub_enabled_at_startup,
+            pubsub_client_enabled,
             pubsub_push_diff_enabled,
         } = self;
         if let Some(blob_target_size) = blob_target_size {
@@ -719,10 +718,10 @@ impl PersistParameters {
                 .stats_filter_enabled
                 .store(*stats_filter_enabled, DynamicConfig::STORE_ORDERING);
         }
-        if let Some(pubsub_enabled_at_startup) = pubsub_enabled_at_startup {
+        if let Some(pubsub_client_enabled) = pubsub_client_enabled {
             cfg.dynamic
-                .pubsub_enabled_at_startup
-                .store(*pubsub_enabled_at_startup, DynamicConfig::STORE_ORDERING);
+                .pubsub_client_enabled
+                .store(*pubsub_client_enabled, DynamicConfig::STORE_ORDERING);
         }
         if let Some(pubsub_push_diff_enabled) = pubsub_push_diff_enabled {
             cfg.dynamic
@@ -745,7 +744,7 @@ impl RustType<ProtoPersistParameters> for PersistParameters {
             next_listen_batch_retryer: self.next_listen_batch_retryer.into_proto(),
             stats_collection_enabled: self.stats_collection_enabled.into_proto(),
             stats_filter_enabled: self.stats_filter_enabled.into_proto(),
-            pubsub_enabled_at_startup: self.pubsub_enabled_at_startup.into_proto(),
+            pubsub_client_enabled: self.pubsub_client_enabled.into_proto(),
             pubsub_push_diff_enabled: self.pubsub_push_diff_enabled.into_proto(),
         }
     }
@@ -762,7 +761,7 @@ impl RustType<ProtoPersistParameters> for PersistParameters {
             next_listen_batch_retryer: proto.next_listen_batch_retryer.into_rust()?,
             stats_collection_enabled: proto.stats_collection_enabled.into_rust()?,
             stats_filter_enabled: proto.stats_filter_enabled.into_rust()?,
-            pubsub_enabled_at_startup: proto.pubsub_enabled_at_startup.into_rust()?,
+            pubsub_client_enabled: proto.pubsub_client_enabled.into_rust()?,
             pubsub_push_diff_enabled: proto.pubsub_push_diff_enabled.into_rust()?,
         })
     }
