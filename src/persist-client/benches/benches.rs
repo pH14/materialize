@@ -173,7 +173,7 @@ fn create_mem_mem_client() -> Result<PersistClient, ExternalError> {
     let consensus = Arc::new(MemConsensus::default());
     let metrics = Arc::new(Metrics::new(&cfg, &MetricsRegistry::new()));
     let cpu_heavy_runtime = Arc::new(CpuHeavyRuntime::new());
-    let shared_states = StateCache::new(&cfg, Arc::clone(&metrics), None);
+    let shared_states = Arc::new(StateCache::new(&cfg, Arc::clone(&metrics), None));
     PersistClient::new(
         cfg,
         blob,
@@ -200,7 +200,7 @@ async fn create_file_pg_client(
     let consensus = Arc::clone(&postgres_consensus);
     let metrics = Arc::new(Metrics::new(&cfg, &MetricsRegistry::new()));
     let cpu_heavy_runtime = Arc::new(CpuHeavyRuntime::new());
-    let shared_states = StateCache::new(&cfg, Arc::clone(&metrics), None);
+    let shared_states = Arc::new(StateCache::new(&cfg, Arc::clone(&metrics), None));
     let client = PersistClient::new(
         cfg,
         blob,
@@ -230,7 +230,7 @@ async fn create_s3_pg_client(
     let consensus = Arc::clone(&postgres_consensus);
     let metrics = Arc::new(Metrics::new(&cfg, &MetricsRegistry::new()));
     let cpu_heavy_runtime = Arc::new(CpuHeavyRuntime::new());
-    let shared_states = StateCache::new(&cfg, Arc::clone(&metrics), None);
+    let shared_states = Arc::new(StateCache::new(&cfg, Arc::clone(&metrics), None));
     let client = PersistClient::new(
         cfg,
         blob,

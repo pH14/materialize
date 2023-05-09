@@ -28,6 +28,17 @@ steps:
     agents:
       queue: builder-linux-x86_64
 
+  - id: build-aarch64
+    label: Build aarch64
+    command: bin/ci-builder run stable bin/pyactivate -m ci.test.build
+    inputs:
+      - "*"
+    timeout_in_minutes: 60
+    priority: 1
+    agents:
+      queue: builder-linux-aarch64
+    coverage: skip
+
   - id: check-merge-with-target
     label: Merge skew cargo check
     command: ci/test/check-merge-with-target.sh
@@ -48,6 +59,7 @@ steps:
       - "*"
     depends_on:
       - build-x86_64
+      - build-aarch64
     timeout_in_minutes: 10
     agents:
       queue: linux-x86_64
@@ -138,7 +150,6 @@ steps:
           composition: cargo-test
     agents:
       queue: builder-linux-x86_64
-    coverage: skip
 
   - id: miri-test
     label: Miri test

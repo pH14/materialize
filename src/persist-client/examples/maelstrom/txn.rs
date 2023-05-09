@@ -672,7 +672,7 @@ impl Service for TransactorService {
 
         // Wire up the TransactorService.
         let cpu_heavy_runtime = Arc::new(CpuHeavyRuntime::new());
-        let shared_states = StateCache::new(&config, Arc::clone(&metrics), None);
+        let shared_states = Arc::new(StateCache::new(&config, Arc::clone(&metrics), None));
         let client = PersistClient::new(
             config,
             blob,

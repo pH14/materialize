@@ -359,7 +359,7 @@ where
 /// command for the same shard are executing concurrently, only one can win
 /// anyway, the other will retry. With the mutex, we even get to avoid the retry
 /// if the racing commands are on the same process.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct StateCache {
     cfg: Arc<PersistConfig>,
     pub(crate) metrics: Arc<Metrics>,
