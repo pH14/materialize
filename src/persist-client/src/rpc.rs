@@ -353,6 +353,8 @@ impl PersistPubSubClient for GrpcPubSubClient {
                 );
 
                 'reconnect_forever: loop {
+                    metrics.pubsub_client.grpc_connection.connected.set(0);
+
                     if !dynamic_cfg.pubsub_client_enabled() {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         continue 'reconnect_forever;
@@ -392,6 +394,7 @@ impl PersistPubSubClient for GrpcPubSubClient {
                         .grpc_connection
                         .connection_established_count
                         .inc();
+                    metrics.pubsub_client.grpc_connection.connected.set(1);
 
                     info!("Connected to Persist PubSub: {}", config.addr);
 
@@ -477,8 +480,6 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
     mz_ore::task::spawn(
         || "persist::rpc::client::state_cache_diff_apply",
         async move {
-            // WIP: tie this metric to the reconnection task
-            cache.metrics.pubsub_client.receiver.connected.set(1);
             while let Some(res) = pubsub_receiver.next().await {
                 match res.message {
                     Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
@@ -521,7 +522,6 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
                     }
                 }
             }
-            cache.metrics.pubsub_client.receiver.connected.set(0);
         },
     )
 }

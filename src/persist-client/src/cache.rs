@@ -93,7 +93,6 @@ impl PersistClientCache {
                 pubsub_receiver,
             ))
         } else {
-            metrics.pubsub_client.receiver.connected.set(0);
             None
         };
 

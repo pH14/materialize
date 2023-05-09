@@ -1567,6 +1567,7 @@ impl PubSubClientMetrics {
 
 #[derive(Debug)]
 pub struct PubSubGrpcClientConnectionMetrics {
+    pub(crate) connected: UIntGauge,
     pub(crate) connection_established_count: IntCounter,
     pub(crate) connect_call_attempt_count: IntCounter,
     pub(crate) broadcast_recv_lagged_count: IntCounter,
@@ -1576,6 +1577,10 @@ pub struct PubSubGrpcClientConnectionMetrics {
 impl PubSubGrpcClientConnectionMetrics {
     fn new(registry: &MetricsRegistry) -> Self {
         Self {
+            connected: registry.register(metric!(
+                    name: "mz_persist_pubsub_client_grpc_connected",
+                    help: "whether the grpc client is currently connected",
+            )),
             connection_established_count: registry.register(metric!(
                     name: "mz_persist_pubsub_client_grpc_connection_established_count",
                     help: "count of grpc connection establishments to pubsub server",
@@ -1598,7 +1603,6 @@ impl PubSubGrpcClientConnectionMetrics {
 
 #[derive(Debug)]
 pub struct PubSubClientReceiverMetrics {
-    pub(crate) connected: UIntGauge,
     pub(crate) push_received: IntCounter,
     pub(crate) unknown_message_received: IntCounter,
     pub(crate) approx_diff_latency: Histogram,
@@ -1613,10 +1617,6 @@ impl PubSubClientReceiverMetrics {
         ));
 
         Self {
-            connected: registry.register(metric!(
-                    name: "mz_persist_pubsub_client_receiver_connected",
-                    help: "whether the pubsub receiver is connected to an input channel",
-            )),
             push_received: call_received.with_label_values(&["push"]),
             unknown_message_received: call_received.with_label_values(&["unknown"]),
             approx_diff_latency: registry.register(metric!(
