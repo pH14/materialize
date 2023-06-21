@@ -364,8 +364,7 @@ generate_extracted_config!(
     (IgnoreKeys, bool),
     (Size, String),
     (Timeline, String),
-    (TimestampInterval, Interval),
-    (Disk, bool)
+    (TimestampInterval, Interval)
 );
 
 generate_extracted_config!(
@@ -396,14 +395,14 @@ pub fn plan_create_source(
 
     let envelope = envelope.clone().unwrap_or(Envelope::None);
 
-    let mut allowed_with_options = vec![CreateSourceOptionName::Size];
-
+    let allowed_with_options = vec![CreateSourceOptionName::Size];
+    /*
     if scx
         .require_feature_flag(&vars::ENABLE_UPSERT_SOURCE_DISK)
         .is_ok()
     {
         allowed_with_options.push(CreateSourceOptionName::Disk);
-    }
+    }*/
 
     if let Some(op) = with_options
         .iter()
@@ -911,15 +910,12 @@ pub fn plan_create_source(
         timeline,
         timestamp_interval,
         ignore_keys,
-        disk,
         seen: _,
     } = CreateSourceOptionExtracted::try_from(with_options.clone())?;
 
     let (key_desc, value_desc) = encoding.desc()?;
 
     let mut key_envelope = get_key_envelope(include_metadata, &envelope, &encoding)?;
-
-    let disk_default = scx.catalog.system_vars().upsert_source_disk_default();
 
     // Not all source envelopes are compatible with all source connections.
     // Whoever constructs the source ingestion pipeline is responsible for
@@ -939,7 +935,6 @@ pub fn plan_create_source(
             match mode {
                 DbzMode::Plain => UnplannedSourceEnvelope::Upsert {
                     style: UpsertStyle::Debezium { after_idx },
-                    disk: disk.unwrap_or(disk_default),
                 },
             }
         }
@@ -957,7 +952,6 @@ pub fn plan_create_source(
             }
             UnplannedSourceEnvelope::Upsert {
                 style: UpsertStyle::Default(key_envelope),
-                disk: disk.unwrap_or(disk_default),
             }
         }
         mz_sql_parser::ast::Envelope::CdcV2 => {
@@ -970,17 +964,6 @@ pub fn plan_create_source(
             UnplannedSourceEnvelope::CdcV2
         }
     };
-
-    if disk.is_some() {
-        match &envelope {
-            UnplannedSourceEnvelope::Upsert { .. } => {
-                scx.require_feature_flag(&vars::ENABLE_UPSERT_SOURCE_DISK)?
-            }
-            _ => {
-                bail_unsupported!("ON DISK used with non-UPSERT/DEBEZIUM ENVELOPE");
-            }
-        }
-    }
 
     let metadata_columns = external_connection.metadata_columns();
     let metadata_column_types = external_connection.metadata_column_types();
@@ -2732,7 +2715,8 @@ generate_extracted_config!(
     (Managed, bool),
     (Replicas, Vec<ReplicaDefinition<Aug>>),
     (ReplicationFactor, u32),
-    (Size, String)
+    (Size, String),
+    (Disk, bool)
 );
 
 pub fn plan_create_cluster(
@@ -2749,6 +2733,7 @@ pub fn plan_create_cluster(
         replication_factor,
         seen: _,
         size,
+        disk,
     }: ClusterOptionExtracted = options.try_into()?;
 
     let managed = managed.unwrap_or_else(|| replicas.is_none());
@@ -2778,6 +2763,8 @@ pub fn plan_create_cluster(
                 size,
                 availability_zones,
                 compute,
+                // Managed clusters do not use `disk_cluster_replicas_default`.
+                disk: disk.unwrap_or_default(),
             }),
         }))
     } else {
@@ -2831,7 +2818,8 @@ generate_extracted_config!(
     (Workers, u16),
     (IntrospectionInterval, OptionalInterval),
     (IntrospectionDebugging, bool, Default(false)),
-    (IdleArrangementMergeEffort, u32)
+    (IdleArrangementMergeEffort, u32),
+    (Disk, bool)
 );
 
 fn plan_replica_config(
@@ -2849,6 +2837,7 @@ fn plan_replica_config(
         introspection_interval,
         introspection_debugging,
         idle_arrangement_merge_effort,
+        disk,
         ..
     }: ReplicaOptionExtracted = options.try_into()?;
 
@@ -2857,6 +2846,10 @@ fn plan_replica_config(
         introspection_debugging,
         idle_arrangement_merge_effort,
     )?;
+
+    if disk.is_some() {
+        scx.require_feature_flag(&vars::ENABLE_DISK_CLUSTER_REPLICAS)?;
+    }
 
     match (
         size,
@@ -2874,10 +2867,14 @@ fn plan_replica_config(
             sql_bail!("SIZE option must be specified");
         }
         (Some(size), availability_zone, None, None, None, None, None) => {
+            let disk_default = scx.catalog.system_vars().disk_cluster_replicas_default();
+            let disk = disk.unwrap_or(disk_default);
+
             Ok(ReplicaConfig::Managed {
                 size,
                 availability_zone,
                 compute,
+                disk,
             })
         }
 
@@ -2923,6 +2920,10 @@ fn plan_replica_config(
 
             if workers == 0 {
                 sql_bail!("WORKERS must be greater than 0");
+            }
+
+            if disk.is_some() {
+                sql_bail!("DISK can't be specified for unmanaged clusters");
             }
 
             Ok(ReplicaConfig::Unmanaged {
@@ -4156,6 +4157,7 @@ pub fn plan_alter_cluster(
                 replication_factor,
                 seen: _,
                 size,
+                disk,
             }: ClusterOptionExtracted = set_options.try_into()?;
 
             match managed.unwrap_or_else(|| cluster.is_managed()) {
@@ -4193,6 +4195,9 @@ pub fn plan_alter_cluster(
                     if size.is_some() {
                         sql_bail!("SIZE not supported for unmanaged clusters");
                     }
+                    if disk.is_some() {
+                        sql_bail!("DISK not supported for unmanaged clusters");
+                    }
                 }
             }
 
@@ -4226,6 +4231,9 @@ pub fn plan_alter_cluster(
             if let Some(introspection_interval) = introspection_interval {
                 options.introspection_interval = AlterOptionParameter::Set(introspection_interval);
             }
+            if let Some(disk) = disk {
+                options.disk = AlterOptionParameter::Set(disk);
+            }
             if !replicas.is_empty() {
                 options.replicas = AlterOptionParameter::Set(replicas);
             }
@@ -4243,6 +4251,7 @@ pub fn plan_alter_cluster(
                     Replicas => options.replicas = Reset,
                     ReplicationFactor => options.replication_factor = Reset,
                     Size => options.size = Reset,
+                    Disk => options.disk = Reset,
                 }
             }
         }
@@ -4577,7 +4586,6 @@ pub fn plan_alter_source(
                 timeline: timeline_opt,
                 timestamp_interval: timestamp_interval_opt,
                 ignore_keys: ignore_keys_opt,
-                disk: disk_opt,
             } = CreateSourceOptionExtracted::try_from(options)?;
 
             if let Some(value) = size_opt {
@@ -4591,9 +4599,6 @@ pub fn plan_alter_source(
             }
             if let Some(_) = ignore_keys_opt {
                 sql_bail!("Cannot modify the IGNORE KEYS property of a SOURCE.");
-            }
-            if let Some(_) = disk_opt {
-                sql_bail!("Cannot modify the DISK property of a SOURCE.");
             }
         }
         AlterSourceAction::ResetOptions(reset) => {
@@ -4610,9 +4615,6 @@ pub fn plan_alter_source(
                     }
                     CreateSourceOptionName::IgnoreKeys => {
                         sql_bail!("Cannot modify the IGNORE KEYS property of a SOURCE.");
-                    }
-                    CreateSourceOptionName::Disk => {
-                        sql_bail!("Cannot modify the DISK property of a SOURCE.");
                     }
                 }
             }

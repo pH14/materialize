@@ -18,7 +18,7 @@ use mz_controller::clusters::{
     ReplicaLocation,
 };
 use mz_expr::MirScalarExpr;
-use mz_orchestrator::{CpuLimit, MemoryLimit, NotReadyReason, ServiceProcessMetrics};
+use mz_orchestrator::{CpuLimit, DiskLimit, MemoryLimit, NotReadyReason, ServiceProcessMetrics};
 use mz_ore::cast::CastFrom;
 use mz_ore::collections::CollectionExt;
 use mz_repr::adt::array::ArrayDimension;
@@ -185,11 +185,13 @@ impl CatalogState {
         let cluster = &self.clusters_by_id[&id];
         let row = self.pack_privilege_array_row(cluster.privileges());
         let privileges = row.unpack_first();
-        let (size, replication_factor) = match &cluster.config.variant {
-            ClusterVariant::Managed(config) => {
-                (Some(config.size.as_str()), Some(config.replication_factor))
-            }
-            ClusterVariant::Unmanaged => (None, None),
+        let (size, disk, replication_factor) = match &cluster.config.variant {
+            ClusterVariant::Managed(config) => (
+                Some(config.size.as_str()),
+                Some(config.disk),
+                Some(config.replication_factor),
+            ),
+            ClusterVariant::Unmanaged => (None, None, None),
         };
         BuiltinTableUpdate {
             id: self.resolve_builtin_table(&MZ_CLUSTERS),
@@ -201,6 +203,7 @@ impl CatalogState {
                 cluster.is_managed().into(),
                 size.into(),
                 replication_factor.into(),
+                disk.into(),
             ]),
             diff,
         }
@@ -216,14 +219,15 @@ impl CatalogState {
         let id = cluster.replica_id_by_name[name];
         let replica = &cluster.replicas_by_id[&id];
 
-        let (size, az) = match &replica.config.location {
+        let (size, disk, az) = match &replica.config.location {
             ReplicaLocation::Managed(ManagedReplicaLocation {
                 size,
                 availability_zone,
                 az_user_specified: _,
                 allocation: _,
-            }) => (Some(&**size), Some(availability_zone.as_str())),
-            ReplicaLocation::Unmanaged(_) => (None, None),
+                disk,
+            }) => (Some(&**size), Some(*disk), Some(availability_zone.as_str())),
+            ReplicaLocation::Unmanaged(_) => (None, None, None),
         };
 
         // TODO(#18377): Make replica IDs `NewReplicaId`s throughout the code.
@@ -238,6 +242,7 @@ impl CatalogState {
                 Datum::from(size),
                 Datum::from(az),
                 Datum::String(&replica.owner_id.to_string()),
+                Datum::from(disk),
             ]),
             diff,
         }
@@ -1185,6 +1190,7 @@ impl CatalogState {
                     ReplicaAllocation {
                         memory_limit,
                         cpu_limit,
+                        disk_limit,
                         scale,
                         workers,
                         credits_per_hour,
@@ -1195,6 +1201,8 @@ impl CatalogState {
                     let cpu_limit = cpu_limit.unwrap_or(CpuLimit::MAX);
                     let MemoryLimit(ByteSize(memory_bytes)) =
                         (*memory_limit).unwrap_or(MemoryLimit::MAX);
+                    let DiskLimit(ByteSize(disk_bytes)) =
+                        (*disk_limit).unwrap_or(DiskLimit::ONE_GIB);
                     let row = Row::pack_slice(&[
                         size.as_str().into(),
                         u64::from(*scale).into(),
@@ -1202,7 +1210,7 @@ impl CatalogState {
                         cpu_limit.as_nanocpus().into(),
                         memory_bytes.into(),
                         // TODO(guswynn): disk size will be filled in later.
-                        Datum::Null,
+                        disk_bytes.into(),
                         (*credits_per_hour).into(),
                     ]);
                     BuiltinTableUpdate { id, row, diff: 1 }

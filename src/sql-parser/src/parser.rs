@@ -2592,7 +2592,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_source_option_name(&mut self) -> Result<CreateSourceOptionName, ParserError> {
-        let name = match self.expect_one_of_keywords(&[IGNORE, SIZE, TIMELINE, TIMESTAMP, DISK])? {
+        let name = match self.expect_one_of_keywords(&[IGNORE, SIZE, TIMELINE, TIMESTAMP])? {
             IGNORE => {
                 self.expect_keyword(KEYS)?;
                 CreateSourceOptionName::IgnoreKeys
@@ -2603,7 +2603,6 @@ impl<'a> Parser<'a> {
                 self.expect_keyword(INTERVAL)?;
                 CreateSourceOptionName::TimestampInterval
             }
-            DISK => CreateSourceOptionName::Disk,
             _ => unreachable!(),
         };
         Ok(name)
@@ -3136,6 +3135,7 @@ impl<'a> Parser<'a> {
             REPLICAS,
             REPLICATION,
             SIZE,
+            DISK,
         ])?;
         let name = match option {
             AVAILABILITY => {
@@ -3158,6 +3158,7 @@ impl<'a> Parser<'a> {
                 ClusterOptionName::ReplicationFactor
             }
             SIZE => ClusterOptionName::Size,
+            DISK => ClusterOptionName::Disk,
             _ => unreachable!(),
         };
         Ok(name)
@@ -3206,6 +3207,7 @@ impl<'a> Parser<'a> {
             STORAGE,
             STORAGECTL,
             WORKERS,
+            DISK,
         ])? {
             AVAILABILITY => {
                 self.expect_keyword(ZONE)?;
@@ -3238,6 +3240,7 @@ impl<'a> Parser<'a> {
                 ReplicaOptionName::StoragectlAddresses
             }
             WORKERS => ReplicaOptionName::Workers,
+            DISK => ReplicaOptionName::Disk,
             _ => unreachable!(),
         };
         let value = self.parse_optional_option_value()?;

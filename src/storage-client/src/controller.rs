@@ -932,8 +932,6 @@ pub struct StorageControllerState<T: Timestamp + Lattice + Codec64 + TimestampMa
     initialized: bool,
     /// Storage configuration to apply to newly provisioned instances.
     config: StorageParameters,
-    /// Whther clusters have scratch directories enabled.
-    scratch_directory_enabled: bool,
 }
 
 /// A storage controller for a storage instance.
@@ -1096,7 +1094,6 @@ impl<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + TimestampManipulatio
         now: NowFn,
         factory: &StashFactory,
         envd_epoch: NonZeroI64,
-        scratch_directory_enabled: bool,
     ) -> Self {
         let tls = mz_postgres_util::make_tls(
             &tokio_postgres::config::Config::from_str(&postgres_url)
@@ -1183,7 +1180,6 @@ impl<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + TimestampManipulatio
             clients: BTreeMap::new(),
             initialized: false,
             config: StorageParameters::default(),
-            scratch_directory_enabled,
         }
     }
 }
@@ -2497,7 +2493,6 @@ where
         postgres_factory: &StashFactory,
         envd_epoch: NonZeroI64,
         metrics_registry: MetricsRegistry,
-        scratch_directory_enabled: bool,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -2509,7 +2504,6 @@ where
                 now,
                 postgres_factory,
                 envd_epoch,
-                scratch_directory_enabled,
             )
             .await,
             internal_response_queue: rx,
@@ -3262,16 +3256,6 @@ where
             // top-level collection.
             let metadata = self.collection(id)?.collection_metadata.clone();
             source_imports.insert(id, metadata);
-        }
-
-        if let SourceEnvelope::Upsert(upsert) = &ingestion.desc.envelope {
-            if upsert.disk && !self.state.scratch_directory_enabled {
-                return Err(StorageError::InvalidUsage(
-                    "Attempting to render `ON DISK` source without a \
-                    configured scratch directory. This is a bug."
-                        .into(),
-                ));
-            }
         }
 
         // The ingestion metadata is simply the collection metadata of the collection with
