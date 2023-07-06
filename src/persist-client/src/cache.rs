@@ -316,6 +316,7 @@ where
         self
     }
 
+    #[instrument(level = "debug", skip_all, fields(seqno = %diff.seqno))]
     fn push_diff(&self, diff: VersionedData) {
         self.write_lock(&self.metrics.locks.applier_write, |state| {
             let seqno_before = state.seqno;

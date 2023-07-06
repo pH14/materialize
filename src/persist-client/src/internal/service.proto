@@ -34,6 +34,7 @@ message ProtoPubSubMessage {
         ProtoSubscribe subscribe = 3;
         ProtoUnsubscribe unsubscribe = 4;
     }
+    map<string, string> otel_ctx = 5;
 }
 
 service ProtoPersistPubSub {

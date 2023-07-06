@@ -27,6 +27,7 @@ use mz_ore::cast::CastFrom;
 use mz_ore::collections::{HashMap, HashSet};
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::retry::RetryResult;
+use mz_ore::tracing::OpenTelemetryContext;
 use mz_persist::location::VersionedData;
 use mz_proto::{ProtoType, RustType};
 use prost::Message;
@@ -39,7 +40,7 @@ use tokio_stream::StreamExt;
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
 use tonic::transport::Endpoint;
 use tonic::{Extensions, Request, Response, Status, Streaming};
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, instrument, warn, Instrument};
 
 use crate::cache::{DynState, StateCache};
 use crate::cfg::PersistConfig;
@@ -406,6 +407,7 @@ impl Debug for GrpcPubSubSender {
 }
 
 impl GrpcPubSubSender {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn send(&self, message: proto_pub_sub_message::Message, metrics: &PubSubClientCallMetrics) {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -414,6 +416,7 @@ impl GrpcPubSubSender {
         let message = ProtoPubSubMessage {
             timestamp: Some(now.into_proto()),
             message: Some(message),
+            otel_ctx: OpenTelemetryContext::obtain().into(),
         };
         let size = message.encoded_len();
 
@@ -431,6 +434,7 @@ impl GrpcPubSubSender {
 }
 
 impl PubSubSenderInternal for GrpcPubSubSender {
+    #[tracing::instrument(level = "debug", fields(shard_id, seqno = %diff.seqno))]
     fn push_diff(&self, shard_id: &ShardId, diff: &VersionedData) {
         self.send(
             proto_pub_sub_message::Message::PushDiff(ProtoPushDiff {
@@ -492,10 +496,12 @@ impl SubscriptionTrackingSender {
 }
 
 impl PubSubSender for SubscriptionTrackingSender {
+    #[tracing::instrument(level = "debug", skip_all, fields(shard_id, seqno = %diff.seqno))]
     fn push_diff(&self, shard_id: &ShardId, diff: &VersionedData) {
         self.delegate.push_diff(shard_id, diff)
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(shard_id))]
     fn subscribe(self: Arc<Self>, shard_id: &ShardId) -> Arc<ShardSubscriptionToken> {
         let mut subscribes = self.subscribes.lock().expect("lock");
         if let Some(token) = subscribes.get(shard_id) {
@@ -593,6 +599,14 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
         || "persist::rpc::client::state_cache_diff_apply",
         async move {
             while let Some(msg) = pubsub_receiver.next().await {
+                // Create a short-lived span/context that we can attach the incoming
+                // OpenTelemetry context to as its parent.
+                let span = info_span!("handle_message");
+                let _guard = span.enter();
+
+                let otel_ctx = OpenTelemetryContext::from(msg.otel_ctx);
+                otel_ctx.attach_as_parent();
+
                 match msg.message {
                     Some(proto_pub_sub_message::Message::PushDiff(diff)) => {
                         receiver_metrics.push_received.inc();
@@ -606,6 +620,11 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
                             shard_id,
                             diff.seqno,
                             diff.data.len()
+                        );
+
+                        info!(
+                            "Assuming context for ({}, {}): {:?}",
+                            shard_id, diff.seqno, otel_ctx
                         );
 
                         let mut pushed_diff = false;
@@ -664,7 +683,8 @@ pub(crate) fn subscribe_state_cache_to_pubsub(
                     }
                 }
             }
-        },
+        }
+        .instrument(info_span!("persist::rpc::client::state_cache_diff_apply")),
     )
 }
 
@@ -729,6 +749,7 @@ impl PubSubState {
         self.metrics.active_connections.dec();
     }
 
+    #[instrument(level = "debug", skip_all, fields(conn_id = %connection_id, shard = %shard_id, seqno = %data.seqno))]
     fn push_diff(&self, connection_id: usize, shard_id: &ShardId, data: &VersionedData) {
         let now = Instant::now();
         self.metrics.push_call_count.inc();
@@ -771,6 +792,7 @@ impl PubSubState {
                         shard_id: shard_id.to_string(),
                         diff: Bytes::clone(&data.data),
                     })),
+                    otel_ctx: OpenTelemetryContext::obtain().into(),
                 };
                 data_size = req.encoded_len();
                 match tx.try_send(Ok(req)) {
@@ -1004,6 +1026,12 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
                         }
                     };
 
+                    let span = info_span!("persist_pubsub_connection::handle_message");
+                    let _guard = span.enter();
+
+                    let otel_ctx = OpenTelemetryContext::from(req.otel_ctx);
+                    otel_ctx.attach_as_parent();
+
                     match req.message {
                         None => {
                             warn!("received empty message from: {}", caller_id);
@@ -1014,6 +1042,10 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
                                 seqno: req.seqno.into_rust().expect("WIP"),
                                 data: req.diff.clone(),
                             };
+                            info!(
+                                "pubsub server: Assuming context for ({}, {}): {:?}",
+                                shard_id, diff.seqno, otel_ctx
+                            );
                             if dynamic_cfg.pubsub_push_diff_enabled() {
                                 connection.push_diff(&shard_id, &diff);
                             }
