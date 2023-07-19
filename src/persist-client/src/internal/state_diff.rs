@@ -270,12 +270,14 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
 }
 
 impl<T: Timestamp + Lattice + Codec64> State<T> {
+    #[must_use]
     pub fn apply_encoded_diffs<'a, I: IntoIterator<Item = &'a VersionedData>>(
         &mut self,
         cfg: &PersistConfig,
         metrics: &Metrics,
         diffs: I,
-    ) {
+        // WIP: remove need for Owned
+    ) -> Vec<VersionedData> {
         let mut state_seqno = self.seqno;
         let diffs = diffs.into_iter().filter_map(move |x| {
             if x.seqno != state_seqno.next() {
@@ -290,9 +292,11 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
                 .decode(|| StateDiff::decode(&cfg.build_version, x.data.clone()));
             assert_eq!(diff.seqno_from, state_seqno);
             state_seqno = diff.seqno_to;
-            Some((diff, data))
+            Some(((diff, data), x.to_owned()))
         });
-        self.apply_diffs(metrics, diffs);
+        let (decoded_diffs, encoded_diffs): (Vec<_>, Vec<_>) = diffs.unzip();
+        self.apply_diffs(metrics, decoded_diffs);
+        encoded_diffs
     }
 }
 

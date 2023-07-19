@@ -670,19 +670,24 @@ impl<T: Timestamp + Lattice + Codec64> UntypedState<T> {
         &self.state.collections.rollups
     }
 
+    #[must_use]
     pub fn apply_encoded_diffs<'a, I: IntoIterator<Item = &'a VersionedData>>(
         &mut self,
         cfg: &PersistConfig,
         metrics: &Metrics,
         diffs: I,
-    ) {
+    ) -> Vec<VersionedData> {
         // The apply_encoded_diffs might panic if T is not correct. Making this
         // a silent no-op is far too subtle for my taste, but it's not clear
         // what else we could do instead.
         if T::codec_name() != self.ts_codec {
-            return;
+            return vec![];
         }
-        self.state.apply_encoded_diffs(cfg, metrics, diffs);
+        self.state
+            .apply_encoded_diffs(cfg, metrics, diffs)
+            .into_iter()
+            .clone()
+            .collect()
     }
 
     pub fn check_codecs<K: Codec, V: Codec, D: Codec64>(

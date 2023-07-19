@@ -19,6 +19,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
+use futures_util::TryFutureExt;
 use mz_ore::cast::CastFrom;
 use mz_persist::location::{
     Atomicity, Blob, CaSResult, Consensus, Indeterminate, SeqNo, VersionedData, SCAN_ALL,
@@ -140,7 +141,7 @@ impl StateVersions {
     pub async fn maybe_init_shard<K, V, T, D>(
         &self,
         shard_metrics: &ShardMetrics,
-    ) -> Result<TypedState<K, V, T, D>, Box<CodecMismatch>>
+    ) -> Result<(TypedState<K, V, T, D>, Vec<VersionedData>), Box<CodecMismatch>>
     where
         K: Debug + Codec,
         V: Debug + Codec,
@@ -152,10 +153,11 @@ impl StateVersions {
         // The common case is that the shard is initialized, so try that first
         let recent_live_diffs = self.fetch_recent_live_diffs::<T>(&shard_id).await;
         if !recent_live_diffs.0.is_empty() {
-            return self
+            let (state, applied_diffs) = self
                 .fetch_current_state(&shard_id, recent_live_diffs.0)
-                .await
-                .check_codecs(&shard_id);
+                .await;
+            let state = state.check_codecs(&shard_id);
+            return state.map(|x| (x, applied_diffs));
         }
 
         // Shard is not initialized, try initializing it.
@@ -174,13 +176,14 @@ impl StateVersions {
             })
             .await;
         match cas_res {
-            CaSResult::Committed => Ok(initial_state),
+            // WIP: think more about initial diff
+            CaSResult::Committed => Ok((initial_state, vec![])),
             CaSResult::ExpectationMismatch => {
                 let recent_live_diffs = self.fetch_recent_live_diffs::<T>(&shard_id).await;
-                let state = self
+                let (state, applied_diffs) = self
                     .fetch_current_state(&shard_id, recent_live_diffs.0)
-                    .await
-                    .check_codecs(&shard_id);
+                    .await;
+                let state = state.check_codecs(&shard_id);
 
                 // Clean up the rollup blob that we were trying to reference.
                 //
@@ -204,7 +207,7 @@ impl StateVersions {
                     self.delete_rollup(&shard_id, &rollup.key).await;
                 }
 
-                state
+                Ok((state, applied_diffs))
             }
         }
     }
@@ -334,7 +337,7 @@ impl StateVersions {
         &self,
         shard_id: &ShardId,
         mut live_diffs: Vec<VersionedData>,
-    ) -> UntypedState<T>
+    ) -> (UntypedState<T>, Vec<VersionedData>)
     where
         T: Timestamp + Lattice + Codec64,
     {
@@ -387,8 +390,8 @@ impl StateVersions {
                 }
             };
 
-            state.apply_encoded_diffs(&self.cfg, &self.metrics, &live_diffs);
-            return state;
+            let applied_diffs = state.apply_encoded_diffs(&self.cfg, &self.metrics, &live_diffs);
+            return (state, applied_diffs);
         }
     }
 
@@ -702,7 +705,8 @@ impl StateVersions {
                 })
         });
 
-        let state = self.fetch_current_state::<T>(shard_id, live_diffs).await;
+        // WIP: how to more carefully draw this line
+        let (state, _unneeded_diffs) = self.fetch_current_state::<T>(shard_id, live_diffs).await;
         if let Some(rollup) = state.rollups().get(&seqno) {
             return self.fetch_rollup_at_key(shard_id, &rollup.key).await;
         }

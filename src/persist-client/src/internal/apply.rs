@@ -297,7 +297,7 @@ where
                 ApplyCmdResult::Committed((diff, new_state, res, maintenance)) => {
                     cmd.succeeded.inc();
                     self.shard_metrics.cmd_succeeded.inc();
-                    self.update_state(new_state);
+                    self.update_state(new_state, &diff);
                     if self.cfg.dynamic.pubsub_push_diff_enabled() {
                         self.pubsub_sender.push_diff(&self.shard_id, &diff);
                     }
@@ -480,17 +480,19 @@ where
         })
     }
 
-    pub fn update_state(&mut self, new_state: TypedState<K, V, T, D>) {
-        let (seqno_before, seqno_after) =
-            self.state
-                .write_lock(&self.metrics.locks.applier_write, |state| {
-                    let seqno_before = state.seqno;
-                    if seqno_before < new_state.seqno {
-                        *state = new_state;
-                    }
-                    let seqno_after = state.seqno;
-                    (seqno_before, seqno_after)
-                });
+    pub fn update_state(&mut self, new_state: TypedState<K, V, T, D>, diff: &VersionedData) {
+        let (seqno_before, seqno_after) = self.state.write_lock(
+            &self.metrics.locks.applier_write,
+            |(state, buffered_diffs)| {
+                let seqno_before = state.seqno;
+                if seqno_before < new_state.seqno {
+                    *state = new_state;
+                    buffered_diffs.add_diffs(state, vec![diff.clone()]);
+                }
+                let seqno_after = state.seqno;
+                (seqno_before, seqno_after)
+            },
+        );
 
         assert!(
             seqno_before <= seqno_after,
@@ -529,12 +531,15 @@ where
             return;
         }
 
-        let new_seqno = self
-            .state
-            .write_lock(&self.metrics.locks.applier_write, |state| {
-                state.apply_encoded_diffs(&self.cfg, &self.metrics, &diffs_to_current);
+        let new_seqno = self.state.write_lock(
+            &self.metrics.locks.applier_write,
+            |(state, buffered_diffs)| {
+                let applied =
+                    state.apply_encoded_diffs(&self.cfg, &self.metrics, &diffs_to_current);
+                buffered_diffs.add_diffs(state, applied);
                 state.seqno
-            });
+            },
+        );
 
         assert!(
             seqno_before <= new_seqno,
@@ -553,21 +558,24 @@ where
         // our state is so old there aren't any diffs we can use to
         // catch up directly. fall back to fully refetching state.
         // we can reuse the recent diffs we already have as a hint.
-        let new_state = self
+        let (new_state, applied_diffs) = self
             .state_versions
             .fetch_current_state(&self.shard_id, diffs_to_current)
-            .await
+            .await;
+        let new_state = new_state
             .check_codecs::<K, V, D>(&self.shard_id)
             .expect("shard codecs should not change");
 
-        let new_seqno = self
-            .state
-            .write_lock(&self.metrics.locks.applier_write, |state| {
+        let new_seqno = self.state.write_lock(
+            &self.metrics.locks.applier_write,
+            |(state, buffered_diffs)| {
                 if state.seqno < new_state.seqno {
                     *state = new_state;
+                    buffered_diffs.add_diffs(state, applied_diffs);
                 }
                 state.seqno
-            });
+            },
+        );
 
         self.metrics.state.update_state_slow_path.inc();
         assert!(

@@ -317,32 +317,38 @@ where
     }
 
     fn push_diff(&self, diff: VersionedData) {
-        self.write_lock(&self.metrics.locks.applier_write, |state| {
-            let seqno_before = state.seqno;
-            state.apply_encoded_diffs(&self.cfg, &self.metrics, std::iter::once(&diff));
-            let seqno_after = state.seqno;
-            assert!(seqno_after >= seqno_before);
+        self.write_lock(
+            &self.metrics.locks.applier_write,
+            |(state, buffered_diffs)| {
+                let seqno_before = state.seqno;
+                let applied =
+                    state.apply_encoded_diffs(&self.cfg, &self.metrics, std::iter::once(&diff));
+                let seqno_after = state.seqno;
+                assert!(seqno_after >= seqno_before);
 
-            if seqno_before != seqno_after {
-                debug!(
-                    "applied pushed diff {}. seqno {} -> {}.",
-                    state.shard_id, seqno_before, state.seqno
-                );
-                self.shard_metrics.pubsub_push_diff_applied.inc();
-            } else {
-                debug!(
-                    "failed to apply pushed diff {}. seqno {} vs diff {}",
-                    state.shard_id, seqno_before, diff.seqno
-                );
-                if diff.seqno <= seqno_before {
-                    self.shard_metrics.pubsub_push_diff_not_applied_stale.inc();
+                buffered_diffs.add_diffs(state, applied);
+
+                if seqno_before != seqno_after {
+                    debug!(
+                        "applied pushed diff {}. seqno {} -> {}.",
+                        state.shard_id, seqno_before, state.seqno
+                    );
+                    self.shard_metrics.pubsub_push_diff_applied.inc();
                 } else {
-                    self.shard_metrics
-                        .pubsub_push_diff_not_applied_out_of_order
-                        .inc();
+                    debug!(
+                        "failed to apply pushed diff {}. seqno {} vs diff {}",
+                        state.shard_id, seqno_before, diff.seqno
+                    );
+                    if diff.seqno <= seqno_before {
+                        self.shard_metrics.pubsub_push_diff_not_applied_stale.inc();
+                    } else {
+                        self.shard_metrics
+                            .pubsub_push_diff_not_applied_out_of_order
+                            .inc();
+                    }
                 }
-            }
-        })
+            },
+        )
     }
 }
 
@@ -408,7 +414,9 @@ impl StateCache {
         V: Debug + Codec,
         T: Timestamp + Lattice + Codec64,
         D: Semigroup + Codec64,
-        F: Future<Output = Result<TypedState<K, V, T, D>, Box<CodecMismatch>>>,
+        F: Future<
+            Output = Result<(TypedState<K, V, T, D>, Vec<VersionedData>), Box<CodecMismatch>>,
+        >,
         InitFn: FnMut() -> F,
     {
         loop {
@@ -436,10 +444,11 @@ impl StateCache {
                     let mut did_init: Option<Arc<LockingTypedState<K, V, T, D>>> = None;
                     let state = init_once
                         .get_or_try_init::<Box<CodecMismatch>, _, _>(|| async {
-                            let init_res = init_fn().await;
+                            let (init_res, init_diffs) = init_fn().await?;
                             let state = Arc::new(LockingTypedState::new(
                                 shard_id,
-                                init_res?,
+                                init_res,
+                                init_diffs,
                                 Arc::clone(&self.metrics),
                                 Arc::clone(&self.cfg),
                                 Arc::clone(&self.pubsub_sender).subscribe(&shard_id),
@@ -536,7 +545,7 @@ impl StateCache {
 /// simpler to reason about.
 pub(crate) struct LockingTypedState<K, V, T, D> {
     shard_id: ShardId,
-    state: RwLock<TypedState<K, V, T, D>>,
+    state: RwLock<(TypedState<K, V, T, D>, BufferedDiffs)>,
     notifier: StateWatchNotifier,
     cfg: Arc<PersistConfig>,
     metrics: Arc<Metrics>,
@@ -567,6 +576,7 @@ impl<K, V, T, D> LockingTypedState<K, V, T, D> {
     fn new(
         shard_id: ShardId,
         initial_state: TypedState<K, V, T, D>,
+        initial_diffs: Vec<VersionedData>,
         metrics: Arc<Metrics>,
         cfg: Arc<PersistConfig>,
         subscription_token: Arc<ShardSubscriptionToken>,
@@ -575,7 +585,12 @@ impl<K, V, T, D> LockingTypedState<K, V, T, D> {
         Self {
             shard_id,
             notifier: StateWatchNotifier::new(Arc::clone(&metrics)),
-            state: RwLock::new(initial_state),
+            state: RwLock::new((
+                initial_state,
+                BufferedDiffs {
+                    diffs: initial_diffs,
+                },
+            )),
             cfg: Arc::clone(&cfg),
             shard_metrics: metrics.shards.shard(&shard_id, &diagnostics.shard_name),
             metrics,
@@ -606,10 +621,10 @@ impl<K, V, T, D> LockingTypedState<K, V, T, D> {
             }
             Err(TryLockError::Poisoned(err)) => panic!("state read lock poisoned: {}", err),
         };
-        f(&state)
+        f(&state.0)
     }
 
-    pub(crate) fn write_lock<R, F: FnOnce(&mut TypedState<K, V, T, D>) -> R>(
+    pub(crate) fn write_lock<R, F: FnOnce(&mut (TypedState<K, V, T, D>, BufferedDiffs)) -> R>(
         &self,
         metrics: &LockMetrics,
         f: F,
@@ -628,12 +643,13 @@ impl<K, V, T, D> LockingTypedState<K, V, T, D> {
             }
             Err(TryLockError::Poisoned(err)) => panic!("state read lock poisoned: {}", err),
         };
-        let seqno_before = state.seqno;
+        let seqno_before = state.0.seqno;
         let ret = f(&mut state);
-        let seqno_after = state.seqno;
+        let seqno_after = state.0.seqno;
         debug_assert!(seqno_after >= seqno_before);
         if seqno_after > seqno_before {
             self.notifier.notify(seqno_after);
+            state.1.validate(&state.0);
         }
         // For now, make sure to notify while under lock. It's possible to move
         // this out of the lock window, see [StateWatchNotifier::notify].
@@ -643,6 +659,65 @@ impl<K, V, T, D> LockingTypedState<K, V, T, D> {
 
     pub(crate) fn notifier(&self) -> &StateWatchNotifier {
         &self.notifier
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BufferedDiffs {
+    diffs: Vec<VersionedData>,
+}
+
+impl BufferedDiffs {
+    fn new() -> Self {
+        Self { diffs: vec![] }
+    }
+
+    pub(crate) fn validate<'a, K, V, T, D>(&self, state: &TypedState<K, V, T, D>) {
+        let latest_rollup_seqno = state
+            .collections
+            .rollups
+            .last_key_value()
+            .expect("shard has at least 1 rollup")
+            .0;
+
+        let mut seqno = *latest_rollup_seqno;
+        for diff in &self.diffs {
+            assert_eq!(seqno.next(), diff.seqno);
+            seqno = diff.seqno;
+        }
+
+        assert_eq!(seqno.next(), state.seqno);
+    }
+
+    pub(crate) fn add_diffs<K, V, T, D>(
+        &mut self,
+        state: &mut TypedState<K, V, T, D>,
+        new_diffs: Vec<VersionedData>,
+    ) {
+        let latest_rollup_seqno = state
+            .collections
+            .rollups
+            .last_key_value()
+            .expect("shard has at least 1 rollup")
+            .0;
+
+        self.diffs.retain(|x| x.seqno >= *latest_rollup_seqno);
+
+        if new_diffs.is_empty() {
+            return;
+        }
+
+        let mut seqno = self
+            .diffs
+            .last()
+            .map(|x| x.seqno)
+            .unwrap_or(*latest_rollup_seqno);
+
+        for new_diff in new_diffs {
+            assert_eq!(new_diff.seqno, seqno.next());
+            seqno = new_diff.seqno;
+            self.diffs.push(new_diff);
+        }
     }
 }
 
