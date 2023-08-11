@@ -12,14 +12,18 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::env::var;
 use std::rc::Rc;
 use std::time::Duration;
 
 use differential_dataflow::collection::AsCollection;
 use differential_dataflow::operators::arrange::Arranged;
 use differential_dataflow::trace::TraceReader;
+use differential_dataflow::Hashable;
 use mz_expr::{permutation_for_arrangement, MirScalarExpr};
 use mz_ore::cast::CastFrom;
+use mz_ore::metrics::GaugeVecExt;
+use mz_persist_types::Codec64;
 use mz_repr::{Datum, DatumVec, Diff, GlobalId, Row, Timestamp};
 use mz_timely_util::replay::MzReplay;
 use timely::communication::Allocate;
@@ -33,7 +37,7 @@ use timely::logging::WorkerIdentifier;
 use timely::scheduling::Scheduler;
 use timely::worker::Worker;
 use timely::Container;
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::compute_state::ComputeState;
@@ -256,13 +260,21 @@ pub(super) fn construct<A: Allocate + 'static>(
                 Datum::UInt64(u64::cast_from(worker_id)),
             ])
         });
-        let frontier_current = frontier.as_collection().map(move |datum| {
-            Row::pack_slice(&[
-                Datum::String(&datum.export_id.to_string()),
-                Datum::UInt64(u64::cast_from(worker_id)),
-                Datum::MzTimestamp(datum.frontier),
-            ])
-        });
+        let frontier_metric = compute_state.metrics.frontier_current.clone();
+        let frontier_current = frontier
+            .as_collection()
+            .inspect(move |(frontier, time, diff)| {
+                let frontier_current_metric = frontier_metric
+                    .with_label_values(&[&frontier.export_id.to_string(), &worker_id.to_string()]);
+                frontier_current_metric.set(Codec64::decode(Codec64::encode(time)));
+            })
+            .map(move |datum| {
+                Row::pack_slice(&[
+                    Datum::String(&datum.export_id.to_string()),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                    Datum::MzTimestamp(datum.frontier),
+                ])
+            });
         let import_frontier_current = import_frontier.as_collection().map(move |datum| {
             Row::pack_slice(&[
                 Datum::String(&datum.export_id.to_string()),
@@ -347,7 +359,30 @@ pub(super) fn construct<A: Allocate + 'static>(
                         .collect::<Vec<_>>(),
                     variant.desc().arity(),
                 );
+                let variant_clone = variant.clone();
                 let trace = collection
+                    .inspect(move |(row, t, d)| match &variant_clone {
+                        LogVariant::Timely(_) => {}
+                        LogVariant::Differential(_) => {}
+                        LogVariant::Compute(compute_log) => match compute_log {
+                            DataflowCurrent => {}
+                            DataflowDependency => {}
+                            FrontierCurrent => {
+                                info!("Worker: {}. Frontier Current: {:?}", worker_id, row);
+                                // .with_column("export_id", ScalarType::String.nullable(false))
+                                //     .with_column("worker_id", ScalarType::UInt64.nullable(false))
+                                //     .with_column("time", ScalarType::MzTimestamp.nullable(false)),
+                            }
+                            PeekCurrent => {}
+                            PeekDuration => {}
+                            FrontierDelay => {}
+                            ImportFrontierCurrent => {}
+                            ArrangementHeapSize => {}
+                            ArrangementHeapCapacity => {}
+                            ArrangementHeapAllocations => {}
+                            ShutdownDuration => {}
+                        },
+                    })
                     .map({
                         let mut row_buf = Row::default();
                         let mut datums = DatumVec::new();
@@ -366,6 +401,8 @@ pub(super) fn construct<A: Allocate + 'static>(
                     )
                     .trace;
                 traces.insert(variant.clone(), (trace, Rc::clone(&token)));
+
+                // WIP: send log to operator
             }
         }
 

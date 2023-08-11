@@ -30,6 +30,9 @@ pub struct ComputeMetrics {
     // arrangements
     arrangement_maintenance_seconds_total: raw::CounterVec,
     arrangement_maintenance_active_info: raw::UIntGaugeVec,
+
+    // log
+    pub(crate) frontier_current: raw::UIntGaugeVec,
 }
 
 impl ComputeMetrics {
@@ -68,6 +71,11 @@ impl ComputeMetrics {
                 name: "mz_arrangement_maintenance_active_info",
                 help: "Whether maintenance is currently occuring.",
                 var_labels: ["worker_id"],
+            )),
+            frontier_current: registry.register(metric!(
+                name: "mz_compute_log_frontier_current",
+                help: "abc",
+                var_labels: ["export_id", "worker_id"],
             )),
         }
     }

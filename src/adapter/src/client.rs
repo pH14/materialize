@@ -34,7 +34,7 @@ use mz_sql_parser::parser::{ParserStatementError, StatementParseResult};
 use prometheus::Histogram;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::command::{
@@ -289,6 +289,7 @@ impl SessionClient {
         &self,
         sql: &'a str,
     ) -> Result<Result<Vec<StatementParseResult<'a>>, ParserStatementError>, String> {
+        info!("SQL: {}", sql);
         match mz_sql::parse::parse_with_limit(sql) {
             Ok(Err(e)) => {
                 self.track_statement_parse_failure(&e);
