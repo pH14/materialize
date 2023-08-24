@@ -1051,10 +1051,19 @@ pub struct StateMetrics {
     pub(crate) fetch_recent_live_diffs_slow_path: IntCounter,
     pub(crate) writer_added: IntCounter,
     pub(crate) writer_removed: IntCounter,
+    pub(crate) rollup_write_success: IntCounter,
+    pub(crate) rollup_write_noop_latest: IntCounter,
+    pub(crate) rollup_write_noop_truncated: IntCounter,
 }
 
 impl StateMetrics {
     pub(crate) fn new(registry: &MetricsRegistry) -> Self {
+        let rollup_write_noop: IntCounterVec = registry.register(metric!(
+                name: "mz_persist_state_rollup_write_noop",
+                help: "count of no-op rollup writes",
+                var_labels: ["reason"],
+        ));
+
         StateMetrics {
             apply_spine_fast_path: registry.register(metric!(
                 name: "mz_persist_state_apply_spine_fast_path",
@@ -1112,6 +1121,12 @@ impl StateMetrics {
                 name: "mz_persist_state_writer_removed",
                 help: "count of writers removed from the state",
             )),
+            rollup_write_success: registry.register(metric!(
+                name: "mz_persist_state_rollup_write_success",
+                help: "count of rollups written successful (may not be linked in to state)",
+            )),
+            rollup_write_noop_latest: rollup_write_noop.with_label_values(&["latest"]),
+            rollup_write_noop_truncated: rollup_write_noop.with_label_values(&["truncated"]),
         }
     }
 }
