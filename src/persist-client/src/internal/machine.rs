@@ -1030,7 +1030,6 @@ where
 #[cfg(test)]
 pub mod datadriven {
     use std::collections::BTreeMap;
-    use std::marker::PhantomData;
     use std::sync::Arc;
 
     use anyhow::anyhow;
@@ -1047,7 +1046,6 @@ pub mod datadriven {
     use crate::internal::encoding::Schemas;
     use crate::internal::gc::GcReq;
     use crate::internal::paths::{BlobKey, BlobKeyPrefix, PartialBlobKey};
-    use crate::internal::state::TypedState;
     use crate::internal::state_versions::EncodedRollup;
     use crate::read::{Listen, ListenEvent};
     use crate::rpc::NoopPubSubSender;
