@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS consensus (
     sequence_number bigint NOT NULL,
     data bytea NOT NULL,
     PRIMARY KEY(shard, sequence_number)
-) WITH (sql_stats_automatic_collection_enabled = false);
+);
 ";
 
 impl ToSql for SeqNo {
@@ -198,8 +198,8 @@ impl PostgresConsensus {
         // See: https://www.cockroachlabs.com/docs/stable/configure-zone.html#variables
         match client
             .batch_execute(&format!(
-                "{} {}",
-                SCHEMA, "ALTER TABLE consensus CONFIGURE ZONE USING gc.ttlseconds = 600;",
+                "{}",
+                SCHEMA,
             ))
             .await
         {

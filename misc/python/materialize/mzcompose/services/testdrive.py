@@ -152,11 +152,11 @@ class Testdrive(Service):
         if external_cockroach:
             depends_graph["cockroach"] = {"condition": "service_healthy"}
             entrypoint.append(
-                "--persist-consensus-url=postgres://root@cockroach:26257?options=--search_path=consensus"
+                "--persist-consensus-url=postgres://postgres:postgres@postgres:5432"
             )
         else:
             entrypoint.append(
-                f"--persist-consensus-url=postgres://root@{mz_service}:26257?options=--search_path=consensus"
+                "--persist-consensus-url=postgres://postgres:postgres@postgres:5432"
             )
 
         entrypoint.extend(entrypoint_extra)

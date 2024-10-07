@@ -189,7 +189,7 @@ class EnvironmentdStatefulSet(K8sStatefulSet):
             "--orchestrator=kubernetes",
             "--orchestrator-kubernetes-image-pull-policy=if-not-present",
             "--orchestrator-kubernetes-service-fs-group=999",
-            f"--persist-consensus-url=postgres://root@cockroach.{self.cockroach_namespace}:26257?options=--search_path=consensus",
+            "--persist-consensus-url=postgres://postgres@postgres:postgres:5432",
             "--internal-sql-listen-addr=0.0.0.0:6877",
             "--internal-http-listen-addr=0.0.0.0:6878",
             "--unsafe-mode",
@@ -242,11 +242,11 @@ class EnvironmentdStatefulSet(K8sStatefulSet):
 
         if self._meets_minimum_version("0.79.0-dev"):
             args += [
-                f"--timestamp-oracle-url=postgres://root@cockroach.{self.cockroach_namespace}:26257?options=--search_path=tsoracle"
+                "--timestamp-oracle-url=postgres://postgres@postgres:postgres:5432"
             ]
         if not self._meets_minimum_version("0.105.0-dev"):
             args += [
-                f"--storage-stash-url=postgres://root@cockroach.{self.cockroach_namespace}:26257?options=--search_path=storage"
+                "--storage-stash-url=postgres://root@postgres@postgres:postgres:5432"
             ]
         if self._meets_minimum_version("0.118.0-dev"):
             args += [
@@ -305,7 +305,7 @@ class EnvironmentdStatefulSet(K8sStatefulSet):
             # v0.92.0).
             V1EnvVar(
                 name="MZ_ADAPTER_STASH_URL",
-                value=f"postgres://root@cockroach.{self.cockroach_namespace}:26257?options=--search_path=adapter",
+                value="postgres://postgres@postgres:postgres:5432",
             ),
         ]
 

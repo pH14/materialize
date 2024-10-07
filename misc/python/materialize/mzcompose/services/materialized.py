@@ -178,24 +178,24 @@ class Materialized(Service):
             address = "postgres" if external_postgres == True else external_postgres
             depends_graph["postgres"] = {"condition": "service_healthy"}
             command += [
-                f"--persist-consensus-url=postgres://postgres:postgres@{address}:5432?options=--search_path=consensus",
+                f"--persist-consensus-url=postgres://postgres:postgres@{address}:5432",
             ]
             environment += [
-                f"MZ_TIMESTAMP_ORACLE_URL=postgres://postgres:postgres@{address}:5432?options=--search_path=tsoracle",
+                f"MZ_TIMESTAMP_ORACLE_URL=postgres://postgres:postgres@{address}:5432",
                 "MZ_NO_BUILTIN_COCKROACH=1",
             ]
         elif external_cockroach:
             address = "cockroach" if external_cockroach == True else external_cockroach
             depends_graph["cockroach"] = {"condition": "service_healthy"}
             command += [
-                f"--persist-consensus-url=postgres://root@{address}:26257?options=--search_path=consensus",
+                "--persist-consensus-url=postgres://postgres@postgres:postgres:5432",
             ]
             environment += [
-                f"MZ_TIMESTAMP_ORACLE_URL=postgres://root@{address}:26257?options=--search_path=tsoracle",
+                "MZ_TIMESTAMP_ORACLE_URL=postgres://postgres@postgres:postgres:5432",
                 "MZ_NO_BUILTIN_COCKROACH=1",
                 # Set the adapter stash URL for older environments that need it (versions before
                 # v0.92.0).
-                f"MZ_ADAPTER_STASH_URL=postgres://root@{address}:26257?options=--search_path=adapter",
+                "MZ_ADAPTER_STASH_URL=postgres://postgres@postgres:postgres:5432",
             ]
 
         command += [

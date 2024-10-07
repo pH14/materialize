@@ -39,7 +39,7 @@ SANITIZER_TARGET = (
     if sys.platform.startswith("linux")
     else f"{Arch.host()}-apple-darwin"
 )
-DEFAULT_POSTGRES = "postgres://root@localhost:26257/materialize"
+DEFAULT_POSTGRES = "postgres://postgres@postgres:postgres:5432"
 
 # sets entitlements on the built binary, e.g. environmentd, so you can inspect it with Instruments
 MACOS_ENTITLEMENTS_DATA = """
@@ -262,9 +262,9 @@ def main() -> int:
                 f"--orchestrator-process-prometheus-service-discovery-directory={mzdata}/prometheus",
                 f"--orchestrator-process-scratch-directory={scratch}",
                 "--secrets-controller=local-file",
-                f"--persist-consensus-url={args.postgres}?options=--search_path=consensus",
+                "--persist-consensus-url=postgres@postgres:postgres:5432",
                 f"--persist-blob-url=file://{mzdata}/persist/blob",
-                f"--timestamp-oracle-url={args.postgres}?options=--search_path=tsoracle",
+                "--timestamp-oracle-url=postgres@postgres:postgres:5432",
                 f"--environment-id={environment_id}",
                 "--bootstrap-role=materialize",
                 *args.args,
