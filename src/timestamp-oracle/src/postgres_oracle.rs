@@ -439,13 +439,13 @@ where
             //
             // See: https://github.com/MaterializeInc/database-issues/issues/4001
             // See: https://www.cockroachlabs.com/docs/stable/configure-zone.html#variables
-            client
-                .batch_execute(&format!(
-                    "{} {}",
-                    SCHEMA,
-                    "ALTER TABLE timestamp_oracle CONFIGURE ZONE USING gc.ttlseconds = 600;",
-                ))
-                .await?;
+            //client
+            //    .batch_execute(&format!(
+            //        "{} {}",
+            //        SCHEMA,
+            //        "ALTER TABLE timestamp_oracle CONFIGURE ZONE USING gc.ttlseconds = 600;",
+            //    ))
+            //    .await?;
 
             let oracle = PostgresTimestampOracle {
                 timeline: timeline.clone(),
