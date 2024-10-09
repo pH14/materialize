@@ -362,10 +362,7 @@ impl Listeners {
                     CREATE SCHEMA IF NOT EXISTS tsoracle_{seed};"
                 ))
                 .await?;
-            (
-                format!("{cockroach_url}?options=--search_path=consensus_{seed}"),
-                format!("{cockroach_url}?options=--search_path=tsoracle_{seed}"),
-            )
+            (format!("{cockroach_url}"), format!("{cockroach_url}"))
         };
         let metrics_registry = config.metrics_registry.unwrap_or_else(MetricsRegistry::new);
         let orchestrator = ProcessOrchestrator::new(ProcessOrchestratorConfig {
