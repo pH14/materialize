@@ -33,7 +33,7 @@ SERVICES = [
     Kafka(),
     SchemaRegistry(),
     Redpanda(),
-    Postgres(),
+    Postgres(setup_materialize=True),
     MySql(),
     Minio(setup_materialize=True, additional_directories=["copytos3"]),
     Materialized(external_minio=True, external_postgres=True),
