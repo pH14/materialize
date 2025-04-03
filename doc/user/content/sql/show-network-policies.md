@@ -6,7 +6,6 @@ menu:
     parent: commands
 ---
 
-{{< private-preview />}}
 
 `SHOW NETWORK POLICIES` returns a list of all network policies configured in
 Materialize. Network policies are part of Materialize's framework for
@@ -18,9 +17,9 @@ Materialize. Network policies are part of Materialize's framework for
 SHOW NETWORK POLICIES [ LIKE <pattern> ]
 ```
 
-Option                     | Description
----------------------------|------------
-**LIKE** \<pattern\>       | If specified, only show network policies whose name matches the pattern.
+ Option               | Description                                                              
+----------------------|--------------------------------------------------------------------------
+ **LIKE** \<pattern\> | If specified, only show network policies whose name matches the pattern. 
 
 ## Pre-installed network policy
 
@@ -40,6 +39,7 @@ change the default value.
 ```mzsql
 SHOW NETWORK POLICIES;
 ```
+
 ```nofmt
 | name                 | rules              | comment |
 | -------------------- | ------------------ | ------- |
@@ -54,6 +54,7 @@ system catalog table.
 ```mzsql
 SELECT * FROM mz_internal.mz_network_policy_rules;
 ```
+
 ```nofmt
 | name         | policy_id | action | address    | direction |
 | ------------ | --------- | ------ | ---------- | --------- |
