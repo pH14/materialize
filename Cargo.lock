@@ -7327,6 +7327,7 @@ dependencies = [
  "mz-persist",
  "prometheus",
  "prost",
+ "rand 0.8.5",
  "tokio",
  "tokio-stream",
  "tonic",
