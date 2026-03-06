@@ -7396,10 +7396,13 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
+ "aws-sdk-kms",
  "aws-sdk-s3",
  "axum",
  "bytes",
  "clap",
+ "criterion",
  "mz-aws-util",
  "mz-http-util",
  "mz-ore",
