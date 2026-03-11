@@ -7319,6 +7319,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "axum",
+ "bincode",
  "bytes",
  "clap",
  "mz-aws-util",
