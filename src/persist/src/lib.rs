@@ -30,6 +30,7 @@ pub mod location;
 pub mod mem;
 pub mod metrics;
 pub mod postgres;
+pub mod quorum;
 pub mod retry;
 pub mod s3;
 #[cfg(feature = "turmoil")]

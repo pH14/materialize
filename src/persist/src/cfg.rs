@@ -29,6 +29,7 @@ use crate::location::{Blob, Consensus, Determinate, ExternalError};
 use crate::mem::{MemBlob, MemBlobConfig, MemConsensus};
 use crate::metrics::S3BlobMetrics;
 use crate::postgres::{PostgresConsensus, PostgresConsensusConfig};
+use crate::quorum::{QuorumBlob, QuorumBlobConfig, SharedBlobKnobs};
 use crate::s3::{S3Blob, S3BlobConfig};
 
 /// Adds the full set of all mz_persist `Config`s.
@@ -53,6 +54,8 @@ pub enum BlobConfig {
     Mem(bool),
     /// Config for [AzureBlob].
     Azure(AzureBlobConfig),
+    /// Config for [QuorumBlob].
+    Quorum(QuorumBlobConfig),
     #[cfg(feature = "turmoil")]
     /// Config for [crate::turmoil::TurmoilBlob].
     Turmoil(crate::turmoil::BlobConfig),
@@ -74,17 +77,27 @@ pub trait BlobKnobs: std::fmt::Debug + Send + Sync {
 
 impl BlobConfig {
     /// Opens the associated implementation of [Blob].
-    pub async fn open(self) -> Result<Arc<dyn Blob>, ExternalError> {
-        match self {
-            BlobConfig::File(config) => Ok(Arc::new(FileBlob::open(config).await?)),
-            BlobConfig::S3(config) => Ok(Arc::new(S3Blob::open(config).await?)),
-            BlobConfig::Azure(config) => Ok(Arc::new(AzureBlob::open(config).await?)),
-            BlobConfig::Mem(tombstone) => {
-                Ok(Arc::new(MemBlob::open(MemBlobConfig::new(tombstone))))
-            }
-            #[cfg(feature = "turmoil")]
-            BlobConfig::Turmoil(config) => Ok(Arc::new(crate::turmoil::TurmoilBlob::open(config))),
-        }
+    pub fn open(
+        self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<dyn Blob>, ExternalError>> + Send>,
+    > {
+        Box::pin(async move {
+            let blob: Arc<dyn Blob> = match self {
+                BlobConfig::File(config) => Arc::new(FileBlob::open(config).await?),
+                BlobConfig::S3(config) => Arc::new(S3Blob::open(config).await?),
+                BlobConfig::Azure(config) => Arc::new(AzureBlob::open(config).await?),
+                BlobConfig::Quorum(config) => Arc::new(QuorumBlob::open(config).await?),
+                BlobConfig::Mem(tombstone) => {
+                    Arc::new(MemBlob::open(MemBlobConfig::new(tombstone)))
+                }
+                #[cfg(feature = "turmoil")]
+                BlobConfig::Turmoil(config) => {
+                    Arc::new(crate::turmoil::TurmoilBlob::open(config))
+                }
+            };
+            Ok(blob)
+        })
     }
 
     /// Parses a [Blob] config from a uri string.
@@ -144,6 +157,65 @@ impl BlobConfig {
                 .await?;
 
                 Ok(BlobConfig::S3(config))
+            }
+            "s3-quorum" => {
+                let host = url
+                    .host()
+                    .ok_or_else(|| anyhow!("missing buckets: {}", url.as_str()))?
+                    .to_string();
+                let buckets: Vec<&str> = host.split('+').collect();
+                if buckets.len() != 3 {
+                    return Err(ExternalError::from(anyhow!(
+                        "s3-quorum requires exactly 3 buckets separated by '+', got {}: {}",
+                        buckets.len(),
+                        url.as_str()
+                    )));
+                }
+                let prefix = url
+                    .path()
+                    .strip_prefix('/')
+                    .unwrap_or_else(|| url.path())
+                    .to_string();
+                let role_arn = query_params.remove("role_arn").map(|x| x.into_owned());
+                let endpoint = query_params.remove("endpoint").map(|x| x.into_owned());
+                let region = query_params.remove("region").map(|x| x.into_owned());
+
+                let credentials = match url.password() {
+                    None => None,
+                    Some(password) => Some((
+                        String::from_utf8_lossy(&urlencoding::decode_binary(
+                            url.username().as_bytes(),
+                        ))
+                        .into_owned(),
+                        String::from_utf8_lossy(&urlencoding::decode_binary(password.as_bytes()))
+                            .into_owned(),
+                    )),
+                };
+
+                let shared_knobs = SharedBlobKnobs(Arc::from(knobs));
+                let mut configs = Vec::with_capacity(3);
+                for bucket in buckets {
+                    let config = S3BlobConfig::new(
+                        bucket.to_string(),
+                        prefix.clone(),
+                        role_arn.clone(),
+                        endpoint.clone(),
+                        region.clone(),
+                        credentials.clone(),
+                        Box::new(shared_knobs.clone()),
+                        metrics.clone(),
+                        Arc::clone(&cfg),
+                    )
+                    .await?;
+                    configs.push(BlobConfig::S3(config));
+                }
+
+                let inner = [
+                    Box::new(configs.remove(0)),
+                    Box::new(configs.remove(0)),
+                    Box::new(configs.remove(0)),
+                ];
+                Ok(BlobConfig::Quorum(QuorumBlobConfig { inner }))
             }
             "mem" => {
                 if !cfg!(debug_assertions) {
