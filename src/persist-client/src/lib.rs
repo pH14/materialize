@@ -120,6 +120,9 @@ mod internal {
 
     #[cfg(test)]
     pub mod datadriven;
+
+    #[cfg(all(test, feature = "turmoil"))]
+    mod sim;
 }
 
 /// Persist build information.
