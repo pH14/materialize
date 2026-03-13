@@ -33,6 +33,7 @@ pub mod postgres;
 pub mod quorum;
 pub mod retry;
 pub mod s3;
+pub mod s3_consensus;
 #[cfg(feature = "turmoil")]
 pub mod turmoil;
 pub mod unreliable;

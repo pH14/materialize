@@ -31,6 +31,7 @@ use crate::metrics::S3BlobMetrics;
 use crate::postgres::{PostgresConsensus, PostgresConsensusConfig};
 use crate::quorum::{QuorumBlob, QuorumBlobConfig, SharedBlobKnobs};
 use crate::s3::{S3Blob, S3BlobConfig};
+use crate::s3_consensus::S3ConsensusConfig;
 
 /// Adds the full set of all mz_persist `Config`s.
 pub fn all_dyn_configs(configs: ConfigSet) -> ConfigSet {
@@ -92,9 +93,7 @@ impl BlobConfig {
                     Arc::new(MemBlob::open(MemBlobConfig::new(tombstone)))
                 }
                 #[cfg(feature = "turmoil")]
-                BlobConfig::Turmoil(config) => {
-                    Arc::new(crate::turmoil::TurmoilBlob::open(config))
-                }
+                BlobConfig::Turmoil(config) => Arc::new(crate::turmoil::TurmoilBlob::open(config)),
             };
             Ok(blob)
         })
@@ -301,6 +300,8 @@ pub enum ConsensusConfig {
     FoundationDB(FdbConsensusConfig),
     /// Config for [PostgresConsensus].
     Postgres(PostgresConsensusConfig),
+    /// Config for [S3QuorumConsensus].
+    S3Quorum(S3ConsensusConfig),
     /// Config for [MemConsensus], only available in testing.
     Mem,
     #[cfg(feature = "turmoil")]
@@ -319,6 +320,7 @@ impl ConsensusConfig {
             ConsensusConfig::Postgres(config) => {
                 Ok(Arc::new(PostgresConsensus::open(config).await?))
             }
+            ConsensusConfig::S3Quorum(config) => Ok(Arc::new(config.open().await?)),
             ConsensusConfig::Mem => Ok(Arc::new(MemConsensus::default())),
             #[cfg(feature = "turmoil")]
             ConsensusConfig::Turmoil(config) => {
@@ -342,6 +344,55 @@ impl ConsensusConfig {
             "postgres" | "postgresql" => Ok(ConsensusConfig::Postgres(
                 PostgresConsensusConfig::new(url, knobs, metrics, dyncfg)?,
             )),
+            "s3-consensus" => {
+                let host = url
+                    .host()
+                    .ok_or_else(|| anyhow!("missing buckets: {}", url.as_str()))?
+                    .to_string();
+                let bucket_strs: Vec<&str> = host.split('+').collect();
+                if bucket_strs.len() != 3 {
+                    return Err(ExternalError::from(anyhow!(
+                        "s3-consensus requires exactly 3 buckets separated by '+', got {}: {}",
+                        bucket_strs.len(),
+                        url.as_str()
+                    )));
+                }
+                let buckets = [
+                    bucket_strs[0].to_string(),
+                    bucket_strs[1].to_string(),
+                    bucket_strs[2].to_string(),
+                ];
+                let prefix = url
+                    .path()
+                    .strip_prefix('/')
+                    .unwrap_or_else(|| url.path())
+                    .to_string();
+
+                // Parse optional query parameters (same pattern as s3-quorum blob).
+                let mut query_params = url.query_pairs().collect::<BTreeMap<_, _>>();
+                let role_arn = query_params.remove("role_arn").map(|x| x.into_owned());
+                let endpoint = query_params.remove("endpoint").map(|x| x.into_owned());
+                let region = query_params.remove("region").map(|x| x.into_owned());
+                let credentials = match url.password() {
+                    None => None,
+                    Some(password) => Some((
+                        String::from_utf8_lossy(&urlencoding::decode_binary(
+                            url.username().as_bytes(),
+                        ))
+                        .into_owned(),
+                        String::from_utf8_lossy(&urlencoding::decode_binary(password.as_bytes()))
+                            .into_owned(),
+                    )),
+                };
+                Ok(ConsensusConfig::S3Quorum(S3ConsensusConfig {
+                    buckets,
+                    prefix,
+                    role_arn,
+                    endpoint,
+                    region,
+                    credentials,
+                }))
+            }
             "mem" => {
                 if !cfg!(debug_assertions) {
                     warn!("persist unexpectedly using in-mem consensus in a release binary");
