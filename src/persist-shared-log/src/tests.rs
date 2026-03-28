@@ -12,4 +12,5 @@
 mod persist;
 mod persist_sim;
 mod scenario;
+mod sharded;
 mod trace;

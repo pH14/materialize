@@ -9,6 +9,7 @@
 
 //! Binary entry point for the persist shared log service.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use clap::Parser;
@@ -16,11 +17,13 @@ use tonic::transport::Server;
 use tracing::info;
 
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLogServer;
+use mz_persist_client::ShardId;
 use mz_persist_shared_log::metrics::{AcceptorMetrics, LearnerMetrics};
 use mz_persist_shared_log::persist_log::acceptor::PersistAcceptor;
 use mz_persist_shared_log::persist_log::learner::{PersistLearner, PersistLearnerConfig};
-use mz_persist_shared_log::service::PersistSharedLogGrpcService;
-use mz_persist_shared_log::{Acceptor, AcceptorConfig, Learner};
+use mz_persist_shared_log::persist_log::metashard::{MetashardState, PersistMetashardActor};
+use mz_persist_shared_log::sharded_service::ShardedService;
+use mz_persist_shared_log::{AcceptorConfig, PartitionMap, RangeAssignment};
 
 /// CLI arguments for the persist shared log service.
 #[derive(Parser, Debug)]
@@ -44,9 +47,15 @@ struct Args {
     #[arg(long, env = "PERSIST_CONSENSUS_URL")]
     consensus_url: Option<String>,
 
-    /// Shard ID for the persist backend. If omitted, a new shard is created.
+    /// Shard ID for the first log shard. If omitted, new shards are created.
+    /// When using multiple log shards, subsequent shard IDs are auto-generated.
     #[arg(long, env = "PERSIST_SHARD_ID")]
     shard_id: Option<String>,
+
+    /// Number of log shards to create. Each log shard gets its own acceptor and
+    /// learner, with the key space range-partitioned across them.
+    #[arg(long, default_value = "1")]
+    num_log_shards: usize,
 }
 
 fn main() {
@@ -65,19 +74,6 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     rt.block_on(run(args));
-}
-
-/// Start the gRPC server with the given acceptor and learner handles.
-async fn serve_grpc<A: Acceptor, L: Learner>(acceptor: A, learner: L, listen_addr: SocketAddr) {
-    let service = PersistSharedLogGrpcService { acceptor, learner };
-
-    info!(addr = %listen_addr, "starting gRPC server");
-
-    Server::builder()
-        .add_service(PersistSharedLogServer::new(service))
-        .serve(listen_addr)
-        .await
-        .expect("gRPC server failed");
 }
 
 /// Spawn the HTTP metrics server on a background task.
@@ -103,13 +99,35 @@ fn spawn_metrics_server(
     });
 }
 
+/// Build a partition map that evenly divides [0x00, 0x100) across `n` shards.
+fn build_partition_map(shard_ids: &[ShardId]) -> PartitionMap {
+    let n = shard_ids.len();
+    assert!(n > 0, "need at least one log shard");
+    let range_size = 256 / n;
+    let mut ranges = Vec::with_capacity(n);
+    for (i, shard_id) in shard_ids.iter().enumerate() {
+        let lo = (i * range_size) as u8;
+        let hi_exclusive = if i == n - 1 {
+            0x100u16
+        } else {
+            ((i + 1) * range_size) as u16
+        };
+        ranges.push(RangeAssignment {
+            lo,
+            hi_exclusive,
+            log_shard: *shard_id,
+        });
+    }
+    let map = PartitionMap { epoch: 0, ranges };
+    map.validate()
+        .expect("generated partition map must be valid");
+    map
+}
+
 async fn run(args: Args) {
     let metrics_registry = mz_ore::metrics::MetricsRegistry::new();
 
     spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
-
-    let acceptor_metrics = AcceptorMetrics::register(&metrics_registry);
-    let learner_metrics = LearnerMetrics::register(&metrics_registry);
 
     let persist_client = match (&args.blob_url, &args.consensus_url) {
         (Some(blob_url), Some(consensus_url)) => {
@@ -141,24 +159,82 @@ async fn run(args: Args) {
         }
     };
 
-    let shard_id = match &args.shard_id {
-        Some(id) => id.parse().expect("invalid --shard-id"),
-        None => {
-            let id = mz_persist_client::ShardId::new();
-            info!(%id, "generated new shard ID (pass --shard-id to reuse across restarts)");
-            id
+    // Generate shard IDs for each log shard.
+    let num_shards = args.num_log_shards;
+    let mut shard_ids: Vec<ShardId> = Vec::with_capacity(num_shards);
+    if let Some(id) = &args.shard_id {
+        shard_ids.push(id.parse().expect("invalid --shard-id"));
+    }
+    while shard_ids.len() < num_shards {
+        let id = ShardId::new();
+        info!(%id, index = shard_ids.len(), "generated log shard ID");
+        shard_ids.push(id);
+    }
+
+    let partition_map = build_partition_map(&shard_ids);
+    info!(
+        num_shards = num_shards,
+        "partition map: {:?}",
+        partition_map.ranges.iter().map(|r| format!(
+            "[0x{:02x}, 0x{:03x}) -> {}",
+            r.lo, r.hi_exclusive, r.log_shard
+        )).collect::<Vec<_>>()
+    );
+
+    // Spawn metashard actor (static partition map for now).
+    let metashard_state = if num_shards == 1 {
+        MetashardState::single(shard_ids[0])
+    } else {
+        MetashardState {
+            epoch: 0,
+            partition_map: partition_map.clone(),
+            log_shards: BTreeMap::new(),
         }
     };
+    let (_metashard_handle, _metashard_task) =
+        PersistMetashardActor::spawn(metashard_state, 256);
 
-    let acceptor_config = AcceptorConfig::default();
-    let (acceptor_handle, _acceptor_task) =
-        PersistAcceptor::spawn(acceptor_config, &persist_client, shard_id, acceptor_metrics).await;
+    // Spawn acceptor + learner per log shard.
+    let mut acceptor_handles = BTreeMap::new();
+    let mut learner_handles = BTreeMap::new();
 
-    let learner_config = PersistLearnerConfig::default();
-    let (learner_handle, _learner_task) =
-        PersistLearner::spawn(learner_config, &persist_client, shard_id, learner_metrics).await;
+    for (i, &shard_id) in shard_ids.iter().enumerate() {
+        let acceptor_metrics = AcceptorMetrics::register(&metrics_registry);
+        let learner_metrics = LearnerMetrics::register(&metrics_registry);
 
-    info!(%shard_id, "persist backend ready");
+        let acceptor_config = AcceptorConfig::default();
+        let (acceptor_handle, _acceptor_task) = PersistAcceptor::spawn(
+            acceptor_config,
+            &persist_client,
+            shard_id,
+            acceptor_metrics,
+            0,
+        )
+        .await;
 
-    serve_grpc(acceptor_handle, learner_handle, args.listen_addr).await;
+        let learner_config = PersistLearnerConfig::default();
+        let (learner_handle, _learner_task) = PersistLearner::spawn(
+            learner_config,
+            &persist_client,
+            shard_id,
+            learner_metrics,
+        )
+        .await;
+
+        info!(%shard_id, index = i, "log shard ready");
+        acceptor_handles.insert(shard_id, acceptor_handle);
+        learner_handles.insert(shard_id, learner_handle);
+    }
+
+    info!(num_shards = num_shards, "all log shards ready, starting gRPC server");
+
+    // Use ShardedService for routing across log shards.
+    let service = ShardedService::new(partition_map, acceptor_handles, learner_handles);
+
+    info!(addr = %args.listen_addr, "starting gRPC server");
+    Server::builder()
+        .add_service(PersistSharedLogServer::new(service))
+        .serve(args.listen_addr)
+        .await
+        .expect("gRPC server failed");
 }

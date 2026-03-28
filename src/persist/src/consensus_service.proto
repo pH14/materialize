@@ -58,6 +58,12 @@ message ProtoAppendRequest {
 message ProtoAppendResponse {
   uint64 batch_number = 1;
   uint32 position = 2;
+  // Log shard this proposal landed on. Used by the serving layer to route
+  // await_cas_result to the correct learner.
+  string log_shard = 3;
+  // Partition map epoch at the time of routing. Not strictly needed for
+  // correctness, but useful for stale-routing detection and debugging.
+  uint64 epoch = 4;
 }
 
 message ProtoAwaitResultRequest {

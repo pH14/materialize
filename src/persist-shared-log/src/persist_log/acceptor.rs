@@ -150,6 +150,10 @@ pub struct PersistAcceptor {
     pending: Vec<PendingItem>,
     rx: mpsc::Receiver<PersistAcceptorCommand>,
     metrics: AcceptorMetrics,
+    /// ShardId of the log shard this acceptor writes to, included in receipts.
+    log_shard_id: String,
+    /// Partition map epoch this acceptor was created under.
+    epoch: u64,
 }
 
 impl PersistAcceptor {
@@ -161,6 +165,8 @@ impl PersistAcceptor {
         config: AcceptorConfig,
         write: WriteHandle<OrderedKey, Proposal, u64, i64>,
         metrics: AcceptorMetrics,
+        log_shard_id: ShardId,
+        epoch: u64,
     ) -> (
         Self,
         WriteHandle<OrderedKey, Proposal, u64, i64>,
@@ -172,6 +178,8 @@ impl PersistAcceptor {
             pending: Vec::new(),
             rx,
             metrics,
+            log_shard_id: log_shard_id.to_string(),
+            epoch,
         };
         let handle = PersistAcceptorHandle::new(tx);
         (acceptor, write, handle)
@@ -225,7 +233,7 @@ impl PersistAcceptor {
         write: &mut WriteHandle<OrderedKey, Proposal, u64, i64>,
     ) -> Result<(), String> {
         let pending = std::mem::take(&mut self.pending);
-        flush_inner(write, pending, &self.metrics).await
+        flush_inner(write, pending, &self.metrics, &self.log_shard_id, self.epoch).await
     }
 
     /// Runs the acceptor loop until the channel closes or a fatal error occurs.
@@ -265,11 +273,14 @@ impl PersistAcceptor {
 /// Flush pending items via `compare_and_append`.
 ///
 /// Proposal reply oneshots and flush barrier oneshots are resolved inside this
-/// function. Returns `Err` on fatal error (InvalidUsage or retries exhausted).
+/// function. Returns `Err` on fatal error (InvalidUsage, sealed shard, or
+/// retries exhausted).
 async fn flush_inner(
     write: &mut WriteHandle<OrderedKey, Proposal, u64, i64>,
     pending: Vec<PendingItem>,
     metrics: &AcceptorMetrics,
+    log_shard_id: &str,
+    epoch: u64,
 ) -> Result<(), String> {
     if pending.is_empty() {
         return Ok(());
@@ -320,7 +331,18 @@ async fn flush_inner(
     while let Some(state) = retry.next().await {
         // Read the (possibly updated) upper and derive batch_number.
         let upper = write.upper().clone();
-        let raw_upper = *upper.as_option().expect("upper should not be empty");
+        let raw_upper = match upper.as_option() {
+            Some(u) => *u,
+            None => {
+                // Upper is the empty antichain — the shard has been sealed.
+                let msg = "log shard sealed".to_string();
+                warn!("{}", msg);
+                for reply in replies {
+                    let _ = reply.send(Err(msg.clone()));
+                }
+                return Err(msg);
+            }
+        };
         // Skip T=0: listen(as_of=since) where since=[0] treats T=0 as an
         // empty snapshot, so writing at T=0 would be invisible to the
         // learner. After the first batch, raw_upper >= 2 so .max(1) is a
@@ -360,6 +382,8 @@ async fn flush_inner(
                     let _ = reply.send(Ok(ProtoAppendResponse {
                         batch_number,
                         position: u32::try_from(position).expect("batch position fits u32"),
+                        log_shard: log_shard_id.to_string(),
+                        epoch,
                     }));
                 }
                 for barrier in barriers {
@@ -389,6 +413,15 @@ async fn flush_inner(
                 return Ok(());
             }
             Ok(Err(upper_mismatch)) => {
+                // Check if the shard was sealed by someone else.
+                if upper_mismatch.current.as_option().is_none() {
+                    let msg = "log shard sealed (detected on upper mismatch)".to_string();
+                    warn!("{}", msg);
+                    for reply in replies {
+                        let _ = reply.send(Err(msg.clone()));
+                    }
+                    return Err(msg);
+                }
                 // Another writer advanced the upper — retryable.
                 // WriteHandle auto-updates its cached upper on mismatch.
                 metrics.object_store_write_retries.inc();
@@ -436,6 +469,7 @@ impl PersistAcceptor {
         client: &PersistClient,
         shard_id: ShardId,
         metrics: AcceptorMetrics,
+        epoch: u64,
     ) -> (PersistAcceptorHandle, mz_ore::task::JoinHandle<()>) {
         let write = client
             .open_writer::<OrderedKey, Proposal, u64, i64>(
@@ -447,7 +481,7 @@ impl PersistAcceptor {
             .await
             .expect("failed to open persist shard for acceptor");
 
-        let (acceptor, write, handle) = Self::new(config, write, metrics);
+        let (acceptor, write, handle) = Self::new(config, write, metrics, shard_id, epoch);
         let task = mz_ore::task::spawn(|| "persist-acceptor", acceptor.run(write));
         (handle, task)
     }

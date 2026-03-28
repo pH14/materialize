@@ -16,19 +16,29 @@
 //!   w.r.t. shard data.
 //! - **Learner**: state machine. Tails the persist shard, evaluates CAS during
 //!   playback, maintains materialized state, serves reads and result queries.
+//! - **Metashard actor**: maintains the range-based partition map, coordinates
+//!   reconfigurations, manages acceptor/learner lifecycle.
+//! - **Serving layer**: routes client requests to the correct acceptor/learner
+//!   based on the cached partition map.
 //!
 //! Batches independent cross-shard proposals into a single durable persist
 //! `compare_and_append` per flush, making cost O(1/batch_window) instead of
 //! O(shards).
+//!
+//! For horizontal write scaling, client shards are range-partitioned across
+//! multiple log shards (each with its own acceptor). See
+//! `doc/reference/05_horizontal_sharding.md` for the full specification.
 
 use mz_persist::generated::consensus_service::{
     ProtoAppendResponse, ProtoCompareAndSetResponse, ProtoHeadResponse, ProtoLogProposal,
     ProtoScanResponse, ProtoTruncateResponse,
 };
+use mz_persist_client::ShardId;
 
 pub mod metrics;
 pub mod persist_log;
 pub mod service;
+pub mod sharded_service;
 
 #[cfg(test)]
 mod tests;
@@ -51,6 +61,123 @@ impl Default for AcceptorConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Partition map
+// ---------------------------------------------------------------------------
+
+/// Derive a partition byte from a client shard key.
+///
+/// Uses the first byte of the ShardId's hex UUID (characters 1-2 after the
+/// `s` prefix). ShardIds are UUIDs so the distribution is uniform.
+pub fn partition_key(client_shard: &str) -> u8 {
+    if client_shard.len() >= 3 {
+        u8::from_str_radix(&client_shard[1..3], 16).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// A non-overlapping, covering partition of the [0x00, 0xFF] key space.
+///
+/// Each range maps to a log shard. The partition map is the single source of
+/// truth for both write routing (client → acceptor) and read routing
+/// (client → learner).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionMap {
+    /// Monotonically increasing configuration epoch.
+    pub epoch: u64,
+    /// Sorted, non-overlapping, covering ranges.
+    pub ranges: Vec<RangeAssignment>,
+}
+
+/// A single range in the partition map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeAssignment {
+    /// Inclusive lower bound of the partition key range.
+    pub lo: u8,
+    /// Exclusive upper bound. 0x100 (256) for the last range, covering through 0xFF.
+    pub hi_exclusive: u16,
+    /// Log shard that accepts writes for this range.
+    pub log_shard: ShardId,
+}
+
+impl PartitionMap {
+    /// Create a single-range partition map covering the entire key space,
+    /// pointing at `log_shard`. This is the genesis configuration.
+    pub fn single(log_shard: ShardId) -> Self {
+        PartitionMap {
+            epoch: 0,
+            ranges: vec![RangeAssignment {
+                lo: 0x00,
+                hi_exclusive: 0x100,
+                log_shard,
+            }],
+        }
+    }
+
+    /// Route a client shard key to its log shard.
+    pub fn route(&self, client_shard: &str) -> ShardId {
+        let key = partition_key(client_shard);
+        self.route_key(key)
+    }
+
+    /// Route a partition key byte to its log shard.
+    pub fn route_key(&self, key: u8) -> ShardId {
+        for r in &self.ranges {
+            if key >= r.lo && (key as u16) < r.hi_exclusive {
+                return r.log_shard;
+            }
+        }
+        // Invariant: the partition map is covering. If we get here, it's a bug.
+        panic!(
+            "partition map does not cover key 0x{:02x}: {:?}",
+            key, self.ranges
+        );
+    }
+
+    /// Validate partition map invariants: sorted, non-overlapping, covering.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.ranges.is_empty() {
+            return Err("partition map is empty".into());
+        }
+        if self.ranges[0].lo != 0x00 {
+            return Err(format!(
+                "first range starts at 0x{:02x}, expected 0x00",
+                self.ranges[0].lo
+            ));
+        }
+        let last = self.ranges.last().unwrap();
+        if last.hi_exclusive != 0x100 {
+            return Err(format!(
+                "last range ends at 0x{:03x}, expected 0x100",
+                last.hi_exclusive
+            ));
+        }
+        for i in 1..self.ranges.len() {
+            let prev = &self.ranges[i - 1];
+            let curr = &self.ranges[i];
+            if prev.hi_exclusive != curr.lo as u16 {
+                return Err(format!(
+                    "gap or overlap between ranges: prev.hi=0x{:03x}, curr.lo=0x{:02x}",
+                    prev.hi_exclusive, curr.lo
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Immutable identity for an acceptor or learner, assigned at creation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorIdentity {
+    /// The range this actor serves.
+    pub range: RangeAssignment,
+    /// The log shard this actor reads/writes.
+    pub log_shard: ShardId,
+    /// The partition map epoch that created this actor.
+    pub epoch: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
 
@@ -63,6 +190,9 @@ pub enum AcceptorError {
     DroppedReply,
     /// The acceptor returned an application-level error.
     Command(String),
+    /// The log shard has been sealed (frontier advanced to empty antichain).
+    /// The serving layer should refresh its partition map and retry.
+    Sealed,
 }
 
 impl std::fmt::Display for AcceptorError {
@@ -71,6 +201,7 @@ impl std::fmt::Display for AcceptorError {
             AcceptorError::Shutdown => write!(f, "acceptor shut down"),
             AcceptorError::DroppedReply => write!(f, "acceptor dropped reply"),
             AcceptorError::Command(msg) => write!(f, "{}", msg),
+            AcceptorError::Sealed => write!(f, "log shard sealed"),
         }
     }
 }
@@ -92,6 +223,37 @@ impl std::fmt::Display for LearnerError {
             LearnerError::Shutdown => write!(f, "learner shut down"),
             LearnerError::DroppedReply => write!(f, "learner dropped reply"),
             LearnerError::Command(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+/// Error returned by metashard handle methods.
+#[derive(Debug)]
+pub enum MetashardError {
+    /// The metashard actor shut down.
+    Shutdown,
+    /// The metashard actor dropped the reply sender.
+    DroppedReply,
+    /// Application-level error.
+    Command(String),
+    /// A reconfiguration was attempted but another is already in progress.
+    ReconfigurationInProgress,
+    /// The expected epoch did not match the current epoch.
+    EpochMismatch { expected: u64, actual: u64 },
+}
+
+impl std::fmt::Display for MetashardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetashardError::Shutdown => write!(f, "metashard shut down"),
+            MetashardError::DroppedReply => write!(f, "metashard dropped reply"),
+            MetashardError::Command(msg) => write!(f, "{}", msg),
+            MetashardError::ReconfigurationInProgress => {
+                write!(f, "reconfiguration already in progress")
+            }
+            MetashardError::EpochMismatch { expected, actual } => {
+                write!(f, "epoch mismatch: expected {}, actual {}", expected, actual)
+            }
         }
     }
 }
@@ -128,4 +290,121 @@ pub trait Learner: Clone + std::fmt::Debug + Send + Sync + 'static {
         batch_number: u64,
         position: u32,
     ) -> Result<ProtoTruncateResponse, LearnerError>;
+}
+
+/// The metashard maintains the partition map and coordinates reconfigurations.
+///
+/// In steady state, the metashard serves lookups from its in-memory partition
+/// map. During reconfiguration, it coordinates the full lifecycle: intent →
+/// pre-hydrate → seal → commit → finalize.
+#[async_trait::async_trait]
+pub trait Metashard: Clone + std::fmt::Debug + Send + Sync + 'static {
+    /// Look up which log shard owns a client shard.
+    async fn lookup(&self, client_shard: &str) -> Result<ShardId, MetashardError>;
+
+    /// Return the current partition map.
+    async fn partition_map(&self) -> Result<PartitionMap, MetashardError>;
+
+    /// Current epoch.
+    async fn current_epoch(&self) -> Result<u64, MetashardError>;
+}
+
+// ---------------------------------------------------------------------------
+// Partition map unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod partition_map_tests {
+    use super::*;
+
+    fn test_shard(suffix: &str) -> ShardId {
+        // ShardId::new() generates random IDs; for deterministic tests, parse a known one.
+        format!("s{:0>32}", suffix)
+            .parse()
+            .expect("valid shard id")
+    }
+
+    #[test]
+    fn partition_key_extracts_first_byte() {
+        // "s0a..." → 0x0a = 10
+        assert_eq!(partition_key("s0a000000-0000-0000-0000-000000000000"), 0x0a);
+        // "sff..." → 0xff = 255
+        assert_eq!(partition_key("sff000000-0000-0000-0000-000000000000"), 0xff);
+        // "s00..." → 0x00 = 0
+        assert_eq!(partition_key("s00000000-0000-0000-0000-000000000000"), 0x00);
+    }
+
+    #[test]
+    fn single_range_covers_all() {
+        let shard = test_shard("1");
+        let map = PartitionMap::single(shard);
+        assert!(map.validate().is_ok());
+        // Every key routes to the single shard.
+        for key in 0..=255u8 {
+            assert_eq!(map.route_key(key), shard);
+        }
+    }
+
+    #[test]
+    fn two_range_split() {
+        let s1 = test_shard("1");
+        let s2 = test_shard("2");
+        let map = PartitionMap {
+            epoch: 1,
+            ranges: vec![
+                RangeAssignment {
+                    lo: 0x00,
+                    hi_exclusive: 0x80,
+                    log_shard: s1,
+                },
+                RangeAssignment {
+                    lo: 0x80,
+                    hi_exclusive: 0x100,
+                    log_shard: s2,
+                },
+            ],
+        };
+        assert!(map.validate().is_ok());
+        assert_eq!(map.route_key(0x00), s1);
+        assert_eq!(map.route_key(0x7f), s1);
+        assert_eq!(map.route_key(0x80), s2);
+        assert_eq!(map.route_key(0xff), s2);
+    }
+
+    #[test]
+    fn validate_catches_gap() {
+        let s1 = test_shard("1");
+        let s2 = test_shard("2");
+        let map = PartitionMap {
+            epoch: 0,
+            ranges: vec![
+                RangeAssignment {
+                    lo: 0x00,
+                    hi_exclusive: 0x40,
+                    log_shard: s1,
+                },
+                // Gap: 0x40..0x80 unmapped
+                RangeAssignment {
+                    lo: 0x80,
+                    hi_exclusive: 0x100,
+                    log_shard: s2,
+                },
+            ],
+        };
+        assert!(map.validate().is_err());
+    }
+
+    #[test]
+    fn validate_catches_incomplete_coverage() {
+        let s1 = test_shard("1");
+        let map = PartitionMap {
+            epoch: 0,
+            ranges: vec![RangeAssignment {
+                lo: 0x00,
+                hi_exclusive: 0x80,
+                log_shard: s1,
+            }],
+        };
+        assert!(map.validate().is_err());
+    }
 }

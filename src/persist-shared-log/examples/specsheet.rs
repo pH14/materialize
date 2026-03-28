@@ -1182,6 +1182,7 @@ async fn main() {
         &persist_client,
         shard_id,
         acceptor_metrics.clone(),
+        0,
     )
     .await;
 

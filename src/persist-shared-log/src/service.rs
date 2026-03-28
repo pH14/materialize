@@ -35,6 +35,9 @@ impl From<AcceptorError> for tonic::Status {
             AcceptorError::Shutdown => tonic::Status::unavailable("acceptor shut down"),
             AcceptorError::DroppedReply => tonic::Status::internal("acceptor dropped reply"),
             AcceptorError::Command(msg) => tonic::Status::internal(msg),
+            AcceptorError::Sealed => {
+                tonic::Status::failed_precondition("log shard sealed; retry with new routing")
+            }
         }
     }
 }
