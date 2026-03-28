@@ -123,7 +123,7 @@ impl PartitionMap {
     /// Route a partition key byte to its log shard.
     pub fn route_key(&self, key: u8) -> ShardId {
         for r in &self.ranges {
-            if key >= r.lo && (key as u16) < r.hi_exclusive {
+            if key >= r.lo && u16::from(key) < r.hi_exclusive {
                 return r.log_shard;
             }
         }
@@ -155,7 +155,7 @@ impl PartitionMap {
         for i in 1..self.ranges.len() {
             let prev = &self.ranges[i - 1];
             let curr = &self.ranges[i];
-            if prev.hi_exclusive != curr.lo as u16 {
+            if prev.hi_exclusive != u16::from(curr.lo) {
                 return Err(format!(
                     "gap or overlap between ranges: prev.hi=0x{:03x}, curr.lo=0x{:02x}",
                     prev.hi_exclusive, curr.lo

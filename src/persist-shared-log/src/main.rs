@@ -106,11 +106,11 @@ fn build_partition_map(shard_ids: &[ShardId]) -> PartitionMap {
     let range_size = 256 / n;
     let mut ranges = Vec::with_capacity(n);
     for (i, shard_id) in shard_ids.iter().enumerate() {
-        let lo = (i * range_size) as u8;
+        let lo = u8::try_from(i * range_size).expect("range start fits u8");
         let hi_exclusive = if i == n - 1 {
             0x100u16
         } else {
-            ((i + 1) * range_size) as u16
+            u16::try_from((i + 1) * range_size).expect("range end fits u16")
         };
         ranges.push(RangeAssignment {
             lo,

@@ -352,7 +352,7 @@ mod tests {
                 shard: "s0".into(),
                 expected: if i == 1 { None } else { Some(i - 1) },
                 seqno: i,
-                data: vec![i as u8],
+                data: vec![u8::try_from(i).expect("test seqno fits u8")],
             });
         }
 
@@ -404,7 +404,7 @@ mod tests {
                 shard: "s0".into(),
                 expected: if i == 1 { None } else { Some(i - 1) },
                 seqno: i,
-                data: vec![i as u8],
+                data: vec![u8::try_from(i).expect("test seqno fits u8")],
             });
         }
 

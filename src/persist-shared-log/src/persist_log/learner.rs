@@ -112,6 +112,10 @@ impl Default for PersistLearnerConfig {
 /// maintains the resulting key→versions mapping. This is the SMR (state machine
 /// replication) core — it processes the log deterministically so all replicas
 /// converge to the same state.
+///
+/// `pending_retractions` are stored on [`LogShardState`] rather than here,
+/// because retractions must be written to the specific log shard that sourced
+/// the proposal. The apply methods return retractions for the caller to route.
 struct StateMachine {
     shards: BTreeMap<String, ShardState>,
     /// Running total of entries across all shards, maintained incrementally.
@@ -120,13 +124,30 @@ struct StateMachine {
     /// incrementally. Avoids an O(total_entries) traversal on every batch.
     approx_bytes: usize,
 
-    /// Proposals eligible for retraction. Accumulated by apply_cas/apply_truncate,
-    /// drained by the periodic retraction sweep.
-    pending_retractions: BTreeMap<OrderedKey, Proposal>,
-
     /// Every OrderedKey we've seen with diff=+1 that hasn't been retracted (-1).
     /// Used to assert no negative multiplicities.
     live_keys: BTreeSet<OrderedKey>,
+}
+
+/// Per-log-shard state held alongside the global `StateMachine`.
+///
+/// During static sharding (Phase 1-3), each learner has exactly one of these.
+/// During reconfiguration (Phase 4), a learner may temporarily hold multiple
+/// `LogShardState` instances while transitioning between log shards.
+pub(crate) struct LogShardState<E: EventSource> {
+    /// Event source (persist subscribe channel).
+    pub(crate) event_source: E,
+    /// WriteHandle for writing retractions (-1 diffs) during periodic sweeps.
+    pub(crate) retraction_write: WriteHandle<OrderedKey, Proposal, u64, i64>,
+    /// The listen frontier, mirrored from Progress events.
+    pub(crate) listen_frontier: Antichain<u64>,
+    /// Result cache: batch_number → vec of proposal results.
+    pub(crate) results: BTreeMap<u64, Vec<ProposalResult>>,
+    /// Clients waiting for results from specific batches.
+    pub(crate) result_waiters: BTreeMap<u64, Vec<ResultWaiter>>,
+    /// Proposals eligible for retraction, accumulated during apply.
+    /// Drained by the periodic retraction sweep.
+    pub(crate) pending_retractions: BTreeMap<OrderedKey, Proposal>,
 }
 
 impl StateMachine {
@@ -135,21 +156,18 @@ impl StateMachine {
             shards: BTreeMap::new(),
             total_entries: 0,
             approx_bytes: 0,
-            pending_retractions: BTreeMap::new(),
             live_keys: BTreeSet::new(),
         }
     }
 
-    /// Apply a CAS proposal with diff=+1. Returns the CAS result.
-    ///
-    /// If committed, the entry is stored for scan(). If rejected, the proposal
-    /// is added to pending retractions.
+    /// Apply a CAS proposal with diff=+1. Returns the CAS result and an
+    /// optional retraction (if the CAS was rejected, the proposal is waste).
     fn apply_cas(
         &mut self,
         cas: mz_persist::generated::consensus_service::ProtoCasProposal,
         ordered_key: OrderedKey,
         proposal: Proposal,
-    ) -> ProtoCompareAndSetResponse {
+    ) -> (ProtoCompareAndSetResponse, Option<(OrderedKey, Proposal)>) {
         let current_seqno = self
             .shards
             .get(&cas.key)
@@ -158,7 +176,7 @@ impl StateMachine {
 
         let committed = current_seqno == cas.expected;
 
-        if committed {
+        let retraction = if committed {
             let data_len = cas.data.len();
             let entry = VersionedEntry {
                 seqno: cas.new_seqno,
@@ -169,73 +187,73 @@ impl StateMachine {
             self.shards.entry(cas.key).or_default().entries.push(entry);
             self.total_entries += 1;
             self.approx_bytes += data_len;
+            None
         } else {
-            // Rejected CAS — the proposal is waste, retract it.
-            self.pending_retractions.insert(ordered_key, proposal);
-        }
+            Some((ordered_key, proposal))
+        };
 
-        ProtoCompareAndSetResponse { committed }
+        (ProtoCompareAndSetResponse { committed }, retraction)
     }
 
-    /// Apply a truncate proposal with diff=+1. Returns the truncate result.
-    ///
-    /// On success, removed entries and the truncate proposal itself become
-    /// pending retractions. On failure, the truncate proposal becomes a
-    /// pending retraction.
+    /// Apply a truncate proposal with diff=+1. Returns the truncate result
+    /// and a list of retractions (removed entries + the truncate proposal itself).
     fn apply_truncate(
         &mut self,
         trunc: &mz_persist::generated::consensus_service::ProtoTruncateProposal,
         ordered_key: OrderedKey,
         proposal: Proposal,
-    ) -> Result<ProtoTruncateResponse, String> {
+    ) -> (Result<ProtoTruncateResponse, String>, Vec<(OrderedKey, Proposal)>) {
         let shard = match self.shards.get(&trunc.key) {
             Some(s) if !s.entries.is_empty() => s,
             _ => {
-                // Failed truncate — the proposal is waste.
-                self.pending_retractions.insert(ordered_key, proposal);
-                return Err(format!("no data at key: {}", trunc.key));
+                return (
+                    Err(format!("no data at key: {}", trunc.key)),
+                    vec![(ordered_key, proposal)],
+                );
             }
         };
 
         let head_seqno = shard.entries.last().unwrap().seqno;
 
         if trunc.seqno > head_seqno {
-            // Failed truncate — the proposal is waste.
-            self.pending_retractions.insert(ordered_key, proposal);
-            return Err(format!(
-                "upper bound too high for truncate: {}",
-                trunc.seqno
-            ));
+            return (
+                Err(format!("upper bound too high for truncate: {}", trunc.seqno)),
+                vec![(ordered_key, proposal)],
+            );
         }
 
         let shard = self.shards.get_mut(&trunc.key).unwrap();
         let keep_from = shard.entries.partition_point(|e| e.seqno < trunc.seqno);
-        // Update incremental counters before draining.
         let removed_bytes: usize = shard.entries[..keep_from]
             .iter()
             .map(|e| e.data.len())
             .sum();
-        // Add removed entries to pending retractions.
-        for entry in &shard.entries[..keep_from] {
-            self.pending_retractions
-                .insert(entry.ordered_key.clone(), entry.proposal.clone());
-        }
+
+        let mut retractions: Vec<(OrderedKey, Proposal)> = shard.entries[..keep_from]
+            .iter()
+            .map(|e| (e.ordered_key.clone(), e.proposal.clone()))
+            .collect();
         shard.entries.drain(..keep_from);
         self.total_entries -= keep_from;
         self.approx_bytes -= removed_bytes;
 
-        // The truncate proposal itself is also a pending retraction.
-        self.pending_retractions.insert(ordered_key, proposal);
+        // The truncate proposal itself is also a retraction.
+        retractions.push((ordered_key, proposal));
 
-        Ok(ProtoTruncateResponse {
-            // The Consensus service API requires returning the number of rows removed.
-            deleted: Some(u64::cast_from(keep_from)),
-        })
+        (
+            Ok(ProtoTruncateResponse {
+                deleted: Some(u64::cast_from(keep_from)),
+            }),
+            retractions,
+        )
     }
 
-    /// Handle a retraction (diff=-1). Removes the entry from live_keys, prunes
-    /// pending retractions if present, and removes the entry from state if applicable.
-    fn apply_retraction(&mut self, ordered_key: &OrderedKey, _proposal_data: &Proposal) {
+    /// Handle a retraction (diff=-1). Removes the entry from live_keys and
+    /// from materialized state if applicable.
+    ///
+    /// The caller is responsible for pruning the retracted key from the
+    /// `LogShardState.pending_retractions` map.
+    fn apply_retraction(&mut self, ordered_key: &OrderedKey) {
         // Assert: we must have seen this key with +1 before.
         assert!(
             self.live_keys.remove(ordered_key),
@@ -243,14 +261,7 @@ impl StateMachine {
             ordered_key,
         );
 
-        // Prune from pending retractions if present (another learner may have
-        // retracted it).
-        self.pending_retractions.remove(ordered_key);
-
         // If this was a committed CAS entry still in state, remove it.
-        // OrderedKey.shard tells us which shard to look in, and the
-        // ordered_key itself uniquely identifies the entry — no need to
-        // decode the protobuf.
         if let Some(shard) = self.shards.get_mut(&ordered_key.shard) {
             if let Some(idx) = shard
                 .entries
@@ -359,8 +370,6 @@ enum ReadCommand {
         received_at: tokio::time::Instant,
     },
 }
-
-/// A read command that has been assigned a linearization target.
 
 // ---------------------------------------------------------------------------
 // Handle
@@ -513,12 +522,12 @@ impl crate::Learner for PersistLearnerHandle {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-enum ProposalResult {
+pub(crate) enum ProposalResult {
     Cas(ProtoCompareAndSetResponse),
     Truncate(Result<ProtoTruncateResponse, String>),
 }
 
-enum ResultWaiter {
+pub(crate) enum ResultWaiter {
     Cas {
         position: u32,
         reply: oneshot::Sender<ProtoCompareAndSetResponse>,
@@ -616,11 +625,12 @@ fn spawn_listen_task(
 /// [`flush_pending_retractions`](Self::flush_pending_retractions). The production
 /// [`run()`](Self::run) method is one such driver.
 pub struct PersistLearner<E: EventSource = ChannelEventSource> {
+    /// Global: client shard state, accumulated across all log shards.
     state: StateMachine,
 
-    // --- Result cache ---
-    results: BTreeMap<u64, Vec<ProposalResult>>,
-    result_waiters: BTreeMap<u64, Vec<ResultWaiter>>,
+    /// Per-log-shard state. In static sharding (Phase 1-3), this is a single
+    /// entry. During reconfiguration (Phase 4), may temporarily hold multiple.
+    log_shard: LogShardState<E>,
 
     // --- Configuration ---
     config: PersistLearnerConfig,
@@ -630,19 +640,6 @@ pub struct PersistLearner<E: EventSource = ChannelEventSource> {
 
     // --- Channels ---
     cmd_rx: mpsc::Receiver<PersistLearnerCommand>,
-
-    // --- Event source ---
-    event_source: E,
-
-    // --- Persist handles ---
-    /// WriteHandle for writing retractions (-1 diffs) during periodic sweeps.
-    retraction_write: WriteHandle<OrderedKey, Proposal, u64, i64>,
-
-    // --- Listen frontier tracking ---
-    /// The listen frontier, mirrored from Progress events delivered through the
-    /// event source. This tracks the same value as `Listen::frontier()` on the
-    /// dedicated task side (when using `ChannelEventSource`).
-    listen_frontier: Antichain<u64>,
 
     // --- Bus-stand linearization ---
     /// Reads waiting for the current upper fetch to complete.
@@ -683,16 +680,21 @@ impl<E: EventSource> PersistLearner<E> {
     ) -> (Self, PersistLearnerHandle) {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.queue_depth);
 
-        let learner = PersistLearner {
-            state: StateMachine::new(),
-            results: BTreeMap::new(),
-            result_waiters: BTreeMap::new(),
-            config,
-            metrics,
-            cmd_rx,
+        let log_shard = LogShardState {
             event_source,
             retraction_write,
             listen_frontier: Antichain::from_elem(0),
+            results: BTreeMap::new(),
+            result_waiters: BTreeMap::new(),
+            pending_retractions: BTreeMap::new(),
+        };
+
+        let learner = PersistLearner {
+            state: StateMachine::new(),
+            log_shard,
+            config,
+            metrics,
+            cmd_rx,
             pending_reads: Vec::new(),
             linearizing_reads: BTreeMap::new(),
         };
@@ -713,6 +715,11 @@ impl<E: EventSource> PersistLearner<E> {
     pub fn on_events(&mut self, events: Vec<ListenEvent<u64, ((OrderedKey, Proposal), u64, i64)>>) {
         self.process_listen_events(events);
         self.wake_linearizing_reads();
+    }
+
+    /// Returns the listen frontier from the current log shard.
+    pub fn listen_frontier(&self) -> &Antichain<u64> {
+        &self.log_shard.listen_frontier
     }
 
     /// An upper fetch completed: assign linearization targets and wake reads.
@@ -753,7 +760,7 @@ impl<E: EventSource> PersistLearner<E> {
     /// When this returns true, the caller may choose to call
     /// [`flush_pending_retractions`](Self::flush_pending_retractions).
     pub fn has_pending_retractions(&self) -> bool {
-        !self.state.pending_retractions.is_empty()
+        !self.log_shard.pending_retractions.is_empty()
     }
 
     // -------------------------------------------------------------------
@@ -802,7 +809,7 @@ impl<E: EventSource> PersistLearner<E> {
             tokio::select! {
                 biased;
                 // cancel-safety: per tokio docs
-                events = self.event_source.next_events() => {
+                events = self.log_shard.event_source.next_events() => {
                     match events {
                         Some(events) => self.on_events(events),
                         None => {
@@ -826,7 +833,7 @@ impl<E: EventSource> PersistLearner<E> {
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
                         Some(PersistLearnerCommand::ForceRetractionSweep { reply }) => {
-                            let count = self.state.pending_retractions.len();
+                            let count = self.log_shard.pending_retractions.len();
                             self.flush_pending_retractions().await;
                             let _ = reply.send(count);
                         }
@@ -857,7 +864,7 @@ impl<E: EventSource> PersistLearner<E> {
                     }
                 }
                 ListenEvent::Progress(frontier) => {
-                    self.listen_frontier = frontier;
+                    self.log_shard.listen_frontier = frontier;
                 }
             }
         }
@@ -896,38 +903,45 @@ impl<E: EventSource> PersistLearner<E> {
                 match ProtoLogProposal::decode(proposal_data.encoded.as_ref()) {
                     Ok(proposal) => match proposal.op {
                         Some(proto_log_proposal::Op::Cas(cas)) => {
-                            let result = self.state.apply_cas(cas, key.clone(), proposal_data);
+                            let (result, retraction) =
+                                self.state.apply_cas(cas, key.clone(), proposal_data);
                             if result.committed {
                                 self.metrics.cas_committed.inc();
                             } else {
                                 self.metrics.cas_rejected.inc();
                             }
-                            while batch_results.len() <= key.position as usize {
+                            if let Some((rk, rp)) = retraction {
+                                self.log_shard.pending_retractions.insert(rk, rp);
+                            }
+                            while batch_results.len() <= usize::cast_from(key.position) {
                                 batch_results.push(None);
                             }
-                            batch_results[key.position as usize] =
+                            batch_results[usize::cast_from(key.position)] =
                                 Some(ProposalResult::Cas(result));
                         }
                         Some(proto_log_proposal::Op::Truncate(trunc)) => {
-                            let result =
+                            let (result, retractions) =
                                 self.state
                                     .apply_truncate(&trunc, key.clone(), proposal_data);
                             self.metrics.truncate_ops.inc();
-                            while batch_results.len() <= key.position as usize {
+                            for (rk, rp) in retractions {
+                                self.log_shard.pending_retractions.insert(rk, rp);
+                            }
+                            while batch_results.len() <= usize::cast_from(key.position) {
                                 batch_results.push(None);
                             }
-                            batch_results[key.position as usize] =
+                            batch_results[usize::cast_from(key.position)] =
                                 Some(ProposalResult::Truncate(result));
                         }
                         None => {
                             warn!(batch_number, "proposal with no op, skipping");
-                            self.state
+                            self.log_shard
                                 .pending_retractions
                                 .insert(key.clone(), proposal_data);
-                            while batch_results.len() <= key.position as usize {
+                            while batch_results.len() <= usize::cast_from(key.position) {
                                 batch_results.push(None);
                             }
-                            batch_results[key.position as usize] =
+                            batch_results[usize::cast_from(key.position)] =
                                 Some(ProposalResult::Cas(ProtoCompareAndSetResponse {
                                     committed: false,
                                 }));
@@ -935,13 +949,13 @@ impl<E: EventSource> PersistLearner<E> {
                     },
                     Err(e) => {
                         warn!(batch_number, "failed to decode proposal: {}, skipping", e);
-                        self.state
+                        self.log_shard
                             .pending_retractions
                             .insert(key.clone(), proposal_data);
-                        while batch_results.len() <= key.position as usize {
+                        while batch_results.len() <= usize::cast_from(key.position) {
                             batch_results.push(None);
                         }
-                        batch_results[key.position as usize] =
+                        batch_results[usize::cast_from(key.position)] =
                             Some(ProposalResult::Cas(ProtoCompareAndSetResponse {
                                 committed: false,
                             }));
@@ -949,14 +963,13 @@ impl<E: EventSource> PersistLearner<E> {
                 }
             } else {
                 debug_assert_eq!(diff, -1);
-                // Retraction: remove from live_keys, clean up state and results.
-                self.state.apply_retraction(&key, &proposal_data);
+                // Retraction: remove from live_keys + state, prune pending retractions.
+                self.state.apply_retraction(&key);
+                self.log_shard.pending_retractions.remove(&key);
 
                 // Clean up the result for this retracted proposal.
-                self.results.get_mut(&key.batch_id).map(|results| {
-                    if let Some(slot) = results.get_mut(key.position as usize) {
-                        // Replace with a tombstone-like value; the vec
-                        // is position-indexed so we can't remove.
+                self.log_shard.results.get_mut(&key.batch_id).map(|results| {
+                    if let Some(slot) = results.get_mut(usize::cast_from(key.position)) {
                         *slot =
                             ProposalResult::Cas(ProtoCompareAndSetResponse { committed: false });
                     }
@@ -967,7 +980,7 @@ impl<E: EventSource> PersistLearner<E> {
         // Convert Option<ProposalResult> to ProposalResult for storage.
         let batch_results: Vec<ProposalResult> = batch_results.into_iter().flatten().collect();
 
-        self.results.insert(batch_number, batch_results);
+        self.log_shard.results.insert(batch_number, batch_results);
         self.metrics.batches_materialized.inc();
         self.metrics
             .batch_materialize_latency_seconds
@@ -1041,7 +1054,7 @@ impl<E: EventSource> PersistLearner<E> {
                 self.metrics
                     .cmd_queue_seconds
                     .observe(received_at.elapsed().as_secs_f64());
-                if let Some(results) = self.results.get(&batch_number) {
+                if let Some(results) = self.log_shard.results.get(&batch_number) {
                     if let Some(ProposalResult::Cas(result)) =
                         results.get(usize::cast_from(position))
                     {
@@ -1052,7 +1065,7 @@ impl<E: EventSource> PersistLearner<E> {
                         return;
                     }
                 }
-                self.result_waiters
+                self.log_shard.result_waiters
                     .entry(batch_number)
                     .or_default()
                     .push(ResultWaiter::Cas {
@@ -1070,7 +1083,7 @@ impl<E: EventSource> PersistLearner<E> {
                 self.metrics
                     .cmd_queue_seconds
                     .observe(received_at.elapsed().as_secs_f64());
-                if let Some(results) = self.results.get(&batch_number) {
+                if let Some(results) = self.log_shard.results.get(&batch_number) {
                     if let Some(ProposalResult::Truncate(result)) =
                         results.get(usize::cast_from(position))
                     {
@@ -1081,7 +1094,7 @@ impl<E: EventSource> PersistLearner<E> {
                         return;
                     }
                 }
-                self.result_waiters
+                self.log_shard.result_waiters
                     .entry(batch_number)
                     .or_default()
                     .push(ResultWaiter::Truncate {
@@ -1111,17 +1124,17 @@ impl<E: EventSource> PersistLearner<E> {
         let sweep_start = tokio::time::Instant::now();
         self.metrics.retraction_sweeps.inc();
 
-        let pending = std::mem::take(&mut self.state.pending_retractions);
+        let pending = std::mem::take(&mut self.log_shard.pending_retractions);
         if pending.is_empty() {
             return;
         }
 
-        let upper = self.retraction_write.upper().clone();
+        let upper = self.log_shard.retraction_write.upper().clone();
         let raw_upper = match upper.as_option() {
             Some(ts) => (*ts).max(1),
             None => {
                 warn!("retraction write upper is empty, skipping sweep");
-                self.state.pending_retractions = pending;
+                self.log_shard.pending_retractions = pending;
                 return;
             }
         };
@@ -1135,6 +1148,7 @@ impl<E: EventSource> PersistLearner<E> {
         let new_upper = Antichain::from_elem(raw_upper + 1);
 
         match self
+            .log_shard
             .retraction_write
             .compare_and_append(&updates, upper, new_upper)
             .await
@@ -1164,11 +1178,11 @@ impl<E: EventSource> PersistLearner<E> {
                     retractions = num_retractions,
                     "learner retraction upper mismatch, discarding batch"
                 );
-                self.state.pending_retractions = pending;
+                self.log_shard.pending_retractions = pending;
             }
             Err(invalid_usage) => {
                 error!("learner retraction invalid usage: {}", invalid_usage);
-                self.state.pending_retractions = pending;
+                self.log_shard.pending_retractions = pending;
             }
         }
     }
@@ -1180,6 +1194,7 @@ impl<E: EventSource> PersistLearner<E> {
     /// Serve any linearizing reads whose target has been reached by the listen.
     fn wake_linearizing_reads(&mut self) {
         let frontier = self
+            .log_shard
             .listen_frontier
             .as_option()
             .copied()
@@ -1245,11 +1260,11 @@ impl<E: EventSource> PersistLearner<E> {
     // -----------------------------------------------------------------------
 
     fn wake_result_waiters(&mut self, batch_number: u64) {
-        let waiters = match self.result_waiters.remove(&batch_number) {
+        let waiters = match self.log_shard.result_waiters.remove(&batch_number) {
             Some(w) => w,
             None => return,
         };
-        let results = match self.results.get(&batch_number) {
+        let results = match self.log_shard.results.get(&batch_number) {
             Some(r) => r,
             None => return,
         };

@@ -188,7 +188,7 @@ impl Codec for OrderedKey {
     {
         buf.put_u64(self.batch_id);
         buf.put_u32(self.position);
-        buf.put_u32(self.shard.len() as u32);
+        buf.put_u32(u32::try_from(self.shard.len()).expect("shard name fits u32"));
         buf.put(self.shard.as_bytes());
     }
 
@@ -201,7 +201,8 @@ impl Codec for OrderedKey {
         }
         let batch_id = u64::from_be_bytes(buf[0..8].try_into().unwrap());
         let position = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-        let shard_len = u32::from_be_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let shard_len = usize::try_from(u32::from_be_bytes(buf[12..16].try_into().unwrap()))
+            .expect("u32 fits usize");
         if buf.len() < 16 + shard_len {
             return Err(format!(
                 "OrderedKey: expected {} bytes for shard, got {}",
