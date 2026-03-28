@@ -307,6 +307,19 @@ pub trait Metashard: Clone + std::fmt::Debug + Send + Sync + 'static {
 
     /// Current epoch.
     async fn current_epoch(&self) -> Result<u64, MetashardError>;
+
+    /// Execute a reconfiguration: install a new partition map, spawning new
+    /// actors and sealing old log shards. Returns the new epoch on success.
+    async fn reconfigure(&self, plan: ReconfigurationPlan) -> Result<u64, MetashardError>;
+}
+
+/// A plan for a reconfiguration operation.
+#[derive(Debug, Clone)]
+pub struct ReconfigurationPlan {
+    /// The epoch the caller believes is current (CaS-like guard).
+    pub expected_epoch: u64,
+    /// The new partition map to install.
+    pub new_partition_map: PartitionMap,
 }
 
 // ---------------------------------------------------------------------------

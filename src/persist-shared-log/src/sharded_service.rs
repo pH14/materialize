@@ -14,9 +14,14 @@
 //! incoming request, the service extracts the client shard key, looks up the
 //! owning log shard in the partition map, and routes to the corresponding
 //! acceptor and learner.
+//!
+//! The routing state is held behind an `Arc<RwLock<...>>` so that the metashard
+//! actor can atomically swap it during reconfiguration.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use tokio::sync::RwLock;
 use tracing::debug;
 
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
@@ -30,28 +35,23 @@ use mz_persist_client::ShardId;
 use crate::{Acceptor, Learner, PartitionMap};
 
 // ---------------------------------------------------------------------------
-// ShardedService
+// RoutingState
 // ---------------------------------------------------------------------------
 
-/// A sharded gRPC service that routes requests by partition key.
-///
-/// Holds one acceptor and one learner per log shard. The `partition_map`
-/// determines routing. In Phase 1 (static sharding), the map is fixed at
-/// construction. Phase 4 will add dynamic updates via metashard subscription.
+/// The routing state that can be atomically swapped during reconfiguration.
 #[derive(Debug)]
-pub struct ShardedService<A: Acceptor, L: Learner> {
-    partition_map: PartitionMap,
-    acceptors: BTreeMap<ShardId, A>,
-    learners: BTreeMap<ShardId, L>,
+pub struct RoutingState<A: Acceptor, L: Learner> {
+    pub partition_map: PartitionMap,
+    pub acceptors: BTreeMap<ShardId, A>,
+    pub learners: BTreeMap<ShardId, L>,
 }
 
-impl<A: Acceptor, L: Learner> ShardedService<A, L> {
+impl<A: Acceptor, L: Learner> RoutingState<A, L> {
     pub fn new(
         partition_map: PartitionMap,
         acceptors: BTreeMap<ShardId, A>,
         learners: BTreeMap<ShardId, L>,
     ) -> Self {
-        // Validate that we have an acceptor and learner for every log shard in the map.
         for range in &partition_map.ranges {
             assert!(
                 acceptors.contains_key(&range.log_shard),
@@ -64,27 +64,51 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
                 range.log_shard
             );
         }
-        ShardedService {
+        RoutingState {
             partition_map,
             acceptors,
             learners,
         }
     }
+}
 
-    fn route_acceptor(&self, client_shard: &str) -> &A {
-        let log_shard = self.partition_map.route(client_shard);
-        self.acceptors
-            .get(&log_shard)
-            .expect("partition map routes to known log shard")
+// ---------------------------------------------------------------------------
+// ShardedService
+// ---------------------------------------------------------------------------
+
+/// A sharded gRPC service that routes requests by partition key.
+///
+/// The routing state (partition map + acceptor/learner pools) is behind an
+/// `Arc<RwLock<...>>` so that the metashard actor can atomically swap it
+/// during reconfiguration without blocking in-flight requests.
+pub struct ShardedService<A: Acceptor, L: Learner> {
+    routing: Arc<RwLock<RoutingState<A, L>>>,
+}
+
+// Manual Debug impl to avoid requiring Debug on A, L.
+impl<A: Acceptor, L: Learner> std::fmt::Debug for ShardedService<A, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardedService").finish_non_exhaustive()
+    }
+}
+
+impl<A: Acceptor, L: Learner> ShardedService<A, L> {
+    pub fn new(
+        partition_map: PartitionMap,
+        acceptors: BTreeMap<ShardId, A>,
+        learners: BTreeMap<ShardId, L>,
+    ) -> Self {
+        let routing = RoutingState::new(partition_map, acceptors, learners);
+        ShardedService {
+            routing: Arc::new(RwLock::new(routing)),
+        }
     }
 
-    fn route_learner(&self, client_shard: &str) -> &L {
-        let log_shard = self.partition_map.route(client_shard);
-        self.learners
-            .get(&log_shard)
-            .expect("partition map routes to known log shard")
+    /// Get a handle to the routing state for external updates (e.g., from the
+    /// metashard actor during reconfiguration).
+    pub fn routing_handle(&self) -> Arc<RwLock<RoutingState<A, L>>> {
+        Arc::clone(&self.routing)
     }
-
 }
 
 #[tonic::async_trait]
@@ -95,7 +119,12 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
     ) -> Result<tonic::Response<ProtoHeadResponse>, tonic::Status> {
         let req = request.into_inner();
         debug!(key = %req.key, "sharded head");
-        let learner = self.route_learner(&req.key);
+        let routing = self.routing.read().await;
+        let log_shard = routing.partition_map.route(&req.key);
+        let learner = routing
+            .learners
+            .get(&log_shard)
+            .expect("partition map routes to known log shard");
         let resp = learner.head(req.key).await?;
         Ok(tonic::Response::new(resp))
     }
@@ -106,7 +135,12 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
     ) -> Result<tonic::Response<ProtoScanResponse>, tonic::Status> {
         let req = request.into_inner();
         debug!(key = %req.key, from = req.from, limit = req.limit, "sharded scan");
-        let learner = self.route_learner(&req.key);
+        let routing = self.routing.read().await;
+        let log_shard = routing.partition_map.route(&req.key);
+        let learner = routing
+            .learners
+            .get(&log_shard)
+            .expect("partition map routes to known log shard");
         let resp = learner.scan(req.key, req.from, req.limit).await?;
         Ok(tonic::Response::new(resp))
     }
@@ -119,9 +153,9 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
         _request: tonic::Request<ProtoListKeysRequest>,
     ) -> Result<tonic::Response<Self::ListKeysStream>, tonic::Status> {
         debug!("sharded list_keys");
-        // Fan out to all learners, merge results.
+        let routing = self.routing.read().await;
         let mut all_keys = std::collections::BTreeSet::new();
-        for learner in self.learners.values() {
+        for learner in routing.learners.values() {
             match learner.list_keys().await {
                 Ok(keys) => {
                     all_keys.extend(keys);
@@ -129,6 +163,8 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
                 Err(e) => return Err(tonic::Status::from(e)),
             }
         }
+        // Drop the read lock before streaming.
+        drop(routing);
 
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(64);
         mz_ore::task::spawn(|| "sharded-list-keys-stream", async move {
@@ -169,10 +205,25 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
             )),
         };
 
-        let acceptor = self.route_acceptor(&req.key);
-        let receipt = acceptor.append(proposal).await?;
+        // Read lock: look up routing and clone the handles (they're cheap Arc-based clones).
+        let (acceptor, learner) = {
+            let routing = self.routing.read().await;
+            let log_shard = routing.partition_map.route(&req.key);
+            let a = routing
+                .acceptors
+                .get(&log_shard)
+                .expect("partition map routes to known log shard")
+                .clone();
+            let l = routing
+                .learners
+                .get(&log_shard)
+                .expect("partition map routes to known log shard")
+                .clone();
+            (a, l)
+        };
+        // Lock dropped — the append + await can take time and must not hold it.
 
-        let learner = self.route_learner(&req.key);
+        let receipt = acceptor.append(proposal).await?;
         let result = learner
             .await_cas_result(receipt.batch_number, receipt.position)
             .await?;
@@ -196,10 +247,23 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
             )),
         };
 
-        let acceptor = self.route_acceptor(&req.key);
-        let receipt = acceptor.append(proposal).await?;
+        let (acceptor, learner) = {
+            let routing = self.routing.read().await;
+            let log_shard = routing.partition_map.route(&req.key);
+            let a = routing
+                .acceptors
+                .get(&log_shard)
+                .expect("partition map routes to known log shard")
+                .clone();
+            let l = routing
+                .learners
+                .get(&log_shard)
+                .expect("partition map routes to known log shard")
+                .clone();
+            (a, l)
+        };
 
-        let learner = self.route_learner(&req.key);
+        let receipt = acceptor.append(proposal).await?;
         let result = learner
             .await_truncate_result(receipt.batch_number, receipt.position)
             .await?;

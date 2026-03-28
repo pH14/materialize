@@ -25,9 +25,10 @@ use mz_ore::metrics::MetricsRegistry;
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
 use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::sharded_service::ShardedService;
-use crate::{AcceptorConfig, PartitionMap, RangeAssignment};
+use crate::{AcceptorConfig, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 async fn new_persist_client_for_test() -> PersistClient {
     tokio::time::pause();
@@ -292,4 +293,126 @@ async fn test_sharded_truncate() {
     assert_eq!(data.len(), 2);
     assert_eq!(data[0].seqno, 2);
     assert_eq!(data[1].seqno, 3);
+}
+
+/// Reconfiguration: start with 1 shard, write data, split into 2 shards,
+/// verify new writes route correctly to both new shards.
+#[mz_ore::test(tokio::test)]
+async fn test_reconfiguration_split() {
+    let client = new_persist_client_for_test().await;
+    let registry = MetricsRegistry::new();
+
+    // Start with a single log shard.
+    let shard_1 = ShardId::new();
+    let (acceptor_1, learner_1) = spawn_shard(&client, shard_1).await;
+
+    let partition_map = PartitionMap::single(shard_1);
+
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_1, acceptor_1);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_1, learner_1);
+
+    let service = ShardedService::new(partition_map, acceptors, learners);
+    let routing_handle = service.routing_handle();
+
+    let metashard_state = MetashardState::single(shard_1);
+    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
+        metashard_state,
+        256,
+        client.clone(),
+        registry,
+        routing_handle,
+    );
+
+    // --- Pre-reconfiguration: write data on the single shard ---
+    let key_lo = "s10000000-0000-0000-0000-000000000000"; // partition key 0x10
+    let key_hi = "s90000000-0000-0000-0000-000000000000"; // partition key 0x90
+
+    let resp = service.compare_and_set(cas_request(key_lo, None, 1, b"lo_v1")).await.unwrap();
+    assert!(resp.into_inner().committed, "pre-reconfig CAS should commit");
+
+    let resp = service.compare_and_set(cas_request(key_hi, None, 1, b"hi_v1")).await.unwrap();
+    assert!(resp.into_inner().committed, "pre-reconfig CAS should commit");
+
+    // --- Reconfigure: split [0x00, 0x100) into [0x00, 0x80) and [0x80, 0x100) ---
+    let shard_a = ShardId::new(); // [0x00, 0x80)
+    let shard_b = ShardId::new(); // [0x80, 0x100)
+
+    let new_partition_map = PartitionMap {
+        epoch: 1,
+        ranges: vec![
+            RangeAssignment {
+                lo: 0x00,
+                hi_exclusive: 0x80,
+                log_shard: shard_a,
+            },
+            RangeAssignment {
+                lo: 0x80,
+                hi_exclusive: 0x100,
+                log_shard: shard_b,
+            },
+        ],
+    };
+
+    let new_epoch = metashard_handle
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map: new_partition_map.clone(),
+        })
+        .await
+        .expect("reconfiguration should succeed");
+    assert_eq!(new_epoch, 1);
+
+    // Verify the metashard state updated.
+    assert_eq!(metashard_handle.current_epoch().await.unwrap(), 1);
+    let map = metashard_handle.partition_map().await.unwrap();
+    assert_eq!(map.ranges.len(), 2);
+
+    // --- Post-reconfiguration: writes route to new shards ---
+
+    // key_lo (0x10) → shard_a. This is a NEW shard, so this client shard has
+    // no history there. CAS with expected=None should succeed.
+    let resp = service
+        .compare_and_set(cas_request(key_lo, None, 1, b"lo_v2_on_shard_a"))
+        .await
+        .unwrap();
+    assert!(
+        resp.into_inner().committed,
+        "post-reconfig CAS on new shard should commit"
+    );
+
+    // key_hi (0x90) → shard_b. Same logic.
+    let resp = service
+        .compare_and_set(cas_request(key_hi, None, 1, b"hi_v2_on_shard_b"))
+        .await
+        .unwrap();
+    assert!(
+        resp.into_inner().committed,
+        "post-reconfig CAS on new shard should commit"
+    );
+
+    // Read from new shards.
+    let resp = service
+        .head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() }))
+        .await
+        .unwrap();
+    let data = resp.into_inner().data.unwrap();
+    assert_eq!(data.data, b"lo_v2_on_shard_a");
+
+    let resp = service
+        .head(tonic::Request::new(ProtoHeadRequest { key: key_hi.into() }))
+        .await
+        .unwrap();
+    let data = resp.into_inner().data.unwrap();
+    assert_eq!(data.data, b"hi_v2_on_shard_b");
+
+    // Verify epoch mismatch is caught.
+    let err = metashard_handle
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0, // stale
+            new_partition_map,
+        })
+        .await;
+    assert!(matches!(err, Err(crate::MetashardError::EpochMismatch { .. })));
 }

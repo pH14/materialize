@@ -181,19 +181,6 @@ async fn run(args: Args) {
         )).collect::<Vec<_>>()
     );
 
-    // Spawn metashard actor (static partition map for now).
-    let metashard_state = if num_shards == 1 {
-        MetashardState::single(shard_ids[0])
-    } else {
-        MetashardState {
-            epoch: 0,
-            partition_map: partition_map.clone(),
-            log_shards: BTreeMap::new(),
-        }
-    };
-    let (_metashard_handle, _metashard_task) =
-        PersistMetashardActor::spawn(metashard_state, 256);
-
     // Spawn acceptor + learner per log shard.
     let mut acceptor_handles = BTreeMap::new();
     let mut learner_handles = BTreeMap::new();
@@ -226,10 +213,29 @@ async fn run(args: Args) {
         learner_handles.insert(shard_id, learner_handle);
     }
 
-    info!(num_shards = num_shards, "all log shards ready, starting gRPC server");
+    info!(num_shards = num_shards, "all log shards ready");
 
-    // Use ShardedService for routing across log shards.
-    let service = ShardedService::new(partition_map, acceptor_handles, learner_handles);
+    // Create ShardedService and get a handle to its routing state.
+    let service = ShardedService::new(partition_map.clone(), acceptor_handles, learner_handles);
+    let routing_handle = service.routing_handle();
+
+    // Spawn metashard actor with access to the routing state for reconfiguration.
+    let metashard_state = if num_shards == 1 {
+        MetashardState::single(shard_ids[0])
+    } else {
+        MetashardState {
+            epoch: 0,
+            partition_map: partition_map.clone(),
+            log_shards: BTreeMap::new(),
+        }
+    };
+    let (_metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
+        metashard_state,
+        256,
+        persist_client,
+        metrics_registry,
+        routing_handle,
+    );
 
     info!(addr = %args.listen_addr, "starting gRPC server");
     Server::builder()
