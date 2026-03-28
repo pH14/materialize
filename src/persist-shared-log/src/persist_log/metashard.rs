@@ -263,6 +263,14 @@ impl PersistMetashardActor {
     /// 3. Spawn new acceptors + learners
     /// 4. Seal retiring log shards
     /// 5. Update partition map and swap routing state
+    ///
+    /// TODO(horizontal-sharding): Add pre-hydration with CriticalSince:
+    /// - Before sealing, new learners should subscribe to old shards and catch up
+    /// - Acquire CriticalSince on old shard at the catch-up point
+    /// - Write snapshot entries (T=0) to new shard during pre-hydration
+    /// - Write delta entries (T=1) after seal
+    /// - Release CriticalSince after delta confirmed
+    /// See doc/reference/05_horizontal_sharding.md Section 12 for the full protocol.
     async fn do_reconfigure(&mut self, plan: ReconfigurationPlan) -> Result<u64, MetashardError> {
         // Phase 0: Validate.
         if plan.expected_epoch != self.state.epoch {

@@ -420,4 +420,103 @@ mod partition_map_tests {
         };
         assert!(map.validate().is_err());
     }
+
+    /// PM1 + PM2 + PM3: multi-way split covers the full range with no gaps or
+    /// overlaps, and epochs increase monotonically through a reconfiguration
+    /// sequence.
+    #[test]
+    fn multi_way_split_and_reconfig_sequence() {
+        let s1 = test_shard("1");
+        let s2 = test_shard("2");
+        let s3 = test_shard("3");
+        let s4 = test_shard("4");
+
+        // Epoch 0: single shard.
+        let map0 = PartitionMap::single(s1);
+        assert!(map0.validate().is_ok());
+        assert_eq!(map0.epoch, 0);
+
+        // Epoch 1: split into 4 ranges.
+        let map1 = PartitionMap {
+            epoch: 1,
+            ranges: vec![
+                RangeAssignment { lo: 0x00, hi_exclusive: 0x40, log_shard: s1 },
+                RangeAssignment { lo: 0x40, hi_exclusive: 0x80, log_shard: s2 },
+                RangeAssignment { lo: 0x80, hi_exclusive: 0xC0, log_shard: s3 },
+                RangeAssignment { lo: 0xC0, hi_exclusive: 0x100, log_shard: s4 },
+            ],
+        };
+        assert!(map1.validate().is_ok());
+        assert!(map1.epoch > map0.epoch); // PM3: monotonic
+
+        // Every key routes to exactly one shard.
+        for key in 0..=255u8 {
+            let shard = map1.route_key(key);
+            let expected = match key {
+                0x00..=0x3F => s1,
+                0x40..=0x7F => s2,
+                0x80..=0xBF => s3,
+                0xC0..=0xFF => s4,
+            };
+            assert_eq!(shard, expected, "key 0x{key:02x} routed to wrong shard");
+        }
+    }
+
+    /// Validate boundary keys route correctly at range edges.
+    #[test]
+    fn boundary_key_routing() {
+        let s1 = test_shard("1");
+        let s2 = test_shard("2");
+        let s3 = test_shard("3");
+        let map = PartitionMap {
+            epoch: 0,
+            ranges: vec![
+                RangeAssignment { lo: 0x00, hi_exclusive: 0x55, log_shard: s1 },
+                RangeAssignment { lo: 0x55, hi_exclusive: 0xAA, log_shard: s2 },
+                RangeAssignment { lo: 0xAA, hi_exclusive: 0x100, log_shard: s3 },
+            ],
+        };
+        assert!(map.validate().is_ok());
+
+        // Boundary keys.
+        assert_eq!(map.route_key(0x54), s1); // last key in range 1
+        assert_eq!(map.route_key(0x55), s2); // first key in range 2
+        assert_eq!(map.route_key(0xA9), s2); // last key in range 2
+        assert_eq!(map.route_key(0xAA), s3); // first key in range 3
+        assert_eq!(map.route_key(0xFF), s3); // last key in range 3
+    }
+
+    /// Validate that validate() catches an empty map.
+    #[test]
+    fn validate_catches_empty_map() {
+        let map = PartitionMap {
+            epoch: 0,
+            ranges: vec![],
+        };
+        assert!(map.validate().is_err());
+    }
+
+    /// Validate that validate() catches a map that doesn't start at 0x00.
+    #[test]
+    fn validate_catches_wrong_start() {
+        let s1 = test_shard("1");
+        let map = PartitionMap {
+            epoch: 0,
+            ranges: vec![RangeAssignment {
+                lo: 0x10,
+                hi_exclusive: 0x100,
+                log_shard: s1,
+            }],
+        };
+        assert!(map.validate().is_err());
+    }
+
+    /// Test partition_key with short/empty inputs.
+    #[test]
+    fn partition_key_edge_cases() {
+        assert_eq!(partition_key(""), 0);
+        assert_eq!(partition_key("s"), 0);
+        assert_eq!(partition_key("s0"), 0);
+        assert_eq!(partition_key("sZZ"), 0); // invalid hex → 0
+    }
 }
