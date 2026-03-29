@@ -227,6 +227,7 @@ async fn run(args: Args) {
             epoch: 0,
             partition_map: partition_map.clone(),
             log_shards: BTreeMap::new(),
+            pending_intent: None,
         }
     };
     let (_metashard_handle, _metashard_task) = PersistMetashardActor::spawn(

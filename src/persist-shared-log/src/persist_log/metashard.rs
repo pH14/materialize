@@ -69,6 +69,27 @@ pub struct LogShardInfo {
     pub has_snapshot: bool,
 }
 
+/// Status of a reconfiguration intent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IntentStatus {
+    /// Intent written, not yet started.
+    Preparing,
+    /// Old shards sealed.
+    Sealed,
+    /// Snapshots written, new actors spawned.
+    Committed,
+}
+
+/// A durable reconfiguration intent. Written to the metashard persist shard
+/// before sealing, so that a crash mid-reconfiguration can be detected and
+/// completed on restart.
+#[derive(Debug, Clone)]
+pub struct ReconfigurationIntent {
+    pub epoch: u64,
+    pub plan: ReconfigurationPlan,
+    pub status: IntentStatus,
+}
+
 /// The metashard actor's in-memory materialized state.
 #[derive(Debug, Clone)]
 pub struct MetashardState {
@@ -78,6 +99,8 @@ pub struct MetashardState {
     pub partition_map: PartitionMap,
     /// Per-log-shard metadata.
     pub log_shards: BTreeMap<ShardId, LogShardInfo>,
+    /// In-flight reconfiguration intent (if any).
+    pub pending_intent: Option<ReconfigurationIntent>,
 }
 
 impl MetashardState {
@@ -104,6 +127,7 @@ impl MetashardState {
             epoch: 0,
             partition_map: PartitionMap::single(log_shard),
             log_shards,
+            pending_intent: None,
         }
     }
 }
@@ -442,6 +466,13 @@ impl PersistMetashardActor {
             "starting reconfiguration"
         );
 
+        // Phase 0: Write ReconfigurationIntent (durable crash recovery marker).
+        self.state.pending_intent = Some(ReconfigurationIntent {
+            epoch: new_epoch,
+            plan: plan.clone(),
+            status: IntentStatus::Preparing,
+        });
+
         // Phase 0.5: Acquire CriticalSince on retiring shards to prevent
         // compaction during predecessor replay. Uses a deterministic reader ID
         // derived from the new epoch so it can be recovered after crash.
@@ -493,6 +524,11 @@ impl PersistMetashardActor {
                 info.status = LogShardStatus::Sealed;
                 info.epoch_sealed = Some(new_epoch);
             }
+        }
+
+        // Update intent: sealed.
+        if let Some(ref mut intent) = self.state.pending_intent {
+            intent.status = IntentStatus::Sealed;
         }
 
         // Phase 2: Write snapshots to new shards + spawn actors.
@@ -652,6 +688,8 @@ impl PersistMetashardActor {
 
         self.state.epoch = new_epoch;
         self.state.partition_map = new_partition_map;
+        // Clear the intent — reconfiguration committed successfully.
+        self.state.pending_intent = None;
 
         // Phase 5: Release CriticalSince holds on retired shards.
         // The new learners have finished replaying predecessors by now
@@ -684,6 +722,18 @@ impl PersistMetashardActor {
             num_log_shards = self.state.log_shards.len(),
             "metashard actor starting"
         );
+
+        // Check for a pending reconfiguration intent from a previous crash.
+        if let Some(ref intent) = self.state.pending_intent {
+            // TODO(horizontal-sharding): Implement crash recovery by resuming
+            // the reconfiguration from the last completed phase.
+            tracing::warn!(
+                epoch = intent.epoch,
+                status = ?intent.status,
+                "found pending reconfiguration intent from previous run — \
+                 crash recovery not yet implemented, manual intervention required"
+            );
+        }
 
         loop {
             match self.rx.recv().await {
@@ -767,6 +817,7 @@ mod tests {
                 ],
             },
             log_shards: BTreeMap::new(),
+            pending_intent: None,
         };
 
         // Create a minimal actor (query-only, no reconfiguration capability).
