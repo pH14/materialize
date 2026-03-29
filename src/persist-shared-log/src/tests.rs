@@ -14,5 +14,6 @@ mod persist_sim;
 mod scenario;
 mod sharded;
 mod sharded_sim;
+mod sim_cluster;
 mod stateright_reconfig;
 mod trace;
