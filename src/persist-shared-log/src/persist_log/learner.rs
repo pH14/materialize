@@ -1305,6 +1305,105 @@ impl<E: EventSource> PersistLearner<E> {
 }
 
 impl PersistLearner<ChannelEventSource> {
+    /// Replay a sealed predecessor shard into this learner's StateMachine.
+    ///
+    /// Subscribes to the predecessor, processes all events to completion
+    /// (frontier = []), and returns. Only updates the global StateMachine —
+    /// results and retractions for the predecessor shard are discarded since
+    /// the predecessor is sealed and will never serve result queries.
+    async fn replay_predecessor(
+        &mut self,
+        client: &PersistClient,
+        predecessor_shard: ShardId,
+    ) {
+        info!(%predecessor_shard, "replaying sealed predecessor shard");
+
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
+
+        let (_, read) = client
+            .open::<OrderedKey, Proposal, u64, i64>(
+                predecessor_shard,
+                key_schema,
+                val_schema,
+                Diagnostics::from_purpose("persist-shared-log-predecessor-replay"),
+                false,
+            )
+            .await
+            .expect("failed to open predecessor shard for replay");
+
+        let since = read.since().clone();
+        let mut subscribe = read
+            .subscribe(since)
+            .await
+            .expect("subscribe to predecessor should succeed");
+
+        let mut events_processed: u64 = 0;
+        loop {
+            let events = subscribe
+                .fetch_next()
+                .await;
+
+            let mut done = false;
+            for event in &events {
+                match event {
+                    ListenEvent::Progress(frontier) => {
+                        if frontier.is_empty() {
+                            done = true;
+                        }
+                    }
+                    ListenEvent::Updates(updates) => {
+                        // Apply to StateMachine only (not LogShardState).
+                        for ((key, proposal_data), _ts, diff) in updates {
+                            if *diff == 1 {
+                                self.state.live_keys.insert(key.clone());
+                                let proposal: ProtoLogProposal =
+                                    match Message::decode(proposal_data.encoded.as_ref()) {
+                                        Ok(p) => p,
+                                        Err(_) => continue,
+                                    };
+                                match proposal.op {
+                                    Some(proto_log_proposal::Op::Cas(cas)) => {
+                                        let (_, retraction) = self.state.apply_cas(
+                                            cas,
+                                            key.clone(),
+                                            proposal_data.clone(),
+                                        );
+                                        // Discard retraction — predecessor is sealed.
+                                        let _ = retraction;
+                                    }
+                                    Some(proto_log_proposal::Op::Truncate(trunc)) => {
+                                        let (_, _retractions) = self.state.apply_truncate(
+                                            &trunc,
+                                            key.clone(),
+                                            proposal_data.clone(),
+                                        );
+                                    }
+                                    None => {}
+                                }
+                            } else {
+                                debug_assert_eq!(*diff, -1);
+                                self.state.apply_retraction(key);
+                            }
+                            events_processed += 1;
+                        }
+                    }
+                }
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        info!(
+            %predecessor_shard,
+            events_processed,
+            total_entries = self.state.total_entries,
+            "predecessor replay complete"
+        );
+    }
+
     /// Opens a persist shard and spawns the learner as a tokio task.
     ///
     /// Handles shard subscription and upper-handle creation internally —
@@ -1353,6 +1452,67 @@ impl PersistLearner<ChannelEventSource> {
 
         let (learner, handle) = Self::new(config, subscribe, retraction_write, metrics);
         let task = mz_ore::task::spawn(|| "persist-learner", learner.run(upper_handle));
+        (handle, task)
+    }
+
+    /// Spawn a learner that replays sealed predecessor shards before entering
+    /// its normal event loop.
+    ///
+    /// The predecessor replay builds up the StateMachine with state from old
+    /// log shards, so the learner starts with carried-forward state. This is
+    /// the chain replay mechanism described in `05_horizontal_sharding.md`.
+    pub async fn spawn_with_predecessors(
+        config: PersistLearnerConfig,
+        client: &PersistClient,
+        shard_id: ShardId,
+        predecessors: Vec<ShardId>,
+        metrics: LearnerMetrics,
+    ) -> (PersistLearnerHandle, mz_ore::task::JoinHandle<()>) {
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
+
+        let (mut upper_handle, read) = client
+            .open::<OrderedKey, Proposal, u64, i64>(
+                shard_id,
+                Arc::clone(&key_schema),
+                Arc::clone(&val_schema),
+                Diagnostics::from_purpose("persist-shared-log-learner"),
+                false,
+            )
+            .await
+            .expect("failed to open persist shard for learner");
+
+        let retraction_write = client
+            .open_writer::<OrderedKey, Proposal, u64, i64>(
+                shard_id,
+                key_schema,
+                val_schema,
+                Diagnostics::from_purpose("persist-shared-log-learner-retraction"),
+            )
+            .await
+            .expect("failed to open retraction writer for learner");
+
+        if upper_handle.upper().as_option() == Some(&0) {
+            upper_handle.advance_upper(&Antichain::from_elem(1)).await;
+        }
+
+        let since = read.since().clone();
+        let subscribe = read
+            .subscribe(since)
+            .await
+            .expect("subscribe should succeed");
+
+        let (mut learner, handle) = Self::new(config, subscribe, retraction_write, metrics);
+
+        // Replay predecessors before starting the main loop.
+        let client_clone = client.clone();
+        let task = mz_ore::task::spawn(|| "persist-learner-with-predecessors", async move {
+            for predecessor in predecessors {
+                learner.replay_predecessor(&client_clone, predecessor).await;
+            }
+            learner.run(upper_handle).await;
+        });
+
         (handle, task)
     }
 }

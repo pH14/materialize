@@ -25,11 +25,13 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{debug, info};
 
 use mz_ore::metrics::MetricsRegistry;
-use mz_persist_client::{PersistClient, ShardId};
+use mz_persist_client::critical::{CriticalReaderId, Opaque, SinceHandle};
+use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::persist_log::{OrderedKey, Proposal};
 use crate::sharded_service::RoutingState;
 use crate::{AcceptorConfig, MetashardError, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
@@ -304,6 +306,33 @@ impl PersistMetashardActor {
             "starting reconfiguration"
         );
 
+        // Phase 0.5: Acquire CriticalSince on retiring shards to prevent
+        // compaction during predecessor replay. Uses a deterministic reader ID
+        // derived from the new epoch so it can be recovered after crash.
+        let mut critical_holds: Vec<SinceHandle<OrderedKey, Proposal, u64, i64>> = Vec::new();
+        for &shard_id in &retiring {
+            let reader_id: CriticalReaderId = format!(
+                "c{:0>8}-{:04x}-0000-0000-000000000000",
+                new_epoch, shard_id.to_string().len()
+            )
+            .parse()
+            .expect("valid CriticalReaderId");
+
+            let handle = self
+                .persist_client
+                .open_critical_since::<OrderedKey, Proposal, u64, i64>(
+                    shard_id,
+                    reader_id,
+                    Opaque::encode(&0i64),
+                    Diagnostics::from_purpose("metashard-reconfig-critical-since"),
+                )
+                .await
+                .expect("open_critical_since should succeed");
+
+            info!(%shard_id, "acquired CriticalSince hold for predecessor replay");
+            critical_holds.push(handle);
+        }
+
         // Phase 1: Spawn new acceptors + learners for added log shards.
         let mut new_acceptors = BTreeMap::new();
         let mut new_learners = BTreeMap::new();
@@ -325,13 +354,48 @@ impl PersistMetashardActor {
             )
             .await;
 
-            let (learner_handle, _task) = PersistLearner::spawn(
-                PersistLearnerConfig::default(),
-                &self.persist_client,
-                shard_id,
-                learner_metrics,
-            )
-            .await;
+            // Find predecessor shards for this new log shard.
+            // The predecessor is the old log shard whose range overlapped with
+            // the new log shard's range.
+            let new_range = new_map
+                .ranges
+                .iter()
+                .find(|r| r.log_shard == shard_id)
+                .expect("new shard must be in new partition map");
+            let predecessors: Vec<ShardId> = old_map
+                .ranges
+                .iter()
+                .filter(|r| {
+                    u16::from(new_range.lo) < r.hi_exclusive
+                        && u16::from(r.lo) < new_range.hi_exclusive
+                })
+                .map(|r| r.log_shard)
+                .filter(|s| retiring.contains(s))
+                .collect();
+
+            let (learner_handle, _task) = if predecessors.is_empty() {
+                PersistLearner::spawn(
+                    PersistLearnerConfig::default(),
+                    &self.persist_client,
+                    shard_id,
+                    learner_metrics,
+                )
+                .await
+            } else {
+                info!(
+                    %shard_id,
+                    predecessors = ?predecessors,
+                    "spawning learner with predecessor chain replay"
+                );
+                PersistLearner::spawn_with_predecessors(
+                    PersistLearnerConfig::default(),
+                    &self.persist_client,
+                    shard_id,
+                    predecessors,
+                    learner_metrics,
+                )
+                .await
+            };
 
             info!(%shard_id, "spawned new acceptor + learner for reconfiguration");
             new_acceptors.insert(shard_id, acceptor_handle);
@@ -438,6 +502,25 @@ impl PersistMetashardActor {
 
         self.state.epoch = new_epoch;
         self.state.partition_map = new_partition_map;
+
+        // Phase 5: Release CriticalSince holds on retired shards.
+        // The new learners have finished replaying predecessors by now
+        // (spawn_with_predecessors blocks until replay is complete before
+        // entering the run loop), so the holds are no longer needed.
+        for mut hold in critical_holds {
+            let opaque = hold.opaque().clone();
+            match hold
+                .compare_and_downgrade_since(&opaque, (&opaque, &Antichain::new()))
+                .await
+            {
+                Ok(_) => {
+                    info!("released CriticalSince hold");
+                }
+                Err(actual) => {
+                    info!(?actual, "CriticalSince was fenced (another process released it)");
+                }
+            }
+        }
 
         info!(new_epoch, "reconfiguration complete");
         Ok(new_epoch)

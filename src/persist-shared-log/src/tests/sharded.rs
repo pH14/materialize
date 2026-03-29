@@ -370,29 +370,30 @@ async fn test_reconfiguration_split() {
     assert_eq!(map.ranges.len(), 2);
 
     // --- Post-reconfiguration: writes route to new shards ---
+    // Give learners a moment to finish predecessor replay.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // key_lo (0x10) → shard_a. This is a NEW shard, so this client shard has
-    // no history there. CAS with expected=None should succeed.
+    // State carried forward via chain replay: key_lo and key_hi already have
+    // seqno 1 from the predecessor shard. CAS with expected=Some(1) succeeds.
     let resp = service
-        .compare_and_set(cas_request(key_lo, None, 1, b"lo_v2_on_shard_a"))
+        .compare_and_set(cas_request(key_lo, Some(1), 2, b"lo_v2_on_shard_a"))
         .await
         .unwrap();
     assert!(
         resp.into_inner().committed,
-        "post-reconfig CAS on new shard should commit"
+        "post-reconfig CAS with carried-forward expected seqno should commit"
     );
 
-    // key_hi (0x90) → shard_b. Same logic.
     let resp = service
-        .compare_and_set(cas_request(key_hi, None, 1, b"hi_v2_on_shard_b"))
+        .compare_and_set(cas_request(key_hi, Some(1), 2, b"hi_v2_on_shard_b"))
         .await
         .unwrap();
     assert!(
         resp.into_inner().committed,
-        "post-reconfig CAS on new shard should commit"
+        "post-reconfig CAS with carried-forward expected seqno should commit"
     );
 
-    // Read from new shards.
+    // Read from new shards — data reflects the post-reconfig writes.
     let resp = service
         .head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() }))
         .await
@@ -415,4 +416,111 @@ async fn test_reconfiguration_split() {
         })
         .await;
     assert!(matches!(err, Err(crate::MetashardError::EpochMismatch { .. })));
+}
+
+/// Reconfiguration with state carryforward: data written before reconfiguration
+/// is readable after reconfiguration via chain replay.
+///
+/// This tests the core state migration guarantee: new learners replay sealed
+/// predecessor shards and carry forward the materialized state.
+#[mz_ore::test(tokio::test)]
+async fn test_reconfiguration_state_carryforward() {
+    let client = new_persist_client_for_test().await;
+    let registry = MetricsRegistry::new();
+
+    // Start with a single log shard covering the full range.
+    let shard_old = ShardId::new();
+    let (acceptor_old, learner_old) = spawn_shard(&client, shard_old).await;
+
+    let partition_map = PartitionMap::single(shard_old);
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_old, acceptor_old);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_old, learner_old);
+
+    let service = ShardedService::new(partition_map, acceptors, learners);
+    let routing_handle = service.routing_handle();
+
+    let metashard_state = MetashardState::single(shard_old);
+    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
+        metashard_state,
+        256,
+        client.clone(),
+        registry,
+        routing_handle,
+    );
+
+    // --- Write data before reconfiguration ---
+    let key = "s30000000-0000-0000-0000-000000000000"; // partition key 0x30
+
+    let resp = service
+        .compare_and_set(cas_request(key, None, 1, b"before_reconfig_v1"))
+        .await
+        .unwrap();
+    assert!(resp.into_inner().committed);
+
+    let resp = service
+        .compare_and_set(cas_request(key, Some(1), 2, b"before_reconfig_v2"))
+        .await
+        .unwrap();
+    assert!(resp.into_inner().committed);
+
+    // Verify data is readable before reconfig.
+    let resp = service
+        .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+        .await
+        .unwrap();
+    assert_eq!(resp.into_inner().data.unwrap().seqno, 2);
+
+    // --- Reconfigure: replace old shard with new shard ---
+    let shard_new = ShardId::new();
+    let new_partition_map = PartitionMap::single(shard_new);
+
+    let new_epoch = metashard_handle
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map,
+        })
+        .await
+        .expect("reconfiguration should succeed");
+    assert_eq!(new_epoch, 1);
+
+    // Give the learner a moment to finish predecessor replay.
+    // The spawn_with_predecessors blocks on replay before entering the run
+    // loop, but there's a brief async window for the learner task to start.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // --- Verify state carried forward ---
+    // The new learner should have replayed shard_old and have the data.
+    let resp = service
+        .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+        .await
+        .unwrap();
+    let data = resp.into_inner().data;
+    assert!(
+        data.is_some(),
+        "data should be carried forward from predecessor shard"
+    );
+    let data = data.unwrap();
+    assert_eq!(data.seqno, 2, "seqno should be carried forward");
+    assert_eq!(
+        data.data, b"before_reconfig_v2",
+        "data should be carried forward"
+    );
+
+    // --- Verify new writes work on the new shard ---
+    let resp = service
+        .compare_and_set(cas_request(key, Some(2), 3, b"after_reconfig_v3"))
+        .await
+        .unwrap();
+    assert!(
+        resp.into_inner().committed,
+        "CAS with correct expected seqno from carried-forward state should commit"
+    );
+
+    let resp = service
+        .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+        .await
+        .unwrap();
+    assert_eq!(resp.into_inner().data.unwrap().seqno, 3);
 }
