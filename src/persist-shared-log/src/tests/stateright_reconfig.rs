@@ -293,7 +293,10 @@ enum Phase {
     HoldsAcquired,
     /// Retiring shards sealed (upper = []). This is durable in the log shards.
     Sealed,
-    /// All new shards have replayed predecessor data.
+    /// Replay in progress. Some (new_shard, predecessor) pairs have been
+    /// replayed but not all. Crash here clears `replayed`, requiring re-replay.
+    Replaying,
+    /// All new shards have replayed all predecessor data.
     Replayed,
     /// Routing swapped to new shards. The in-memory map and epoch have been
     /// updated, but durable_intent still exists and the durable epoch/map
@@ -335,8 +338,8 @@ struct ProtocolState {
     phase: Phase,
     /// CriticalSince holds (prevent compaction of sealed shards during replay).
     holds: BTreeSet<u8>,
-    /// New shards that have completed predecessor replay.
-    replayed: BTreeSet<u8>,
+    /// (new_shard, predecessor) pairs that have completed replay.
+    replayed: BTreeSet<(u8, u8)>,
 
     // --- Bookkeeping ---
 
@@ -365,8 +368,9 @@ enum ProtocolAction {
     AcquireHolds,
     /// Seal retiring log shards.
     Seal,
-    /// Replay all predecessors into new shards (atomic for state space).
-    Replay,
+    /// Replay one predecessor shard into one new shard. Per-predecessor
+    /// granularity so crash-during-partial-replay is a modeled state.
+    ReplayPredecessor { new_shard: u8, predecessor: u8 },
     /// Swap routing to new partition map. In-memory map/epoch updated,
     /// intent cleared in memory but NOT yet durably persisted.
     SwapRouting,
@@ -509,8 +513,45 @@ impl Model for ProtocolModel {
             Phase::HoldsAcquired => {
                 actions.push(ProtocolAction::Seal);
             }
-            Phase::Sealed => {
-                actions.push(ProtocolAction::Replay);
+            Phase::Sealed | Phase::Replaying => {
+                // Offer per-predecessor replay actions for any (new_shard,
+                // predecessor) pair that hasn't been replayed yet.
+                if let Some(plan) = &state.durable_intent {
+                    let old_map = &state.durable_map;
+                    let mut any_remaining = false;
+                    for &new_shard in &plan.new_shards {
+                        let new_range = plan
+                            .new_map
+                            .iter()
+                            .find(|&&(_, _, sid)| sid == new_shard);
+                        if let Some(new_range) = new_range {
+                            for &pred in &plan.retiring {
+                                let pred_range = old_map
+                                    .iter()
+                                    .find(|&&(_, _, sid)| sid == pred);
+                                if let Some(pred_range) = pred_range {
+                                    // Check overlap: ranges must share client shards.
+                                    let overlaps = (0..NUM_CS).any(|cs| {
+                                        range_covers(new_range.0, new_range.1, cs)
+                                            && range_covers(pred_range.0, pred_range.1, cs)
+                                    });
+                                    if overlaps && !state.replayed.contains(&(new_shard, pred)) {
+                                        actions.push(ProtocolAction::ReplayPredecessor {
+                                            new_shard,
+                                            predecessor: pred,
+                                        });
+                                        any_remaining = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !any_remaining && state.phase == Phase::Replaying {
+                        // All predecessors replayed — no more replay actions,
+                        // but SwapRouting becomes available via Replayed phase.
+                        // Transition happens in next_state for the last replay.
+                    }
+                }
             }
             Phase::Replayed => {
                 actions.push(ProtocolAction::SwapRouting);
@@ -530,6 +571,7 @@ impl Model for ProtocolModel {
                 Phase::IntentPersisted
                 | Phase::HoldsAcquired
                 | Phase::Sealed
+                | Phase::Replaying
                 | Phase::Replayed
                 | Phase::RoutingSwapped
                 | Phase::DurableCommitted => {
@@ -581,36 +623,61 @@ impl Model for ProtocolModel {
                 s.phase = Phase::Sealed;
             }
 
-            ProtocolAction::Replay => {
+            ProtocolAction::ReplayPredecessor {
+                new_shard,
+                predecessor,
+            } => {
                 let plan = s.durable_intent.as_ref().expect("must have intent").clone();
-                // For each new shard, copy data from all overlapping predecessors.
-                for &new_shard in &plan.new_shards {
-                    let new_range = plan
+                let new_range = plan
+                    .new_map
+                    .iter()
+                    .find(|&&(_, _, sid)| sid == new_shard)
+                    .expect("new shard must be in new map");
+                let pred_range = state
+                    .durable_map
+                    .iter()
+                    .find(|&&(_, _, sid)| sid == predecessor)
+                    .expect("predecessor must be in old map");
+                // Copy each client shard that both ranges cover.
+                for cs in 0..NUM_CS {
+                    if range_covers(new_range.0, new_range.1, cs)
+                        && range_covers(pred_range.0, pred_range.1, cs)
+                    {
+                        let pred_seq = s.data[&predecessor][cs];
+                        let entry = s.data.get_mut(&new_shard).unwrap();
+                        entry[cs] = entry[cs].max(pred_seq);
+                    }
+                }
+                s.replayed.insert((new_shard, predecessor));
+
+                // Check if all (new_shard, predecessor) pairs are replayed.
+                let all_done = plan.new_shards.iter().all(|&ns| {
+                    let new_r = plan
                         .new_map
                         .iter()
-                        .find(|&&(_, _, sid)| sid == new_shard)
-                        .expect("new shard must be in new map");
-                    for &pred in &plan.retiring {
-                        let pred_range = state
-                            .map
+                        .find(|&&(_, _, sid)| sid == ns);
+                    plan.retiring.iter().all(|&pred| {
+                        let pred_r = state
+                            .durable_map
                             .iter()
-                            .find(|&&(_, _, sid)| sid == pred)
-                            .expect("predecessor must be in old map");
-                        // Copy each client shard that both ranges cover.
-                        for cs in 0..NUM_CS {
-                            if range_covers(new_range.0, new_range.1, cs)
-                                && range_covers(pred_range.0, pred_range.1, cs)
-                            {
-                                let pred_seq = s.data[&pred][cs];
-                                let entry = s.data.get_mut(&new_shard).unwrap();
-                                // Take the max — replay applies all predecessor data.
-                                entry[cs] = entry[cs].max(pred_seq);
+                            .find(|&&(_, _, sid)| sid == pred);
+                        match (new_r, pred_r) {
+                            (Some(nr), Some(pr)) => {
+                                let overlaps = (0..NUM_CS).any(|cs| {
+                                    range_covers(nr.0, nr.1, cs)
+                                        && range_covers(pr.0, pr.1, cs)
+                                });
+                                !overlaps || s.replayed.contains(&(ns, pred))
                             }
+                            _ => true,
                         }
-                    }
-                    s.replayed.insert(new_shard);
-                }
-                s.phase = Phase::Replayed;
+                    })
+                });
+                s.phase = if all_done {
+                    Phase::Replayed
+                } else {
+                    Phase::Replaying
+                };
             }
 
             ProtocolAction::SwapRouting => {

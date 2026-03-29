@@ -1768,6 +1768,8 @@ async fn test_buggify_reconfiguration_recovery() {
     let injection_points = [
         "after_intent_persist",
         "after_seal",
+        "after_actor_spawn",
+        "during_predecessor_replay",
         "after_replay_complete",
     ];
 
@@ -1896,7 +1898,11 @@ async fn test_buggify_reconfiguration_recovery() {
 async fn test_buggify_post_commit_injection_points() {
     use crate::fault::{self, FaultConfig};
 
-    let post_commit_points = ["after_routing_swap", "after_commit_persist"];
+    let post_commit_points = [
+        "after_routing_swap",
+        "after_commit_persist",
+        "before_hold_release",
+    ];
 
     let client = new_persist_client_for_test().await;
 

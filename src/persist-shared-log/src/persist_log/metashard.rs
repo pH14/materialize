@@ -1022,6 +1022,12 @@ impl PersistMetashardActor {
             new_learners.insert(shard_id, learner_handle);
         }
 
+        // BUGGIFY: crash after spawning new actors but before waiting for
+        // predecessor replay. Actors are running but replay hasn't been
+        // confirmed. On recovery, fresh actors are spawned and replay restarts.
+        crate::fault::maybe_fail("after_actor_spawn")
+            .map_err(MetashardError::Command)?;
+
         // Phase 3: Wait for all predecessor replays to complete BEFORE
         // committing the new epoch. If any replay fails, bail out — nothing
         // has been committed yet, CriticalSince holds are still active, and
@@ -1132,6 +1138,12 @@ impl PersistMetashardActor {
         // Holds leak but correctness is preserved — old shards just keep
         // their CriticalSince longer than necessary.
         crate::fault::maybe_fail("after_commit_persist")
+            .map_err(MetashardError::Command)?;
+
+        // BUGGIFY: crash before releasing CriticalSince holds. Holds leak
+        // but correctness is preserved — old shards keep their since longer
+        // than necessary. Next reconfiguration or restart can release them.
+        crate::fault::maybe_fail("before_hold_release")
             .map_err(MetashardError::Command)?;
 
         // Phase 6: Release CriticalSince holds on retired shards.

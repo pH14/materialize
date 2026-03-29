@@ -1396,6 +1396,12 @@ impl PersistLearner<ChannelEventSource> {
             }
         }
 
+        // BUGGIFY: fail during predecessor replay. This simulates a crash or
+        // error partway through replay. The caller (metashard) detects the
+        // failure via the replay_done oneshot and aborts the reconfiguration.
+        crate::fault::maybe_fail("during_predecessor_replay")
+            .map_err(|e| format!("predecessor replay interrupted: {e}"))?;
+
         info!(
             %predecessor_shard,
             events_processed,
