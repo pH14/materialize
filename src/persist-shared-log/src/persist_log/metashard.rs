@@ -240,6 +240,13 @@ pub struct PersistMetashardActor {
     routing: Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>>,
     /// Whether a reconfiguration is currently in progress.
     reconfiguring: bool,
+    /// Optional persist shard for durable metashard state. When provided, the
+    /// partition map and reconfiguration intents are written here so they survive
+    /// process restarts. The shard uses a special convention: key
+    /// `"__metashard_epoch_{N}"` with the serialized partition map as data.
+    metashard_shard_id: Option<ShardId>,
+    /// Write handle for the metashard persist shard (if any).
+    metashard_write: Option<mz_persist_client::write::WriteHandle<OrderedKey, Proposal, u64, i64>>,
 }
 
 impl PersistMetashardActor {
@@ -259,9 +266,92 @@ impl PersistMetashardActor {
             metrics_registry,
             routing,
             reconfiguring: false,
+            metashard_shard_id: None,
+            metashard_write: None,
         };
         let handle = PersistMetashardHandle::new(tx);
         (actor, handle)
+    }
+
+    /// Configure this actor to persist its state to a persist shard.
+    /// Must be called before `run()`.
+    pub async fn with_durable_state(mut self, shard_id: ShardId) -> Self {
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
+
+        let mut write = self
+            .persist_client
+            .open_writer::<OrderedKey, Proposal, u64, i64>(
+                shard_id,
+                key_schema,
+                val_schema,
+                Diagnostics::from_purpose("metashard-durable-state"),
+            )
+            .await
+            .expect("open metashard persist shard writer");
+
+        // Advance past T=0 if fresh.
+        if write.upper().as_option() == Some(&0) {
+            write.advance_upper(&Antichain::from_elem(1)).await;
+        }
+
+        self.metashard_shard_id = Some(shard_id);
+        self.metashard_write = Some(write);
+        self
+    }
+
+    /// Persist the current metashard state to the durable shard (if configured).
+    async fn persist_state(&mut self) {
+        let write = match self.metashard_write.as_mut() {
+            Some(w) => w,
+            None => return, // No durable shard configured.
+        };
+
+        // Serialize the partition map as a simple string representation.
+        // Format: "epoch={epoch};ranges={lo1}-{hi1}:{shard1},{lo2}-{hi2}:{shard2},..."
+        let mut data = format!("epoch={}", self.state.epoch);
+        for r in &self.state.partition_map.ranges {
+            data.push_str(&format!(
+                ";{:02x}-{:03x}:{}",
+                r.lo, r.hi_exclusive, r.log_shard
+            ));
+        }
+        if let Some(ref intent) = self.state.pending_intent {
+            data.push_str(&format!(";intent={:?}", intent.status));
+        }
+
+        let batch_number = write
+            .upper()
+            .as_option()
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+
+        let key = OrderedKey {
+            batch_id: batch_number,
+            position: 0,
+            shard: "__metashard".to_string(),
+        };
+        let proposal = Proposal {
+            encoded: Bytes::from(data.into_bytes()),
+        };
+
+        let upper = write.upper().clone();
+        let new_upper = Antichain::from_elem(batch_number + 1);
+        match write
+            .compare_and_append(&[((key, proposal), batch_number, 1i64)], upper, new_upper)
+            .await
+        {
+            Ok(Ok(())) => {
+                debug!(epoch = self.state.epoch, "persisted metashard state");
+            }
+            Ok(Err(_)) => {
+                debug!("metashard state persist upper mismatch (concurrent writer)");
+            }
+            Err(e) => {
+                tracing::error!("metashard state persist error: {e}");
+            }
+        }
     }
 
     /// Handle a non-reconfigure command (fast, synchronous).
@@ -445,8 +535,8 @@ impl PersistMetashardActor {
             .validate()
             .map_err(|e| MetashardError::Command(format!("invalid partition map: {e}")))?;
 
-        let old_map = &self.state.partition_map;
-        let new_map = &plan.new_partition_map;
+        let old_map = self.state.partition_map.clone();
+        let new_map = plan.new_partition_map.clone();
         let new_epoch = self.state.epoch + 1;
 
         // Identify which log shards are new and which are retiring.
@@ -472,6 +562,7 @@ impl PersistMetashardActor {
             plan: plan.clone(),
             status: IntentStatus::Preparing,
         });
+        self.persist_state().await;
 
         // Phase 0.5: Acquire CriticalSince on retiring shards to prevent
         // compaction during predecessor replay. Uses a deterministic reader ID
@@ -690,6 +781,9 @@ impl PersistMetashardActor {
         self.state.partition_map = new_partition_map;
         // Clear the intent — reconfiguration committed successfully.
         self.state.pending_intent = None;
+
+        // Persist the updated state durably.
+        self.persist_state().await;
 
         // Phase 5: Release CriticalSince holds on retired shards.
         // The new learners have finished replaying predecessors by now
