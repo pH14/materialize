@@ -597,6 +597,23 @@ impl PersistMetashardActor {
         );
     }
 
+    /// Access the actor's current state. Used by main.rs to read the
+    /// (possibly recovered) partition map before spawning log shard actors.
+    pub fn state(&self) -> &MetashardState {
+        &self.state
+    }
+
+    /// Get the routing handle for external updates.
+    pub fn routing_handle(&self) -> &Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>> {
+        &self.routing
+    }
+
+    /// Public wrapper for transitive predecessor lookup, used by main.rs
+    /// to determine which predecessors to replay at startup.
+    pub fn transitive_predecessors_for(&self, shard_id: ShardId) -> Vec<ShardId> {
+        self.transitive_predecessors(shard_id)
+    }
+
     /// Walk the predecessor chain transitively for a shard, returning all
     /// ancestors in replay order (oldest first).
     ///

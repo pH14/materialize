@@ -49,6 +49,16 @@ pub struct RoutingState<A: Acceptor, L: Learner> {
 }
 
 impl<A: Acceptor, L: Learner> RoutingState<A, L> {
+    /// Create an empty routing state. Used as a placeholder during startup
+    /// before the real routing is populated.
+    pub fn empty() -> Self {
+        RoutingState {
+            partition_map: PartitionMap { epoch: 0, ranges: vec![] },
+            acceptors: BTreeMap::new(),
+            learners: BTreeMap::new(),
+        }
+    }
+
     pub fn new(
         partition_map: PartitionMap,
         acceptors: BTreeMap<ShardId, A>,

@@ -7458,6 +7458,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "turmoil",
  "workspace-hack",
 ]
 

@@ -11,18 +11,21 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use clap::Parser;
+use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tracing::info;
 
+use mz_ore::metrics::MetricsRegistry;
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLogServer;
 use mz_persist_client::ShardId;
 use mz_persist_shared_log::metrics::{AcceptorMetrics, LearnerMetrics};
 use mz_persist_shared_log::persist_log::acceptor::PersistAcceptor;
 use mz_persist_shared_log::persist_log::learner::{PersistLearner, PersistLearnerConfig};
 use mz_persist_shared_log::persist_log::metashard::{MetashardState, PersistMetashardActor};
-use mz_persist_shared_log::sharded_service::ShardedService;
+use mz_persist_shared_log::sharded_service::{RoutingState, ShardedService};
 use mz_persist_shared_log::{AcceptorConfig, PartitionMap, RangeAssignment};
 
 /// CLI arguments for the persist shared log service.
@@ -165,78 +168,7 @@ async fn run(args: Args) {
         }
     };
 
-    // Generate shard IDs for each log shard.
-    let num_shards = args.num_log_shards;
-    let mut shard_ids: Vec<ShardId> = Vec::with_capacity(num_shards);
-    if let Some(id) = &args.shard_id {
-        shard_ids.push(id.parse().expect("invalid --shard-id"));
-    }
-    while shard_ids.len() < num_shards {
-        let id = ShardId::new();
-        info!(%id, index = shard_ids.len(), "generated log shard ID");
-        shard_ids.push(id);
-    }
-
-    let partition_map = build_partition_map(&shard_ids);
-    info!(
-        num_shards = num_shards,
-        "partition map: {:?}",
-        partition_map.ranges.iter().map(|r| format!(
-            "[0x{:02x}, 0x{:03x}) -> {}",
-            r.lo, r.hi_exclusive, r.log_shard
-        )).collect::<Vec<_>>()
-    );
-
-    // Spawn acceptor + learner per log shard.
-    let mut acceptor_handles = BTreeMap::new();
-    let mut learner_handles = BTreeMap::new();
-
-    for (i, &shard_id) in shard_ids.iter().enumerate() {
-        let acceptor_metrics = AcceptorMetrics::register(&metrics_registry);
-        let learner_metrics = LearnerMetrics::register(&metrics_registry);
-
-        let acceptor_config = AcceptorConfig::default();
-        let (acceptor_handle, _acceptor_task) = PersistAcceptor::spawn(
-            acceptor_config,
-            &persist_client,
-            shard_id,
-            acceptor_metrics,
-            0,
-        )
-        .await;
-
-        let learner_config = PersistLearnerConfig::default();
-        let (learner_handle, _learner_task, _replay_done) = PersistLearner::spawn(
-            learner_config,
-            &persist_client,
-            shard_id,
-            vec![],
-            learner_metrics,
-        )
-        .await;
-
-        info!(%shard_id, index = i, "log shard ready");
-        acceptor_handles.insert(shard_id, acceptor_handle);
-        learner_handles.insert(shard_id, learner_handle);
-    }
-
-    info!(num_shards = num_shards, "all log shards ready");
-
-    // Create ShardedService and get a handle to its routing state.
-    let service = ShardedService::new(partition_map.clone(), acceptor_handles, learner_handles);
-    let routing_handle = service.routing_handle();
-
-    // Spawn metashard actor with access to the routing state for reconfiguration.
-    let metashard_state = if num_shards == 1 {
-        MetashardState::single(shard_ids[0])
-    } else {
-        MetashardState {
-            epoch: 0,
-            partition_map: partition_map.clone(),
-            log_shards: BTreeMap::new(),
-            pending_intent: None,
-        }
-    };
+    // --- Step 1: Create metashard (source of truth) ---
     let metashard_shard_id = match &args.metashard_id {
         Some(id) => id.parse().expect("invalid --metashard-id"),
         None => {
@@ -245,16 +177,116 @@ async fn run(args: Args) {
             id
         }
     };
-    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
-        metashard_state,
+
+    // Build a bootstrap partition map from CLI args. PersistMetashardActor::new
+    // will override this if it recovers a committed map from durable state.
+    let num_shards = args.num_log_shards;
+    let mut bootstrap_shard_ids: Vec<ShardId> = Vec::with_capacity(num_shards);
+    if let Some(id) = &args.shard_id {
+        bootstrap_shard_ids.push(id.parse().expect("invalid --shard-id"));
+    }
+    while bootstrap_shard_ids.len() < num_shards {
+        bootstrap_shard_ids.push(ShardId::new());
+    }
+    let bootstrap_map = build_partition_map(&bootstrap_shard_ids);
+    let bootstrap_state = if num_shards == 1 {
+        MetashardState::single(bootstrap_shard_ids[0])
+    } else {
+        MetashardState {
+            epoch: 0,
+            partition_map: bootstrap_map,
+            log_shards: BTreeMap::new(),
+            pending_intent: None,
+        }
+    };
+
+    // The routing handle starts empty — we'll populate it after spawning
+    // log shard actors. The metashard actor needs it for reconfiguration
+    // but doesn't use it during construction.
+    let empty_routing = Arc::new(RwLock::new(RoutingState::empty()));
+
+    let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
+        bootstrap_state,
         256,
-        persist_client,
-        metrics_registry,
-        routing_handle,
+        persist_client.clone(),
+        metrics_registry.clone(),
+        Arc::clone(&empty_routing),
         metashard_shard_id,
     )
     .await;
 
+    // --- Step 2: Read the (possibly recovered) partition map ---
+    let partition_map = metashard_actor.state().partition_map.clone();
+    let epoch = metashard_actor.state().epoch;
+    info!(
+        epoch,
+        num_ranges = partition_map.ranges.len(),
+        "active partition map: {:?}",
+        partition_map.ranges.iter().map(|r| format!(
+            "[0x{:02x}, 0x{:03x}) -> {}",
+            r.lo, r.hi_exclusive, r.log_shard
+        )).collect::<Vec<_>>()
+    );
+
+    // --- Step 3: Spawn log shard actors from the partition map ---
+    let mut acceptor_handles = BTreeMap::new();
+    let mut learner_handles = BTreeMap::new();
+
+    for (i, range) in partition_map.ranges.iter().enumerate() {
+        let shard_id = range.log_shard;
+        let shard_registry = MetricsRegistry::new();
+        let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
+        let learner_metrics = LearnerMetrics::register(&shard_registry);
+
+        let (acceptor_handle, _) = PersistAcceptor::spawn(
+            AcceptorConfig::default(),
+            &persist_client,
+            shard_id,
+            acceptor_metrics,
+            epoch,
+        )
+        .await;
+
+        let predecessors = metashard_actor.transitive_predecessors_for(shard_id);
+        let (learner_handle, _, replay_done) = PersistLearner::spawn(
+            PersistLearnerConfig::default(),
+            &persist_client,
+            shard_id,
+            predecessors,
+            learner_metrics,
+        )
+        .await;
+        if replay_done.await.is_err() {
+            panic!("predecessor replay failed for shard {shard_id} during startup");
+        }
+
+        info!(%shard_id, index = i, "log shard ready");
+        acceptor_handles.insert(shard_id, acceptor_handle);
+        learner_handles.insert(shard_id, learner_handle);
+    }
+
+    info!(num_shards = partition_map.ranges.len(), "all log shards ready");
+
+    // --- Step 4: Build ShardedService and populate routing ---
+    let service = ShardedService::new(
+        partition_map.clone(),
+        acceptor_handles,
+        learner_handles,
+    );
+    // Replace the empty routing with the real one.
+    {
+        let real = service.routing_handle();
+        let real_state = real.read().await;
+        let mut empty = empty_routing.write().await;
+        *empty = RoutingState::new(
+            real_state.partition_map.clone(),
+            real_state.acceptors.clone(),
+            real_state.learners.clone(),
+        );
+    }
+
+    // --- Step 5: Start metashard actor + gRPC server ---
+    let _metashard_task = mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
     let service = service.with_metashard(metashard_handle);
 
     info!(addr = %args.listen_addr, "starting gRPC server");
