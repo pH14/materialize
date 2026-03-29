@@ -63,8 +63,9 @@ pub struct LogShardInfo {
     pub epoch_created: u64,
     pub epoch_sealed: Option<u64>,
     pub range: RangeAssignment,
-    /// The log shard this one succeeded for overlapping ranges.
-    pub predecessor: Option<ShardId>,
+    /// The log shard(s) this one succeeded for overlapping ranges.
+    /// Multiple predecessors occur in fan-in (merge) reconfigurations.
+    pub predecessors: Vec<ShardId>,
     /// Whether this shard contains T=0 snapshot entries from its predecessor.
     pub has_snapshot: bool,
 }
@@ -119,7 +120,7 @@ impl MetashardState {
                 epoch_created: 0,
                 epoch_sealed: None,
                 range: range.clone(),
-                predecessor: None,
+                predecessors: Vec::new(),
                 has_snapshot: false,
             },
         );
@@ -390,10 +391,10 @@ impl PersistMetashardActor {
                                         hi_exclusive: 0,
                                         log_shard: shard,
                                     },
-                                    predecessor: None,
+                                    predecessors: Vec::new(),
                                     has_snapshot: false,
                                 })
-                                .predecessor = Some(pred);
+                                .predecessors.push(pred);
                         }
                     }
                 } else if let Some(status) = line.strip_prefix("intent_status=") {
@@ -492,7 +493,7 @@ impl PersistMetashardActor {
         }
         // Persist predecessor chains so recovery can use spawn_with_predecessors.
         for (shard_id, info) in &self.state.log_shards {
-            if let Some(pred) = &info.predecessor {
+            for pred in &info.predecessors {
                 lines.push(format!("predecessor={}:{}", shard_id, pred));
             }
         }
@@ -574,8 +575,7 @@ impl PersistMetashardActor {
                 .state
                 .log_shards
                 .get(&shard_id)
-                .and_then(|info| info.predecessor.as_ref())
-                .map(|pred| vec![*pred])
+                .map(|info| info.predecessors.clone())
                 .unwrap_or_default();
 
             let (learner_handle, _task) = if predecessors.is_empty() {
@@ -1049,16 +1049,17 @@ impl PersistMetashardActor {
         // Track new log shards in metashard state.
         for range in &new_map.ranges {
             if added.contains(&range.log_shard) {
-                // Find which old shard this range overlaps with (predecessor).
-                let predecessor = old_map
+                // Find ALL old shards this range overlaps with (predecessors).
+                // A merge reconfiguration can have multiple predecessors.
+                let predecessors: Vec<ShardId> = old_map
                     .ranges
                     .iter()
-                    .find(|r| {
-                        // The new range overlaps with the old range if they share any key space.
+                    .filter(|r| {
                         u16::from(range.lo) < r.hi_exclusive
                             && u16::from(r.lo) < range.hi_exclusive
                     })
-                    .map(|r| r.log_shard);
+                    .map(|r| r.log_shard)
+                    .collect();
 
                 self.state.log_shards.insert(
                     range.log_shard,
@@ -1067,7 +1068,7 @@ impl PersistMetashardActor {
                         epoch_created: new_epoch,
                         epoch_sealed: None,
                         range: range.clone(),
-                        predecessor,
+                        predecessors,
                         has_snapshot: false,
                     },
                 );

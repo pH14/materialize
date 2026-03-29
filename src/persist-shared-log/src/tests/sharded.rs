@@ -1228,3 +1228,119 @@ async fn test_restart_after_reconfiguration_preserves_state() {
         "carried-forward seqno should be preserved across restart"
     );
 }
+
+/// Restart recovery after a 2→1 merge: both predecessors' carried-forward
+/// state must survive. This catches the bug where only one predecessor was
+/// persisted/recovered due to Option<ShardId> instead of Vec<ShardId>.
+#[mz_ore::test(tokio::test)]
+async fn test_restart_after_merge_preserves_both_predecessors() {
+    let client = new_persist_client_for_test().await;
+
+    // --- Phase 1: start with 2 shards, write to both, merge ---
+    let registry1 = MetricsRegistry::new();
+    let shard_a = ShardId::new();
+    let shard_b = ShardId::new();
+    let metashard_shard = ShardId::new();
+
+    let (acc_a, lrn_a) = spawn_shard(&client, shard_a).await;
+    let (acc_b, lrn_b) = spawn_shard(&client, shard_b).await;
+
+    let partition_map = PartitionMap {
+        epoch: 0,
+        ranges: vec![
+            RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
+            RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
+        ],
+    };
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_a, acc_a);
+    acceptors.insert(shard_b, acc_b);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_a, lrn_a);
+    learners.insert(shard_b, lrn_b);
+
+    let service1 = ShardedService::new(partition_map.clone(), acceptors, learners);
+    let routing_handle1 = service1.routing_handle();
+
+    let metashard_state1 = MetashardState {
+        epoch: 0,
+        partition_map,
+        log_shards: BTreeMap::new(),
+        pending_intent: None,
+    };
+    let (actor1, handle1) = PersistMetashardActor::new(
+        metashard_state1,
+        256,
+        client.clone(),
+        registry1,
+        routing_handle1,
+    );
+    let actor1 = actor1.with_durable_state(metashard_shard).await;
+    let _task1 = mz_ore::task::spawn(|| "metashard-merge-1", actor1.run());
+
+    // Write to shard_a and shard_b.
+    let key_lo = "s20000000-0000-0000-0000-000000000000"; // 0x20 → shard_a
+    let key_hi = "sa0000000-0000-0000-0000-000000000000"; // 0xa0 → shard_b
+
+    service1.compare_and_set(cas_request(key_lo, None, 1, b"from_a")).await.unwrap();
+    service1.compare_and_set(cas_request(key_hi, None, 1, b"from_b")).await.unwrap();
+
+    // Merge into a single shard.
+    let shard_merged = ShardId::new();
+    handle1
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map: PartitionMap::single(shard_merged),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Verify both keys readable after merge.
+    let resp = service1.head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() })).await.unwrap();
+    assert_eq!(resp.into_inner().data.unwrap().seqno, 1);
+    let resp = service1.head(tonic::Request::new(ProtoHeadRequest { key: key_hi.into() })).await.unwrap();
+    assert_eq!(resp.into_inner().data.unwrap().seqno, 1);
+
+    // --- Phase 2: simulate restart ---
+    drop(handle1);
+    drop(_task1);
+    drop(service1);
+
+    let registry2 = MetricsRegistry::new();
+    let bootstrap_shard = ShardId::new();
+    let (acc2, lrn2) = spawn_shard(&client, bootstrap_shard).await;
+    let bootstrap_map = PartitionMap::single(bootstrap_shard);
+    let mut acceptors2 = BTreeMap::new();
+    acceptors2.insert(bootstrap_shard, acc2);
+    let mut learners2 = BTreeMap::new();
+    learners2.insert(bootstrap_shard, lrn2);
+
+    let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
+    let routing_handle2 = service2.routing_handle();
+
+    let metashard_state2 = MetashardState::single(bootstrap_shard);
+    let (actor2, _handle2) = PersistMetashardActor::new(
+        metashard_state2,
+        256,
+        client.clone(),
+        registry2,
+        routing_handle2,
+    );
+    let actor2 = actor2.with_durable_state(metashard_shard).await;
+    let _task2 = mz_ore::task::spawn(|| "metashard-merge-2", actor2.run());
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // --- Phase 3: verify BOTH predecessors' state survived ---
+    let resp = service2.head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() })).await.unwrap();
+    let data = resp.into_inner().data;
+    assert!(data.is_some(), "key from shard_a should survive merge + restart");
+    assert_eq!(data.unwrap().seqno, 1);
+
+    let resp = service2.head(tonic::Request::new(ProtoHeadRequest { key: key_hi.into() })).await.unwrap();
+    let data = resp.into_inner().data;
+    assert!(data.is_some(), "key from shard_b should survive merge + restart");
+    assert_eq!(data.unwrap().seqno, 1);
+}
