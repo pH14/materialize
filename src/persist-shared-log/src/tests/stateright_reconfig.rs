@@ -233,7 +233,7 @@ fn stateright_reconfig_state_count() {
 //
 // Key simplifications vs. the real system:
 // - Seqno abstracted to 0..MAX_SEQ (not full CAS evaluation)
-// - Replay is atomic (all predecessors at once, not per-predecessor)
+// - Replay is per-predecessor (crash during partial replay is modeled)
 // - No network, no message delivery, no timing
 // - Durable state = log shard data + sealed set + metashard intent/epoch
 
