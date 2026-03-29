@@ -594,19 +594,40 @@ impl PersistMetashardActor {
                         PersistLearnerConfig::default(),
                         &self.persist_client,
                         shard_id,
-                        predecessors,
+                        predecessors.clone(),
                         learner_metrics,
                     )
                     .await;
-                // Wait for predecessor replay to complete before proceeding.
+                // Wait for predecessor replay to complete. If it fails, retry
+                // once with a fresh learner rather than installing a learner
+                // with missing state.
                 if replay_done_rx.await.is_err() {
-                    tracing::error!(
+                    tracing::warn!(
                         %shard_id,
-                        "predecessor replay task died during recovery; \
-                         learner may be missing carried-forward state"
+                        "predecessor replay failed during recovery, retrying"
                     );
+                    let retry_registry = MetricsRegistry::new();
+                    let retry_metrics = LearnerMetrics::register(&retry_registry);
+                    let (retry_handle, _retry_task, retry_rx) =
+                        PersistLearner::spawn_with_predecessors(
+                            PersistLearnerConfig::default(),
+                            &self.persist_client,
+                            shard_id,
+                            predecessors,
+                            retry_metrics,
+                        )
+                        .await;
+                    if retry_rx.await.is_err() {
+                        tracing::error!(
+                            %shard_id,
+                            "predecessor replay failed twice during recovery; \
+                             learner installed without carried-forward state"
+                        );
+                    }
+                    retry_handle
+                } else {
+                    handle
                 }
-                handle
             };
 
             info!(%shard_id, "spawned recovered actor");
