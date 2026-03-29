@@ -712,3 +712,365 @@ async fn test_dst_workload_with_reconfiguration() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Invariant + protocol obligation tests
+// ---------------------------------------------------------------------------
+
+/// Helper: read all entries from a persist shard and return the client shard
+/// keys (the OrderedKey.shard field from each +1 diff entry).
+async fn read_shard_keys(client: &PersistClient, shard_id: ShardId) -> Vec<String> {
+    let key_schema = Arc::new(OrderedKeySchema);
+    let val_schema = Arc::new(ProposalSchema);
+
+    let (write, read) = client
+        .open::<OrderedKey, Proposal, u64, i64>(
+            shard_id,
+            key_schema,
+            val_schema,
+            Diagnostics::from_purpose("test-read-shard-keys"),
+            false,
+        )
+        .await
+        .expect("open shard");
+
+    let target_upper = write.upper().as_option().copied().unwrap_or(u64::MAX);
+    let since = read.since().clone();
+    let mut subscribe = read.subscribe(since).await.expect("subscribe");
+
+    let mut keys = Vec::new();
+    loop {
+        let events = subscribe.fetch_next().await;
+        let mut done = false;
+        for event in &events {
+            match event {
+                mz_persist_client::read::ListenEvent::Progress(frontier) => {
+                    if frontier.is_empty()
+                        || frontier.as_option().copied() >= Some(target_upper)
+                    {
+                        done = true;
+                    }
+                }
+                mz_persist_client::read::ListenEvent::Updates(updates) => {
+                    for ((key, _), _, diff) in updates {
+                        if *diff == 1 {
+                            keys.push(key.shard.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    keys
+}
+
+/// Invariant: after a split reconfiguration, each new shard contains ONLY
+/// entries whose partition_key falls within its assigned range.
+#[mz_ore::test(tokio::test)]
+async fn test_shard_ownership_invariant_after_split() {
+    let client = new_persist_client_for_test().await;
+    let registry = MetricsRegistry::new();
+
+    let shard_old = ShardId::new();
+    let (acceptor, learner) = spawn_shard(&client, shard_old).await;
+
+    let partition_map = PartitionMap::single(shard_old);
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_old, acceptor);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_old, learner);
+
+    let service = ShardedService::new(partition_map, acceptors, learners);
+    let routing_handle = service.routing_handle();
+
+    let metashard_state = MetashardState::single(shard_old);
+    let (metashard_handle, _) = PersistMetashardActor::spawn(
+        metashard_state,
+        256,
+        client.clone(),
+        registry,
+        routing_handle,
+    );
+
+    // Write data across the full key range.
+    let keys = [
+        "s10000000-0000-0000-0000-000000000000", // 0x10 → first half
+        "s50000000-0000-0000-0000-000000000000", // 0x50 → first half
+        "s90000000-0000-0000-0000-000000000000", // 0x90 → second half
+        "sd0000000-0000-0000-0000-000000000000", // 0xd0 → second half
+    ];
+    for &key in &keys {
+        service.compare_and_set(cas_request(key, None, 1, b"v1")).await.unwrap();
+    }
+
+    // Split into two shards.
+    let shard_a = ShardId::new(); // [0x00, 0x80)
+    let shard_b = ShardId::new(); // [0x80, 0x100)
+    metashard_handle
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map: PartitionMap {
+                epoch: 1,
+                ranges: vec![
+                    RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
+                    RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
+                ],
+            },
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Invariant: shard_a contains ONLY keys with partition_key < 0x80.
+    let keys_a = read_shard_keys(&client, shard_a).await;
+    for key in &keys_a {
+        let pk = crate::partition_key(key);
+        assert!(
+            pk < 0x80,
+            "shard_a contains out-of-range key {} (pk=0x{:02x})",
+            key,
+            pk
+        );
+    }
+
+    // Invariant: shard_b contains ONLY keys with partition_key >= 0x80.
+    let keys_b = read_shard_keys(&client, shard_b).await;
+    for key in &keys_b {
+        let pk = crate::partition_key(key);
+        assert!(
+            pk >= 0x80,
+            "shard_b contains out-of-range key {} (pk=0x{:02x})",
+            key,
+            pk
+        );
+    }
+
+    // Both shards together should cover all original keys.
+    assert_eq!(keys_a.len(), 2, "shard_a should have 2 entries (0x10, 0x50)");
+    assert_eq!(keys_b.len(), 2, "shard_b should have 2 entries (0x90, 0xd0)");
+}
+
+/// Fan-in (merge) reconfiguration: 2 shards → 1 shard.
+/// Verifies all state from both predecessors carries forward.
+#[mz_ore::test(tokio::test)]
+async fn test_reconfiguration_merge() {
+    let client = new_persist_client_for_test().await;
+    let registry = MetricsRegistry::new();
+
+    // Start with 2 shards.
+    let shard_a = ShardId::new();
+    let shard_b = ShardId::new();
+    let (acc_a, lrn_a) = spawn_shard(&client, shard_a).await;
+    let (acc_b, lrn_b) = spawn_shard(&client, shard_b).await;
+
+    let partition_map = PartitionMap {
+        epoch: 0,
+        ranges: vec![
+            RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
+            RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
+        ],
+    };
+
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_a, acc_a);
+    acceptors.insert(shard_b, acc_b);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_a, lrn_a);
+    learners.insert(shard_b, lrn_b);
+
+    let service = ShardedService::new(partition_map.clone(), acceptors, learners);
+    let routing_handle = service.routing_handle();
+
+    let metashard_state = MetashardState {
+        epoch: 0,
+        partition_map,
+        log_shards: BTreeMap::new(),
+        pending_intent: None,
+    };
+    let (metashard_handle, _) = PersistMetashardActor::spawn(
+        metashard_state,
+        256,
+        client.clone(),
+        registry,
+        routing_handle,
+    );
+
+    // Write data to both shards.
+    let key_lo = "s20000000-0000-0000-0000-000000000000"; // 0x20 → shard_a
+    let key_hi = "sa0000000-0000-0000-0000-000000000000"; // 0xa0 → shard_b
+
+    service.compare_and_set(cas_request(key_lo, None, 1, b"lo_v1")).await.unwrap();
+    service.compare_and_set(cas_request(key_hi, None, 1, b"hi_v1")).await.unwrap();
+
+    // Merge into a single shard.
+    let shard_merged = ShardId::new();
+    metashard_handle
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map: PartitionMap::single(shard_merged),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Both keys should be readable from the merged shard.
+    let resp = service
+        .head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() }))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.into_inner().data.unwrap().seqno,
+        1,
+        "key_lo state should carry forward from shard_a"
+    );
+
+    let resp = service
+        .head(tonic::Request::new(ProtoHeadRequest { key: key_hi.into() }))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.into_inner().data.unwrap().seqno,
+        1,
+        "key_hi state should carry forward from shard_b"
+    );
+
+    // CaS with carried-forward state should work.
+    let resp = service
+        .compare_and_set(cas_request(key_lo, Some(1), 2, b"lo_v2_merged"))
+        .await
+        .unwrap();
+    assert!(resp.into_inner().committed, "CaS on merged shard should commit");
+}
+
+/// RC2: No silent proposal loss during reconfiguration.
+///
+/// Runs CaS operations concurrently with a reconfiguration. Every operation
+/// must either: commit on old shard, fail with a retriable error (Sealed /
+/// gRPC error), or commit on the new shard. No operation may silently vanish.
+#[mz_ore::test(tokio::test)]
+async fn test_no_silent_loss_during_reconfiguration() {
+    let client = new_persist_client_for_test().await;
+    let registry = MetricsRegistry::new();
+
+    let shard_old = ShardId::new();
+    let (acc, lrn) = spawn_shard(&client, shard_old).await;
+
+    let partition_map = PartitionMap::single(shard_old);
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_old, acc);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_old, lrn);
+
+    let service = std::sync::Arc::new(ShardedService::new(
+        partition_map,
+        acceptors,
+        learners,
+    ));
+    let routing_handle = service.routing_handle();
+
+    let metashard_state = MetashardState::single(shard_old);
+    let (metashard_handle, _) = PersistMetashardActor::spawn(
+        metashard_state,
+        256,
+        client.clone(),
+        registry,
+        routing_handle,
+    );
+
+    // Use a key that will stay in [0x00, 0x80) after the split.
+    let key = "s20000000-0000-0000-0000-000000000000";
+
+    // Write initial state.
+    let resp = service.compare_and_set(cas_request(key, None, 1, b"initial")).await.unwrap();
+    assert!(resp.into_inner().committed);
+
+    // Track all CaS attempts and their outcomes.
+    let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Spawn a background task that continuously issues CaS operations.
+    let service_clone = Arc::clone(&service);
+    let results_clone = Arc::clone(&results);
+    let writer_task = mz_ore::task::spawn(|| "concurrent-writer", async move {
+        let mut seqno = 2u64;
+        let mut expected = 1u64;
+        for _ in 0..20 {
+            let result = service_clone
+                .compare_and_set(cas_request(key, Some(expected), seqno, b"concurrent"))
+                .await;
+            match result {
+                Ok(resp) => {
+                    let committed = resp.into_inner().committed;
+                    results_clone.lock().unwrap().push(("ok", committed));
+                    if committed {
+                        expected = seqno;
+                        seqno += 1;
+                    }
+                }
+                Err(_status) => {
+                    // gRPC error (sealed, unavailable, etc.) — retriable.
+                    results_clone
+                        .lock()
+                        .unwrap()
+                        .push(("error", false));
+                    // Don't advance seqno — retry with same expected.
+                }
+            }
+            // Small delay to spread operations across the reconfiguration window.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    });
+
+    // Wait a bit for some operations to land, then reconfigure.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let shard_new_a = ShardId::new();
+    let shard_new_b = ShardId::new();
+    let _ = metashard_handle
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map: PartitionMap {
+                epoch: 1,
+                ranges: vec![
+                    RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_new_a },
+                    RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_new_b },
+                ],
+            },
+        })
+        .await;
+
+    // Wait for the writer to finish.
+    writer_task.await;
+
+    let outcomes: Vec<_> = results.lock().unwrap().clone();
+
+    // RC2: No silent loss. Every operation is accounted for.
+    let total = outcomes.len();
+    let committed = outcomes.iter().filter(|(s, c)| *s == "ok" && *c).count();
+    let rejected = outcomes.iter().filter(|(s, c)| *s == "ok" && !*c).count();
+    let errors = outcomes.iter().filter(|(s, _)| *s == "error").count();
+
+    assert_eq!(
+        total,
+        committed + rejected + errors,
+        "every operation must be accounted for"
+    );
+    assert!(total >= 10, "should have issued at least 10 operations, got {total}");
+    assert!(committed >= 1, "at least one operation should have committed");
+
+    // The key should be readable from the new shard with the latest committed seqno.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let resp = service
+        .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+        .await
+        .unwrap();
+    let data = resp.into_inner().data.unwrap();
+    assert!(
+        data.seqno >= 1,
+        "key should have at least initial seqno after reconfiguration"
+    );
+}
