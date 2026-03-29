@@ -724,15 +724,40 @@ impl PersistMetashardActor {
         );
 
         // Check for a pending reconfiguration intent from a previous crash.
-        if let Some(ref intent) = self.state.pending_intent {
-            // TODO(horizontal-sharding): Implement crash recovery by resuming
-            // the reconfiguration from the last completed phase.
-            tracing::warn!(
+        // Resume the reconfiguration from the last completed phase.
+        if let Some(intent) = self.state.pending_intent.take() {
+            info!(
                 epoch = intent.epoch,
                 status = ?intent.status,
-                "found pending reconfiguration intent from previous run — \
-                 crash recovery not yet implemented, manual intervention required"
+                "found pending reconfiguration intent — resuming"
             );
+            match intent.status {
+                IntentStatus::Committed => {
+                    // Already committed — just clear the intent.
+                    info!(epoch = intent.epoch, "intent already committed, clearing");
+                }
+                IntentStatus::Preparing | IntentStatus::Sealed => {
+                    // Need to re-run the reconfiguration. The plan tells us
+                    // what the target partition map should be.
+                    info!(
+                        epoch = intent.epoch,
+                        "resuming reconfiguration from {:?}",
+                        intent.status
+                    );
+                    match self.do_reconfigure(intent.plan).await {
+                        Ok(new_epoch) => {
+                            info!(new_epoch, "crash recovery reconfiguration completed");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "crash recovery reconfiguration failed: {} — \
+                                 manual intervention may be required",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         loop {
