@@ -174,26 +174,52 @@ within seconds. Rollup size and compaction determine this.
 
 ## Verification Matrix
 
-Each property is verified by one or more approaches:
+Each property is verified by one or more approaches. Cells marked _(planned)_
+describe intended coverage that is not yet implemented.
 
-| Property | Stateright | DST | Stress Test | Code Review |
-|----------|------------|-----|-------------|-------------|
-| L1-L5    | Yes        | Yes |             | Yes         |
-| C1       | Yes        | Yes |             | Yes         |
-| C2       | Yes        | Yes |             |             |
-| C3       | Yes        | Yes |             |             |
-| C4       | Yes        | Yes |             |             |
-| C5       | Yes        | Yes |             |             |
-| T1-T3    | Yes        | Yes |             |             |
-| R1       |            | Yes | Yes         | Yes         |
-| R2       |            | Yes |             | Yes         |
-| R3       |            |     | Yes         |             |
-| A1-A2    |            | Yes |             | Yes         |
-| Lv1-Lv4  | Yes*       | Yes | Yes         |             |
-| P1-P5    |            |     | Yes         |             |
+| Property | Stateright | DST (single-shard) | Sharded Sim | Integration | Code Review |
+|----------|------------|--------------------|-------------|-------------|-------------|
+| L1-L5    |            | Implicit           |             | Implicit    | Yes         |
+| C1       |            | Yes (oracle)       |             | Yes         | Yes         |
+| C2       |            | Sequential only    | Yes‡        |             | Yes         |
+| C3       |            | Yes (oracle)       | Yes‡        |             |             |
+| C4       |            | Yes (oracle)       | Yes‡        | Yes         |             |
+| C5       |            | Yes (oracle)       |             |             |             |
+| T1-T3    |            | Yes (oracle)       |             |             |             |
+| R1       |            | Sequential only    | Yes‡        |             | Yes         |
+| R2       |            | Implicit           |             |             | Yes         |
+| R3       |            |                    |             |             |             |
+| A1-A2    |            | Implicit           |             |             | Yes         |
+| Lv1-Lv4  |            | Yes                |             |             |             |
+| PM1-PM3  | Yes        |                    |             | Yes         | Yes         |
+| RC1      | Yes        |                    |             | Yes         | Yes         |
+| RC2      | Yes†       |                    | Yes‡        | Yes         | Yes         |
+| RC5      | Yes†       |                    |             | Yes (crash) |             |
+| P1-P5    |            |                    |             | _(planned)_ |             |
 
-\* Stateright checks liveness via `eventually` properties, bounded by the
-model's state space.
+**Notes:**
+- **‡** `sharded_sim.rs` runs concurrent-history linearizability checking:
+  multiple client tasks submit overlapping CAS/Head operations through the
+  `ShardedService`, with the combined history verified via Stateright's
+  `LinearizabilityTester`. Both single-shard (contention) and cross-reconfig
+  (split mid-flight) variants are tested. Operations that fail with transport
+  errors (unknown outcome) are excluded from the linearizability history
+  rather than misclassified as rejections. The concurrency is cooperative
+  (tokio `current_thread` with yield points), not preemptive.
+- **†** The protocol-level Stateright model verifies RC2 (no data loss) and
+  RC5 (reconfiguration liveness) with crash recovery, across both split and
+  merge scenarios. It models the routing-swapped-but-unpersisted window
+  (crash between routing swap and durable persist) as a distinct phase.
+  813 states explored per scenario. The partition-map model verifies PM1-PM3
+  and RC1.
+- BUGGIFY fault injection (`fault.rs`) adds 5 injection points at protocol
+  phase boundaries in `do_reconfigure`, including the post-commit windows
+  `after_routing_swap` and `after_commit_persist`. Tests exercise both
+  pre-commit boundaries (fault→retry→success) and post-commit boundaries
+  (fault after point-of-no-return, verify data accessible).
+- Integration tests in `sharded.rs` cover scripted reconfiguration scenarios
+  (split, merge, state carryforward, restart recovery, crash-mid-reconfig,
+  concurrent writers) but are not oracle-checked.
 
 ## Relationship to Persist's Own Invariants
 

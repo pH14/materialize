@@ -887,6 +887,10 @@ impl PersistMetashardActor {
         });
         self.persist_state().await;
 
+        // BUGGIFY: crash after intent is persisted but before seal.
+        crate::fault::maybe_fail("after_intent_persist")
+            .map_err(MetashardError::Command)?;
+
         // Phase 0.5: Acquire CriticalSince on retiring shards to prevent
         // compaction during predecessor replay. Uses a deterministic reader ID
         // derived from the new epoch so it can be recovered after crash.
@@ -961,6 +965,10 @@ impl PersistMetashardActor {
             intent.status = IntentStatus::Sealed;
         }
 
+        // BUGGIFY: crash after seal but before spawning new actors.
+        crate::fault::maybe_fail("after_seal")
+            .map_err(MetashardError::Command)?;
+
         // Phase 2.5: Spawn actors for new log shards.
         for &shard_id in &added {
             let new_range = new_map
@@ -1028,6 +1036,10 @@ impl PersistMetashardActor {
             }
         }
         info!("all predecessor replays complete — committing new epoch");
+
+        // BUGGIFY: crash after replays complete but before routing swap.
+        crate::fault::maybe_fail("after_replay_complete")
+            .map_err(MetashardError::Command)?;
 
         // Phase 4: Build new routing state and swap atomically.
         let mut routing = self.routing.write().await;
@@ -1107,8 +1119,20 @@ impl PersistMetashardActor {
         // Clear the intent — reconfiguration committed successfully.
         self.state.pending_intent = None;
 
+        // BUGGIFY: crash after routing swap but before durable persist.
+        // On recovery, the durable state still has the old epoch and intent,
+        // but the old shards are sealed. do_reconfigure re-runs idempotently.
+        crate::fault::maybe_fail("after_routing_swap")
+            .map_err(MetashardError::Command)?;
+
         // Persist the updated state durably.
         self.persist_state().await;
+
+        // BUGGIFY: crash after commit persist but before hold release.
+        // Holds leak but correctness is preserved — old shards just keep
+        // their CriticalSince longer than necessary.
+        crate::fault::maybe_fail("after_commit_persist")
+            .map_err(MetashardError::Command)?;
 
         // Phase 6: Release CriticalSince holds on retired shards.
         // Predecessor replays were confirmed complete in Phase 3, so the
@@ -1351,5 +1375,224 @@ mod tests {
 
         let map = handle.partition_map().await.unwrap();
         assert_eq!(map, state.partition_map);
+    }
+
+    /// Round-trip test: persist metashard state (epoch, partition map,
+    /// predecessors, intent), then recover from the same shard and verify
+    /// the recovered state matches.
+    ///
+    /// This catches serialization/parsing bugs in the line-delimited
+    /// key=value format used by `persist_state()` / `new()`.
+    #[mz_ore::test(tokio::test)]
+    async fn metashard_state_roundtrip() {
+        use mz_persist_client::cache::PersistClientCache;
+        use mz_persist_client::PersistLocation;
+
+        let cache = PersistClientCache::new_no_metrics();
+        let client: mz_persist_client::PersistClient = cache
+            .open(PersistLocation::new_in_mem())
+            .await
+            .expect("in-mem persist client");
+
+        let metashard_shard = ShardId::new();
+
+        let s_old = test_shard("000");
+        let s_a = test_shard("aaa");
+        let s_b = test_shard("bbb");
+
+        // Build a state with all serialized fields populated:
+        // - epoch > 0
+        // - multi-range partition map
+        // - predecessor chains
+        // - pending reconfiguration intent with intent_ranges
+        let mut log_shards = BTreeMap::new();
+        log_shards.insert(
+            s_a,
+            LogShardInfo {
+                status: LogShardStatus::Active,
+                epoch_created: 1,
+                epoch_sealed: None,
+                range: RangeAssignment {
+                    lo: 0x00,
+                    hi_exclusive: 0x80,
+                    log_shard: s_a,
+                },
+                predecessors: vec![s_old],
+                has_snapshot: false,
+            },
+        );
+        log_shards.insert(
+            s_b,
+            LogShardInfo {
+                status: LogShardStatus::Active,
+                epoch_created: 1,
+                epoch_sealed: None,
+                range: RangeAssignment {
+                    lo: 0x80,
+                    hi_exclusive: 0x100,
+                    log_shard: s_b,
+                },
+                predecessors: vec![s_old],
+                has_snapshot: false,
+            },
+        );
+
+        let s_merged = test_shard("ccc");
+        let intent = ReconfigurationIntent {
+            epoch: 2,
+            plan: ReconfigurationPlan {
+                expected_epoch: 1,
+                new_partition_map: PartitionMap {
+                    epoch: 2,
+                    ranges: vec![RangeAssignment {
+                        lo: 0x00,
+                        hi_exclusive: 0x100,
+                        log_shard: s_merged,
+                    }],
+                },
+            },
+            status: IntentStatus::Preparing,
+        };
+
+        let state = MetashardState {
+            epoch: 1,
+            partition_map: PartitionMap {
+                epoch: 1,
+                ranges: vec![
+                    RangeAssignment {
+                        lo: 0x00,
+                        hi_exclusive: 0x80,
+                        log_shard: s_a,
+                    },
+                    RangeAssignment {
+                        lo: 0x80,
+                        hi_exclusive: 0x100,
+                        log_shard: s_b,
+                    },
+                ],
+            },
+            log_shards,
+            pending_intent: Some(intent),
+        };
+
+        // --- Persist the state ---
+        // We need a RoutingState but the round-trip test only exercises
+        // persist_state() / new(), not routing. Spawn a real acceptor+learner
+        // pair for a dummy shard so RoutingState::new passes its assertions.
+        let dummy_shard = test_shard("ddd");
+        let dummy_map = PartitionMap::single(dummy_shard);
+
+        let shard_registry = MetricsRegistry::new();
+        let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
+        let learner_metrics = LearnerMetrics::register(&shard_registry);
+
+        let (acc_handle, _acc_task) = PersistAcceptor::spawn(
+            crate::AcceptorConfig::default(),
+            &client,
+            dummy_shard,
+            acceptor_metrics,
+            0,
+        )
+        .await;
+
+        let (lrn_handle, _lrn_task, _replay_rx) = PersistLearner::spawn(
+            PersistLearnerConfig::default(),
+            &client,
+            dummy_shard,
+            Vec::new(),
+            learner_metrics,
+        )
+        .await;
+
+        let mut dummy_acceptors = BTreeMap::new();
+        let mut dummy_learners = BTreeMap::new();
+        dummy_acceptors.insert(dummy_shard, acc_handle);
+        dummy_learners.insert(dummy_shard, lrn_handle);
+        let routing = Arc::new(RwLock::new(RoutingState::new(
+            dummy_map,
+            dummy_acceptors,
+            dummy_learners,
+        )));
+        let registry = MetricsRegistry::new();
+
+        let (mut actor, _handle) = PersistMetashardActor::new(
+            state.clone(),
+            64,
+            client.clone(),
+            registry,
+            routing.clone(),
+            metashard_shard,
+        )
+        .await;
+
+        // Force a persist (normally happens during do_reconfigure).
+        actor.persist_state().await;
+        drop(actor);
+        drop(_handle);
+
+        // --- Recover from the same shard ---
+        let bootstrap = MetashardState::single(test_shard("eee"));
+        let registry2 = MetricsRegistry::new();
+
+        let (recovered_actor, _handle2) = PersistMetashardActor::new(
+            bootstrap,
+            64,
+            client.clone(),
+            registry2,
+            routing.clone(),
+            metashard_shard,
+        )
+        .await;
+
+        let recovered = &recovered_actor.state;
+
+        // --- Verify round-trip ---
+        assert_eq!(
+            recovered.epoch, state.epoch,
+            "epoch round-trip failed: got {}, expected {}",
+            recovered.epoch, state.epoch
+        );
+        assert_eq!(
+            recovered.partition_map, state.partition_map,
+            "partition map round-trip failed"
+        );
+
+        // Verify predecessor chains survived.
+        assert!(
+            recovered.log_shards.contains_key(&s_a),
+            "shard_a should have log_shards entry from predecessor line"
+        );
+        assert_eq!(
+            recovered.log_shards[&s_a].predecessors,
+            vec![s_old],
+            "shard_a predecessor chain round-trip failed"
+        );
+        assert!(
+            recovered.log_shards.contains_key(&s_b),
+            "shard_b should have log_shards entry from predecessor line"
+        );
+        assert_eq!(
+            recovered.log_shards[&s_b].predecessors,
+            vec![s_old],
+            "shard_b predecessor chain round-trip failed"
+        );
+
+        // Verify pending intent survived.
+        let recovered_intent = recovered
+            .pending_intent
+            .as_ref()
+            .expect("pending intent should survive round-trip");
+        assert_eq!(recovered_intent.epoch, 2);
+        assert_eq!(recovered_intent.status, IntentStatus::Preparing);
+        assert_eq!(
+            recovered_intent.plan.new_partition_map.ranges.len(),
+            1,
+            "intent should have 1 range (merged)"
+        );
+        assert_eq!(
+            recovered_intent.plan.new_partition_map.ranges[0].log_shard,
+            s_merged,
+            "intent range shard should be the merged shard"
+        );
     }
 }

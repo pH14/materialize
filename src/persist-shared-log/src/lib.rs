@@ -35,6 +35,7 @@ use mz_persist::generated::consensus_service::{
 };
 use mz_persist_client::ShardId;
 
+pub mod fault;
 pub mod metrics;
 pub mod persist_log;
 pub mod service;

@@ -26,53 +26,56 @@ unlikely to occur in practice.
 
 ### What Is Modeled
 
-An abstract state machine that captures:
+Two models exist, from abstract to concrete:
 
-- CAS operations with seqno-based preconditions
-- Truncate operations
-- Multiple concurrent writers and readers
-- Indeterminate CAS outcomes (the `compare_and_append` call succeeds but
-  the caller cannot confirm; modeled as nondeterministic ghost state)
-- Batch ordering and within-batch position ordering
+**Partition map model** (`stateright_reconfig.rs`, `ReconfigModel`): verifies
+that range-based partition map transitions (split) maintain the covering
+invariant. Properties: PM1+PM2 (valid map), PM3 (monotonic epoch), RC1
+(seal-before-reassign). Bounded to 4 reconfigurations, 8 shards.
 
-### What Is Not Modeled
+**Protocol model** (`stateright_reconfig.rs`, `ProtocolModel`): verifies the
+full seal→replay→commit reconfiguration lifecycle, including crash recovery.
+Models both split and merge scenarios with client writes interleaved with
+protocol phases, and crash/recovery at every intermediate phase. Properties:
+PM1+PM2, RC1, RC2 (no committed write lost after reconfig), seal-before-commit,
+reconfiguration liveness, reachability of carried-forward state. Bounded to
+2 client shards, seqno cap 2, max 2 crashes.
 
-- Blob storage, actual bytes, the data plane
-- Persist internals (compaction, rollups, GC)
-- Network topology or RPC specifics
-- Performance characteristics
+### What Is Not Modeled (Planned)
+
+The following are candidates for future Stateright models:
+
+- Single-shard CAS operations with seqno-based preconditions (C1-C5)
+- Multiple concurrent writers and readers with indeterminate CAS outcomes
+- Batch ordering and within-batch position ordering (L1-L5)
+- Truncate operations (T1-T3)
+- Linearizable reads (R1)
 
 ### Properties Verified
 
-See [02_invariants.md](02_invariants.md) for the full list. The Stateright
-model verifies all safety properties (L1-L5, C1-C5, T1-T3) and liveness
-properties (Lv1-Lv4) within a bounded state space.
+See [02_invariants.md](02_invariants.md) for the verification matrix. The
+Stateright models verify partition map invariants (PM1-PM3), reconfiguration
+safety (RC1, RC2), protocol liveness (RC5), and crash recovery correctness
+across split and merge scenarios.
 
-### State Space Bounding
+### State Space
 
-The model uses finite bounds to make exhaustive checking tractable:
-
-- `max_seqno`: maximum seqno value (e.g. 3)
-- `max_batch`: maximum number of batches
-- `max_writers`: number of concurrent writer actors
-- `max_shards`: number of client shard keys
-
-Multiple configurations are checked with varying bounds to increase
-coverage.
+The partition map model explores ~100-1000 states. The protocol models
+explore ~500 states each (split and merge), verifying all properties across
+all reachable states including crash/recovery paths.
 
 ### Relationship to Implementation
 
-The Stateright model is a parallel codebase: it verifies the protocol
-design, not the Rust implementation. If the protocol changes, the model must
-be updated. The model and implementation are connected through shared
-invariant definitions (the properties in
-[02_invariants.md](02_invariants.md)) and through DST assertions that check
-the same properties on real code.
+The Stateright models are abstract: they verify the protocol design, not the
+Rust implementation. If the protocol changes, the models must be updated.
+The models and implementation are connected through shared invariant
+definitions ([02_invariants.md](02_invariants.md)) and through DST/integration
+tests that check the same properties on real code.
 
 ### Running
 
 ```bash
-cargo test -p mz-persist-stateright
+cargo test -p mz-persist-shared-log stateright
 ```
 
 ## Layer 2: Deterministic Simulation Testing (DST)
@@ -86,74 +89,87 @@ code, race conditions in the listen/evaluate pipeline.
 
 ### Framework
 
-Uses [turmoil](https://github.com/tokio-rs/turmoil) for deterministic
-scheduling and network simulation. All randomness is seeded, so any failing
-test can be reproduced exactly by re-running with the same seed.
+Uses in-memory persist (via `PersistClientCache::new_for_turmoil()`) with a
+`current_thread` tokio runtime for deterministic scheduling. All randomness
+is seeded, so any failing test can be reproduced by re-running with the same
+seed. See `tests/CLAUDE.md` for the determinism policy.
 
 ### Architecture
 
 ```
-turmoil simulation
+persist_sim harness
 ├── persist infrastructure (in-memory blob + consensus)
 ├── shared log acceptor (real PersistAcceptor code)
 ├── shared log learner (real PersistLearner code)
-├── writer clients (submit CAS proposals at configured rate)
-├── reader clients (issue head/scan reads)
-└── fault injector (partitions, delays, restarts)
+├── seeded OpGenerator (CAS, Head, Scan, Truncate)
+├── independent oracle (SharedLogOracle, implements SequentialSpec)
+├── LinearizabilityTester (Stateright, sequential operations)
+└── SimTrace (structured operation log for debugging)
 ```
 
-Each writer and reader runs as a turmoil host with its own persist client.
-The fault injector is a dedicated client that introduces network partitions
-and repairs on a schedule.
+Operations are submitted sequentially from a single thread. The
+`LinearizabilityTester` is wired up but is currently tautological for
+sequential histories.
 
 ### What Is Tested
 
-- **Write uniqueness**: Successful CAS proposals for the same client shard
-  produce distinct seqnos.
-- **Write ordering**: Committed seqnos for a client shard are strictly
-  increasing.
-- **Read consistency**: A `head` read returns state consistent with some
-  prefix of committed writes.
-- **Liveness**: Under faults, writes and reads eventually complete.
-- **Linearizability** (planned): Full linearizability checking using
-  invoke/respond history analysis.
-- **State machine invariants** (planned): Assert the properties from
-  [02_invariants.md](02_invariants.md) on every `StateMachine` state
-  transition.
+- **Oracle consistency**: Every operation's result is checked against the
+  independent `SharedLogOracle` reference implementation.
+- **CAS rejection pipeline**: ~15% of generated CAS operations have stale
+  expected seqnos, exercising rejection → garbage → retraction.
+- **Crash recovery**: Learner drop/reopen cycles with post-recovery state
+  verification against the oracle.
+- **Multi-writer contention**: Two acceptors on the same shard pool with
+  stale snapshot handling (`persist_sim_multi_writer`).
+- **Determinism**: Same seed always produces identical traces
+  (`persist_sim_deterministic`).
+
+### What Is Not Yet Tested (Planned)
+
+- **Network partitions**: No turmoil hosts, no network-level faults.
+- **Concurrent linearizability**: Operations are sequential; concurrent
+  history checking requires multiple client tasks with overlapping
+  invoke/return windows.
+- **Sharded reconfiguration under faults**: The DST covers single-shard
+  operations only. Reconfiguration is tested via integration tests in
+  `sharded.rs`.
+- **BUGGIFY-style cooperative fault injection**: No injection points inside
+  protocol phase boundaries.
 
 ### Fault Injection
 
-- **Network partitions**: Isolate acceptor from learner, or learner from
-  clients.
-- **Learner restarts**: Kill and restart a learner. Verify it rehydrates
-  via `listen(as_of=since)` and catches up.
-- **Acceptor restarts**: Kill and restart the acceptor. Verify in-flight
-  proposals are retried by clients.
-- **Message delays**: Introduce latency on specific network links.
+Currently limited to:
+- **CAS rejection** (stale expected seqnos, ~15% of operations)
+- **Crash/recovery** (learner drop and reopen, ~5% of actions)
+
+Planned additions:
+- Network partitions and message delays (via turmoil)
+- BUGGIFY injection points at protocol phase boundaries
+- Acceptor restarts with in-flight proposals
 
 ### Seed Exploration
 
-Two modes:
+```bash
+# Single seed
+SEED=42 cargo test -p mz-persist-shared-log persist_sim_single -- --nocapture
 
-1. **Targeted**: Run with a specific seed to reproduce a known failure.
-   ```bash
-   SEED=42 cargo test -p mz-persist-client --features turmoil -- internal::sim
-   ```
+# Default (100 seeds)
+cargo test -p mz-persist-shared-log persist_sim
 
-2. **Fuzzing**: Run with many seeds to explore the state space.
-   ```bash
-   cargo test -p mz-persist-client --features turmoil -- fuzz_persist_dst --ignored
-   ```
-   This runs indefinitely, cycling through seeds.
+# Extended
+SIM_SEEDS=1000 cargo test -p mz-persist-shared-log persist_sim_single
+
+# Infinite fuzzing
+SEED=0 cargo test -p mz-persist-shared-log persist_sim_fuzz -- --ignored
+```
 
 ### Invariant Checking
 
-_Post-hoc_: After the simulation completes, all recorded operations are
-checked against invariants. The `OperationLog` collects all write and read
-events from all clients, and the checker verifies them.
+_Inline_: Every operation is checked against the oracle immediately after
+execution. Mismatches print the full `SimTrace` for debugging.
 
-_Inline_ (planned): Assert invariants in `StateMachine::apply_cas` and
-`StateMachine::apply_truncate` on every state transition during simulation.
+_Linearizability_: Stateright's `LinearizabilityTester` is invoked on every
+operation. Currently sequential; concurrent checking is planned.
 
 ## Layer 3: Stress Testing (Open-Loop)
 

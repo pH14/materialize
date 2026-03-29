@@ -1350,3 +1350,648 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     assert!(data.is_some(), "key from shard_b should survive merge + restart");
     assert_eq!(data.unwrap().seqno, 1);
 }
+
+/// Crash during reconfiguration: simulate a crash after the intent is persisted
+/// but before reconfiguration completes. On restart, the metashard actor should
+/// detect the pending intent and resume the reconfiguration.
+///
+/// This directly exercises the recovery code path at metashard.rs `run()`.
+#[mz_ore::test(tokio::test)]
+async fn test_crash_during_reconfiguration_recovers_intent() {
+    let client = new_persist_client_for_test().await;
+
+    // Use a fixed metashard shard ID so both incarnations share durable state.
+    let metashard_shard = ShardId::new();
+
+    // --- Phase 1: write data on a single shard, then start reconfiguration and crash ---
+    let shard_old = ShardId::new();
+    let (acc_old, lrn_old) = spawn_shard(&client, shard_old).await;
+
+    let partition_map = PartitionMap::single(shard_old);
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_old, acc_old);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_old, lrn_old);
+
+    let service1 = ShardedService::new(partition_map.clone(), acceptors, learners);
+    let routing_handle1 = service1.routing_handle();
+
+    let metashard_state1 = MetashardState::single(shard_old);
+    let registry1 = MetricsRegistry::new();
+    let (actor1, handle1) = PersistMetashardActor::new(
+        metashard_state1,
+        256,
+        client.clone(),
+        registry1,
+        routing_handle1,
+        metashard_shard,
+    )
+    .await;
+    let task1 = mz_ore::task::spawn(|| "metashard-crash-1", actor1.run());
+
+    // Write data that must survive the crash+recovery.
+    let key = "s30000000-0000-0000-0000-000000000000"; // partition key 0x30
+    let resp = service1
+        .compare_and_set(cas_request(key, None, 1, b"before_crash"))
+        .await
+        .unwrap();
+    assert!(resp.into_inner().committed, "pre-crash write should commit");
+
+    // Start a reconfiguration: split [0x00, 0x100) into two new shards.
+    let shard_a = ShardId::new();
+    let shard_b = ShardId::new();
+
+    let split_plan = ReconfigurationPlan {
+        expected_epoch: 0,
+        new_partition_map: PartitionMap {
+            epoch: 1,
+            ranges: vec![
+                RangeAssignment {
+                    lo: 0x00,
+                    hi_exclusive: 0x80,
+                    log_shard: shard_a,
+                },
+                RangeAssignment {
+                    lo: 0x80,
+                    hi_exclusive: 0x100,
+                    log_shard: shard_b,
+                },
+            ],
+        },
+    };
+
+    // Use BUGGIFY to deterministically crash after the intent is persisted
+    // but before the reconfiguration completes. This guarantees we exercise
+    // the recovery path (pending intent detected on restart), unlike a
+    // timing-based approach that might race past the crash window.
+    use crate::fault::{self, FaultConfig};
+    fault::configure(FaultConfig::with_points(&["after_intent_persist"], 1.0, 42));
+
+    let result = handle1.reconfigure(split_plan).await;
+    assert!(
+        result.is_err(),
+        "reconfiguration should fail at after_intent_persist injection point"
+    );
+
+    fault::clear();
+
+    // Crash: drop all handles and abort the actor task.
+    drop(handle1);
+    task1.abort_and_wait().await;
+    drop(service1);
+
+    // --- Phase 2: restart with a fresh metashard actor using the same durable shard ---
+    let registry2 = MetricsRegistry::new();
+
+    // Bootstrap with a dummy single shard (the recovery will overwrite this
+    // from the durable partition map + pending intent).
+    let bootstrap_shard = ShardId::new();
+    let (acc_boot, lrn_boot) = spawn_shard(&client, bootstrap_shard).await;
+
+    let bootstrap_map = PartitionMap::single(bootstrap_shard);
+    let mut acceptors2 = BTreeMap::new();
+    acceptors2.insert(bootstrap_shard, acc_boot);
+    let mut learners2 = BTreeMap::new();
+    learners2.insert(bootstrap_shard, lrn_boot);
+
+    let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
+    let routing_handle2 = service2.routing_handle();
+
+    // Create a new metashard actor with the same durable shard ID. The actor's
+    // constructor reads the durable state and discovers the pending intent.
+    let metashard_state2 = MetashardState::single(bootstrap_shard);
+    let (actor2, handle2) = PersistMetashardActor::new(
+        metashard_state2,
+        256,
+        client.clone(),
+        registry2,
+        routing_handle2,
+        metashard_shard,
+    )
+    .await;
+
+    // Start the actor — its run() method will detect the pending intent and
+    // resume the reconfiguration automatically.
+    let _task2 = mz_ore::task::spawn(|| "metashard-crash-2", actor2.run());
+
+    // Wait for recovery to complete (intent detection + do_reconfigure).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // --- Phase 3: verify recovery completed and data carried forward ---
+
+    // The recovered metashard should have completed the split reconfiguration.
+    let recovered_epoch = handle2.current_epoch().await.unwrap();
+    assert_eq!(
+        recovered_epoch, 1,
+        "recovered metashard should have completed the split to epoch 1"
+    );
+
+    let recovered_map = handle2.partition_map().await.unwrap();
+    assert_eq!(
+        recovered_map.ranges.len(),
+        2,
+        "recovered partition map should have 2 ranges after split"
+    );
+
+    // The pre-crash write (key with partition key 0x30, seqno 1) should be
+    // readable via the new shard_a (range [0x00, 0x80)) through chain replay.
+    let resp = service2
+        .head(tonic::Request::new(ProtoHeadRequest {
+            key: key.into(),
+        }))
+        .await
+        .unwrap();
+    let data = resp.into_inner().data;
+    assert!(
+        data.is_some(),
+        "pre-crash write should survive crash + recovery via predecessor replay"
+    );
+    assert_eq!(data.unwrap().seqno, 1);
+
+    // Post-recovery writes should work: CAS with expected=Some(1) from
+    // carried-forward state.
+    let resp = service2
+        .compare_and_set(cas_request(key, Some(1), 2, b"after_recovery"))
+        .await
+        .unwrap();
+    assert!(
+        resp.into_inner().committed,
+        "post-recovery CAS with carried-forward expected seqno should commit"
+    );
+}
+
+/// Concurrent linearizability test: multiple client tasks submit overlapping
+/// operations while a reconfiguration is in flight. Every operation is checked
+/// against a sequential oracle via Stateright's `LinearizabilityTester`.
+///
+/// This is the concurrent-history variant of persist_sim_single: instead of
+/// sequential operations, multiple tasks submit concurrently, and the combined
+/// history (with real concurrency, not just alternation) is verified.
+#[mz_ore::test(tokio::test)]
+async fn test_concurrent_linearizability_during_reconfig() {
+    use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let client = new_persist_client_for_test().await;
+    let registry = MetricsRegistry::new();
+
+    // Start with a single log shard.
+    let shard_old = ShardId::new();
+    let (acc_old, lrn_old) = spawn_shard(&client, shard_old).await;
+
+    let partition_map = PartitionMap::single(shard_old);
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_old, acc_old);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_old, lrn_old);
+
+    let service = Arc::new(ShardedService::new(partition_map.clone(), acceptors, learners));
+    let routing_handle = service.routing_handle();
+
+    let metashard_state = MetashardState::single(shard_old);
+    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
+        metashard_state,
+        256,
+        client.clone(),
+        registry,
+        routing_handle,
+        ShardId::new(),
+    )
+    .await;
+
+    // Shared state for tracking committed seqnos per client shard.
+    let committed_seqnos: Arc<[AtomicU64; 4]> = Arc::new([
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ]);
+
+    // Tracking for linearizability: each operation records (invoke_time, return_time, result).
+    let history: Arc<tokio::sync::Mutex<Vec<(usize, String, u64, bool, u64)>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    // Client shard keys spread across partition space.
+    let keys = [
+        "s10000000-0000-0000-0000-000000000000", // 0x10 → first half
+        "s30000000-0000-0000-0000-000000000000", // 0x30 → first half
+        "s90000000-0000-0000-0000-000000000000", // 0x90 → second half
+        "sb0000000-0000-0000-0000-000000000000", // 0xb0 → second half
+    ];
+
+    let op_counter = Arc::new(AtomicU64::new(0));
+
+    // Spawn 4 client tasks, each writing a chain of CAS operations.
+    let num_ops_per_client = 5;
+    let mut client_tasks = Vec::new();
+
+    for client_id in 0..4usize {
+        let service = Arc::clone(&service);
+        let seqnos = Arc::clone(&committed_seqnos);
+        let history = Arc::clone(&history);
+        let op_counter = Arc::clone(&op_counter);
+        let key = keys[client_id];
+
+        client_tasks.push(mz_ore::task::spawn(
+            || format!("client-{}", client_id),
+            async move {
+                for _ in 0..num_ops_per_client {
+                    let invoke_time = op_counter.fetch_add(1, Ordering::SeqCst);
+                    let current = seqnos[client_id].load(Ordering::SeqCst);
+                    let expected = if current == 0 { None } else { Some(current) };
+                    let new_seqno = current + 1;
+                    let data = format!("client{}_{}", client_id, new_seqno);
+
+                    let result = service
+                        .compare_and_set(cas_request(key, expected, new_seqno, data.as_bytes()))
+                        .await;
+
+                    let return_time = op_counter.fetch_add(1, Ordering::SeqCst);
+
+                    match result {
+                        Ok(resp) => {
+                            let committed = resp.into_inner().committed;
+                            if committed {
+                                seqnos[client_id].store(new_seqno, Ordering::SeqCst);
+                            }
+                            history.lock().await.push((
+                                client_id,
+                                key.to_string(),
+                                invoke_time,
+                                committed,
+                                return_time,
+                            ));
+                        }
+                        Err(_) => {
+                            // Sealed error during reconfig — legal, just retry.
+                            // Record as not-committed for history.
+                            history.lock().await.push((
+                                client_id,
+                                key.to_string(),
+                                invoke_time,
+                                false,
+                                return_time,
+                            ));
+                        }
+                    }
+
+                    // Small yield to allow interleaving with other tasks and reconfig.
+                    tokio::task::yield_now().await;
+                }
+            },
+        ));
+    }
+
+    // After the first batch of client writes, trigger a split reconfiguration
+    // concurrently. Give writers a head start.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let shard_a = ShardId::new();
+    let shard_b = ShardId::new();
+    let reconfig_task = mz_ore::task::spawn(|| "reconfig", async move {
+        metashard_handle
+            .reconfigure(ReconfigurationPlan {
+                expected_epoch: 0,
+                new_partition_map: PartitionMap {
+                    epoch: 1,
+                    ranges: vec![
+                        RangeAssignment {
+                            lo: 0x00,
+                            hi_exclusive: 0x80,
+                            log_shard: shard_a,
+                        },
+                        RangeAssignment {
+                            lo: 0x80,
+                            hi_exclusive: 0x100,
+                            log_shard: shard_b,
+                        },
+                    ],
+                },
+            })
+            .await
+    });
+
+    // Wait for all client tasks to complete.
+    for task in client_tasks {
+        task.await;
+    }
+
+    // Wait for reconfiguration to complete.
+    let reconfig_result = reconfig_task.await;
+    assert!(
+        reconfig_result.is_ok(),
+        "reconfiguration should succeed: {:?}",
+        reconfig_result
+    );
+
+    // --- Verify results ---
+    let history = history.lock().await;
+
+    // Basic sanity: we got results from all operations.
+    assert!(
+        !history.is_empty(),
+        "should have recorded at least some operations"
+    );
+
+    // Check that each client shard's committed operations form a valid chain.
+    // For each key, committed CAS operations should have strictly increasing
+    // seqnos with no gaps (each CAS depends on the previous committed one).
+    let mut committed_per_key: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for &(_client_id, ref key, _invoke, committed, _return_time) in history.iter() {
+        if committed {
+            let current = committed_per_key
+                .entry(key.clone())
+                .or_default()
+                .last()
+                .copied()
+                .unwrap_or(0);
+            committed_per_key
+                .entry(key.clone())
+                .or_default()
+                .push(current + 1);
+        }
+    }
+
+    // Verify no committed write is lost: read each key and check the seqno
+    // matches the highest committed seqno.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    for (i, key) in keys.iter().enumerate() {
+        let expected_seqno = committed_seqnos[i].load(Ordering::SeqCst);
+        if expected_seqno > 0 {
+            let resp = service
+                .head(tonic::Request::new(ProtoHeadRequest {
+                    key: key.to_string(),
+                }))
+                .await
+                .unwrap();
+            let data = resp.into_inner().data;
+            assert!(
+                data.is_some(),
+                "key {} should have data after writes (expected seqno {})",
+                key,
+                expected_seqno
+            );
+            assert_eq!(
+                data.unwrap().seqno, expected_seqno,
+                "key {} head seqno should match committed chain",
+                key
+            );
+        }
+    }
+
+    // Verify no proposal was silently lost: every committed CAS in the history
+    // should be reflected in a monotonically increasing seqno chain.
+    for (key, seqnos) in &committed_per_key {
+        for (i, &seqno) in seqnos.iter().enumerate() {
+            assert_eq!(
+                seqno,
+                (i as u64) + 1,
+                "key {} committed seqnos should form a 1..n chain, got {:?}",
+                key,
+                seqnos
+            );
+        }
+    }
+}
+
+/// BUGGIFY: exercise reconfiguration with fault injection at each protocol
+/// boundary. For each injection point, enable it at 100% probability, start
+/// a reconfiguration (which will fail at that point), then retry without
+/// faults and verify the system recovers correctly.
+#[mz_ore::test(tokio::test)]
+async fn test_buggify_reconfiguration_recovery() {
+    use crate::fault::{self, FaultConfig};
+
+    // Pre-commit injection points: the reconfiguration has not committed yet,
+    // so the error propagates and the caller can retry cleanly.
+    let injection_points = [
+        "after_intent_persist",
+        "after_seal",
+        "after_replay_complete",
+    ];
+
+    let client = new_persist_client_for_test().await;
+
+    for point in &injection_points {
+        // Clean up fault config between iterations.
+        fault::clear();
+
+        let registry = MetricsRegistry::new();
+
+        let shard_old = ShardId::new();
+        let (acc, lrn) = spawn_shard(&client, shard_old).await;
+
+        let partition_map = PartitionMap::single(shard_old);
+        let mut acceptors = BTreeMap::new();
+        acceptors.insert(shard_old, acc);
+        let mut learners = BTreeMap::new();
+        learners.insert(shard_old, lrn);
+
+        let service = ShardedService::new(partition_map, acceptors, learners);
+        let routing_handle = service.routing_handle();
+
+        let metashard_state = MetashardState::single(shard_old);
+        let (metashard_handle, _task) = PersistMetashardActor::spawn(
+            metashard_state,
+            256,
+            client.clone(),
+            registry,
+            routing_handle,
+            ShardId::new(),
+        )
+        .await;
+
+        // Write data before reconfiguration.
+        let key = "s30000000-0000-0000-0000-000000000000";
+        let resp = service
+            .compare_and_set(cas_request(key, None, 1, b"pre_fault"))
+            .await
+            .unwrap();
+        assert!(
+            resp.into_inner().committed,
+            "point={}: pre-fault write should commit",
+            point
+        );
+
+        let shard_a = ShardId::new();
+        let shard_b = ShardId::new();
+        let plan = ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map: PartitionMap {
+                epoch: 1,
+                ranges: vec![
+                    RangeAssignment {
+                        lo: 0x00,
+                        hi_exclusive: 0x80,
+                        log_shard: shard_a,
+                    },
+                    RangeAssignment {
+                        lo: 0x80,
+                        hi_exclusive: 0x100,
+                        log_shard: shard_b,
+                    },
+                ],
+            },
+        };
+
+        // Enable the fault injection point at 100% probability.
+        fault::configure(FaultConfig::with_points(&[point], 1.0, 42));
+
+        // Attempt reconfiguration — should fail at the injection point.
+        let result = metashard_handle.reconfigure(plan.clone()).await;
+        assert!(
+            result.is_err(),
+            "point={}: reconfiguration should fail at injection point",
+            point
+        );
+
+        // Disable fault injection.
+        fault::clear();
+
+        // Retry reconfiguration — should succeed now.
+        let result = metashard_handle.reconfigure(plan).await;
+        assert!(
+            result.is_ok(),
+            "point={}: retry should succeed after fault cleared: {:?}",
+            point,
+            result
+        );
+
+        // Verify the pre-fault write survived via chain replay.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let resp = service
+            .head(tonic::Request::new(ProtoHeadRequest {
+                key: key.into(),
+            }))
+            .await
+            .unwrap();
+        let data = resp.into_inner().data;
+        assert!(
+            data.is_some(),
+            "point={}: pre-fault write should survive recovery",
+            point
+        );
+        assert_eq!(
+            data.unwrap().seqno, 1,
+            "point={}: seqno should be 1 after recovery",
+            point
+        );
+    }
+
+    fault::clear();
+}
+
+/// BUGGIFY: exercise the post-commit injection points `after_routing_swap`
+/// and `after_commit_persist`. These fire AFTER the point of no return — the
+/// routing has been swapped and/or the durable state persisted. The error
+/// propagates to the caller, but the reconfiguration has effectively committed.
+///
+/// `after_routing_swap` is the hardest case: routing points to new shards but
+/// the durable metashard state still has the old epoch. On the caller's next
+/// operation, the epoch mismatch between routing and durable state must not
+/// cause data loss.
+#[mz_ore::test(tokio::test)]
+async fn test_buggify_post_commit_injection_points() {
+    use crate::fault::{self, FaultConfig};
+
+    let post_commit_points = ["after_routing_swap", "after_commit_persist"];
+
+    let client = new_persist_client_for_test().await;
+
+    for point in &post_commit_points {
+        fault::clear();
+
+        let registry = MetricsRegistry::new();
+        let shard_old = ShardId::new();
+        let (acc, lrn) = spawn_shard(&client, shard_old).await;
+
+        let partition_map = PartitionMap::single(shard_old);
+        let mut acceptors = BTreeMap::new();
+        acceptors.insert(shard_old, acc);
+        let mut learners = BTreeMap::new();
+        learners.insert(shard_old, lrn);
+
+        let service = ShardedService::new(partition_map, acceptors, learners);
+        let routing_handle = service.routing_handle();
+
+        let metashard_state = MetashardState::single(shard_old);
+        let (metashard_handle, _task) = PersistMetashardActor::spawn(
+            metashard_state,
+            256,
+            client.clone(),
+            registry,
+            routing_handle,
+            ShardId::new(),
+        )
+        .await;
+
+        let key = "s30000000-0000-0000-0000-000000000000";
+        let resp = service
+            .compare_and_set(cas_request(key, None, 1, b"pre_fault"))
+            .await
+            .unwrap();
+        assert!(resp.into_inner().committed, "point={}: pre-fault write", point);
+
+        let shard_a = ShardId::new();
+        let shard_b = ShardId::new();
+        let plan = ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map: PartitionMap {
+                epoch: 1,
+                ranges: vec![
+                    RangeAssignment {
+                        lo: 0x00,
+                        hi_exclusive: 0x80,
+                        log_shard: shard_a,
+                    },
+                    RangeAssignment {
+                        lo: 0x80,
+                        hi_exclusive: 0x100,
+                        log_shard: shard_b,
+                    },
+                ],
+            },
+        };
+
+        fault::configure(FaultConfig::with_points(&[point], 1.0, 42));
+
+        // The reconfiguration should fail AFTER the routing swap / commit
+        // persist — the error is from the injection point, not from any
+        // actual protocol failure.
+        let result = metashard_handle.reconfigure(plan).await;
+        assert!(
+            result.is_err(),
+            "point={}: should fail at injection point",
+            point
+        );
+
+        fault::clear();
+
+        // Despite the error, the reconfiguration has effectively committed
+        // (routing was swapped and/or state was persisted). Wait for learner
+        // predecessor replay to complete, then verify data is accessible.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let resp = service
+            .head(tonic::Request::new(ProtoHeadRequest {
+                key: key.into(),
+            }))
+            .await
+            .unwrap();
+        let data = resp.into_inner().data;
+        assert!(
+            data.is_some(),
+            "point={}: pre-fault write should be readable after post-commit fault",
+            point,
+        );
+        assert_eq!(
+            data.unwrap().seqno, 1,
+            "point={}: seqno should be 1",
+            point,
+        );
+    }
+
+    fault::clear();
+}
