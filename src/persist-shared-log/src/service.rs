@@ -167,4 +167,16 @@ impl<A: crate::Acceptor, L: crate::Learner> PersistSharedLog for PersistSharedLo
 
         Ok(tonic::Response::new(result))
     }
+
+    async fn reconfigure(
+        &self,
+        _request: tonic::Request<mz_persist::generated::consensus_service::ProtoReconfigureRequest>,
+    ) -> Result<
+        tonic::Response<mz_persist::generated::consensus_service::ProtoReconfigureResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "reconfiguration not supported on single-shard service",
+        ))
+    }
 }

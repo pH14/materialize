@@ -245,7 +245,7 @@ async fn run(args: Args) {
             id
         }
     };
-    let (_metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
+    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
         metashard_state,
         256,
         persist_client,
@@ -254,6 +254,8 @@ async fn run(args: Args) {
         metashard_shard_id,
     )
     .await;
+
+    let service = service.with_metashard(metashard_handle);
 
     info!(addr = %args.listen_addr, "starting gRPC server");
     Server::builder()

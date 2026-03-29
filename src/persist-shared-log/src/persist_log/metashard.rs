@@ -1532,7 +1532,7 @@ mod tests {
             64,
             client.clone(),
             registry,
-            routing.clone(),
+            Arc::clone(&routing),
             metashard_shard,
         )
         .await;
@@ -1551,7 +1551,7 @@ mod tests {
             64,
             client.clone(),
             registry2,
-            routing.clone(),
+            Arc::clone(&routing),
             metashard_shard,
         )
         .await;

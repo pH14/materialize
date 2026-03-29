@@ -1746,7 +1746,7 @@ async fn test_concurrent_linearizability_during_reconfig() {
         for (i, &seqno) in seqnos.iter().enumerate() {
             assert_eq!(
                 seqno,
-                (i as u64) + 1,
+                u64::try_from(i).expect("i fits u64") + 1,
                 "key {} committed seqnos should form a 1..n chain, got {:?}",
                 key,
                 seqnos

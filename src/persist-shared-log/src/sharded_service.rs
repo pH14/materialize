@@ -22,17 +22,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, info};
 
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
 use mz_persist::generated::consensus_service::{
     ProtoCompareAndSetRequest, ProtoCompareAndSetResponse, ProtoHeadRequest, ProtoHeadResponse,
-    ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal, ProtoScanRequest,
-    ProtoScanResponse, ProtoTruncateRequest, ProtoTruncateResponse, proto_log_proposal,
+    ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal, ProtoReconfigureRequest,
+    ProtoReconfigureResponse, ProtoScanRequest, ProtoScanResponse, ProtoTruncateRequest,
+    ProtoTruncateResponse, proto_log_proposal,
 };
 use mz_persist_client::ShardId;
 
-use crate::{Acceptor, Learner, PartitionMap};
+use crate::persist_log::metashard::PersistMetashardHandle;
+use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 // ---------------------------------------------------------------------------
 // RoutingState
@@ -83,6 +85,8 @@ impl<A: Acceptor, L: Learner> RoutingState<A, L> {
 /// during reconfiguration without blocking in-flight requests.
 pub struct ShardedService<A: Acceptor, L: Learner> {
     routing: Arc<RwLock<RoutingState<A, L>>>,
+    /// Metashard handle for triggering reconfigurations via the Reconfigure RPC.
+    metashard: Option<PersistMetashardHandle>,
 }
 
 // Manual Debug impl to avoid requiring Debug on A, L.
@@ -101,6 +105,7 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
         let routing = RoutingState::new(partition_map, acceptors, learners);
         ShardedService {
             routing: Arc::new(RwLock::new(routing)),
+            metashard: None,
         }
     }
 
@@ -108,6 +113,12 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
     /// metashard actor during reconfiguration).
     pub fn routing_handle(&self) -> Arc<RwLock<RoutingState<A, L>>> {
         Arc::clone(&self.routing)
+    }
+
+    /// Attach a metashard handle to enable the Reconfigure RPC.
+    pub fn with_metashard(mut self, handle: PersistMetashardHandle) -> Self {
+        self.metashard = Some(handle);
+        self
     }
 }
 
@@ -306,5 +317,72 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
         Err(tonic::Status::unavailable(
             "acceptor sealed after 3 retry attempts; reconfiguration may be in progress",
         ))
+    }
+
+    async fn reconfigure(
+        &self,
+        request: tonic::Request<ProtoReconfigureRequest>,
+    ) -> Result<tonic::Response<ProtoReconfigureResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let num_shards = usize::try_from(req.num_shards).expect("num_shards fits usize");
+        if num_shards == 0 {
+            return Err(tonic::Status::invalid_argument(
+                "num_shards must be at least 1",
+            ));
+        }
+
+        let metashard = self
+            .metashard
+            .as_ref()
+            .ok_or_else(|| {
+                tonic::Status::unimplemented("reconfiguration not available (no metashard)")
+            })?;
+
+        let current_epoch = metashard
+            .current_epoch()
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+
+        // Build a new partition map with `num_shards` evenly-sized ranges.
+        let range_size = 256 / num_shards;
+        let mut ranges = Vec::with_capacity(num_shards);
+        for i in 0..num_shards {
+            let lo = u8::try_from(i * range_size).expect("range start fits u8");
+            let hi_exclusive = if i == num_shards - 1 {
+                0x100u16
+            } else {
+                u16::try_from((i + 1) * range_size).expect("range end fits u16")
+            };
+            ranges.push(RangeAssignment {
+                lo,
+                hi_exclusive,
+                log_shard: ShardId::new(),
+            });
+        }
+
+        let new_map = PartitionMap {
+            epoch: current_epoch + 1,
+            ranges,
+        };
+
+        info!(
+            current_epoch,
+            num_shards,
+            "Reconfigure RPC: splitting to {} shards",
+            num_shards
+        );
+
+        let new_epoch = metashard
+            .reconfigure(ReconfigurationPlan {
+                expected_epoch: current_epoch,
+                new_partition_map: new_map,
+            })
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+
+        Ok(tonic::Response::new(ProtoReconfigureResponse {
+            new_epoch,
+            num_shards: u32::try_from(num_shards).expect("num_shards fits u32"),
+        }))
     }
 }

@@ -386,7 +386,7 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
             let harness = Arc::clone(&harness);
             let thread = SimThread::Client(client_id);
             let key = keys[client_id % keys.len()].to_string();
-            let mut rng = SmallRng::seed_from_u64(seed * 1000 + client_id as u64);
+            let mut rng = SmallRng::seed_from_u64(seed * 1000 + u64::try_from(client_id).expect("client_id fits u64"));
 
             tasks.push(mz_ore::task::spawn(
                 || format!("seed{}-client{}", seed, client_id),

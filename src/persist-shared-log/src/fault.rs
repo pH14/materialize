@@ -75,6 +75,11 @@ fn xorshift64(mut x: u64) -> u64 {
     x
 }
 
+#[allow(clippy::as_conversions)]
+fn probability_to_threshold(fire_probability: f64) -> u8 {
+    (fire_probability * 256.0).min(255.0) as u8
+}
+
 impl FaultConfig {
     /// Create a fault configuration from a seed. Each injection point is
     /// independently enabled/disabled (50% chance), and enabled points fire
@@ -88,7 +93,7 @@ impl FaultConfig {
                 enabled.insert(point);
             }
         }
-        let fire_threshold = (fire_probability * 256.0).min(255.0) as u8;
+        let fire_threshold = probability_to_threshold(fire_probability);
         FaultConfig {
             enabled_points: enabled,
             fire_threshold,
@@ -98,7 +103,7 @@ impl FaultConfig {
 
     /// Create a configuration with a specific set of enabled points.
     pub fn with_points(points: &[&'static str], fire_probability: f64, seed: u64) -> Self {
-        let fire_threshold = (fire_probability * 256.0).min(255.0) as u8;
+        let fire_threshold = probability_to_threshold(fire_probability);
         FaultConfig {
             enabled_points: points.iter().copied().collect(),
             fire_threshold,

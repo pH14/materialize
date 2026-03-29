@@ -601,7 +601,7 @@ impl Model for ProtocolModel {
                 for &shard in &plan.new_shards {
                     s.data.insert(shard, [0u8; NUM_CS]);
                 }
-                s.next_shard = state.next_shard + plan.new_shards.len() as u8;
+                s.next_shard = state.next_shard + u8::try_from(plan.new_shards.len()).expect("len fits u8");
 
                 // Persist the intent (durable).
                 s.durable_intent = Some(plan);

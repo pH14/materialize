@@ -39,14 +39,16 @@ service ConsensusLearner {
   rpc ListKeys(ProtoListKeysRequest) returns (stream ProtoListKeysResponse);
 }
 
-// Combined service: maps 1:1 to the persist Consensus trait.
-// Server-side handles the acceptor append + learner await internally.
+// Combined service: maps 1:1 to the persist Consensus trait, plus
+// administrative operations like reconfiguration.
 service PersistSharedLog {
   rpc Head(ProtoHeadRequest) returns (ProtoHeadResponse);
   rpc Scan(ProtoScanRequest) returns (ProtoScanResponse);
   rpc ListKeys(ProtoListKeysRequest) returns (stream ProtoListKeysResponse);
   rpc CompareAndSet(ProtoCompareAndSetRequest) returns (ProtoCompareAndSetResponse);
   rpc Truncate(ProtoTruncateRequest) returns (ProtoTruncateResponse);
+  // Trigger a reconfiguration to a new number of shards.
+  rpc Reconfigure(ProtoReconfigureRequest) returns (ProtoReconfigureResponse);
 }
 
 // --- Acceptor request/response messages ---
@@ -122,6 +124,21 @@ message ProtoListKeysRequest {}
 
 message ProtoListKeysResponse {
   string key = 1;
+}
+
+// --- Reconfiguration messages ---
+
+message ProtoReconfigureRequest {
+  // Target number of log shards. The service will split or merge ranges
+  // to reach this count, evenly dividing [0x00, 0x100).
+  uint32 num_shards = 1;
+}
+
+message ProtoReconfigureResponse {
+  // The new epoch after reconfiguration.
+  uint64 new_epoch = 1;
+  // Number of log shards in the new partition map.
+  uint32 num_shards = 2;
 }
 
 // --- Log serialization (proposal-based, blind writes) ---
