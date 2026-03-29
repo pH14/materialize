@@ -1111,3 +1111,120 @@ async fn test_no_silent_loss_during_reconfiguration() {
         expected_head,
     );
 }
+
+/// Restart recovery: after a committed reconfiguration, simulate a process
+/// restart and verify that carried-forward state (keys never rewritten on
+/// the new shard) is still readable.
+///
+/// This is the test the reviewer identified as missing: it catches the bug
+/// where recovery spawns plain learners that can't access predecessor state.
+#[mz_ore::test(tokio::test)]
+async fn test_restart_after_reconfiguration_preserves_state() {
+    let client = new_persist_client_for_test().await;
+
+    // --- Phase 1: initial setup + write data + reconfigure ---
+    let registry1 = MetricsRegistry::new();
+    let shard_old = ShardId::new();
+    let metashard_shard = ShardId::new(); // durable metashard
+
+    let (acc, lrn) = spawn_shard(&client, shard_old).await;
+    let partition_map = PartitionMap::single(shard_old);
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_old, acc);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_old, lrn);
+
+    let service1 = ShardedService::new(partition_map, acceptors, learners);
+    let routing_handle1 = service1.routing_handle();
+
+    let metashard_state1 = MetashardState::single(shard_old);
+    let (actor1, handle1) = PersistMetashardActor::new(
+        metashard_state1,
+        256,
+        client.clone(),
+        registry1,
+        routing_handle1,
+    );
+    let actor1 = actor1.with_durable_state(metashard_shard).await;
+    let _task1 = mz_ore::task::spawn(|| "metashard-1", actor1.run());
+
+    // Write data that will need to survive reconfiguration + restart.
+    let key = "s30000000-0000-0000-0000-000000000000";
+    let resp = service1
+        .compare_and_set(cas_request(key, None, 1, b"survive_restart"))
+        .await
+        .unwrap();
+    assert!(resp.into_inner().committed);
+
+    // Reconfigure: old shard → new shard.
+    let shard_new = ShardId::new();
+    handle1
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map: PartitionMap::single(shard_new),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Verify data is readable after reconfiguration (in-memory carryforward).
+    let resp = service1
+        .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+        .await
+        .unwrap();
+    assert_eq!(resp.into_inner().data.unwrap().seqno, 1);
+
+    // --- Phase 2: simulate restart ---
+    // Drop the old service (simulates process death).
+    drop(handle1);
+    drop(_task1);
+    drop(service1);
+
+    // Build a fresh service from "bootstrap" args (epoch 0, stale topology).
+    // This simulates what main.rs does on a fresh start.
+    let registry2 = MetricsRegistry::new();
+
+    // Bootstrap with a dummy shard — the recovery should override this.
+    let bootstrap_shard = ShardId::new();
+    let (acc2, lrn2) = spawn_shard(&client, bootstrap_shard).await;
+    let bootstrap_map = PartitionMap::single(bootstrap_shard);
+    let mut acceptors2 = BTreeMap::new();
+    acceptors2.insert(bootstrap_shard, acc2);
+    let mut learners2 = BTreeMap::new();
+    learners2.insert(bootstrap_shard, lrn2);
+
+    let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
+    let routing_handle2 = service2.routing_handle();
+
+    let metashard_state2 = MetashardState::single(bootstrap_shard);
+    let (actor2, _handle2) = PersistMetashardActor::new(
+        metashard_state2,
+        256,
+        client.clone(),
+        registry2,
+        routing_handle2,
+    );
+    // Recover from the durable metashard shard — this should restore the
+    // committed partition map and rebuild routing with predecessors.
+    let actor2 = actor2.with_durable_state(metashard_shard).await;
+    let _task2 = mz_ore::task::spawn(|| "metashard-2", actor2.run());
+
+    // Give the recovery path time to rebuild routing and replay predecessors.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // --- Phase 3: verify carried-forward state survived restart ---
+    let resp = service2
+        .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+        .await
+        .unwrap();
+    let data = resp.into_inner().data;
+    assert!(
+        data.is_some(),
+        "carried-forward key should be readable after restart"
+    );
+    assert_eq!(
+        data.unwrap().seqno, 1,
+        "carried-forward seqno should be preserved across restart"
+    );
+}

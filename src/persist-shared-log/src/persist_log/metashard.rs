@@ -370,6 +370,32 @@ impl PersistMetashardActor {
                             }
                         }
                     }
+                } else if let Some(pred_str) = line.strip_prefix("predecessor=") {
+                    // Format: "shard_id:predecessor_shard_id"
+                    if let Some((shard_str, pred_shard_str)) = pred_str.split_once(':') {
+                        if let (Ok(shard), Ok(pred)) = (
+                            shard_str.parse::<ShardId>(),
+                            pred_shard_str.parse::<ShardId>(),
+                        ) {
+                            // Store in log_shards for use during rebuild_routing_from_state.
+                            self.state
+                                .log_shards
+                                .entry(shard)
+                                .or_insert_with(|| LogShardInfo {
+                                    status: LogShardStatus::Active,
+                                    epoch_created: 0,
+                                    epoch_sealed: None,
+                                    range: RangeAssignment {
+                                        lo: 0,
+                                        hi_exclusive: 0,
+                                        log_shard: shard,
+                                    },
+                                    predecessor: None,
+                                    has_snapshot: false,
+                                })
+                                .predecessor = Some(pred);
+                        }
+                    }
                 } else if let Some(status) = line.strip_prefix("intent_status=") {
                     intent_status = Some(status.to_string());
                 } else if let Some(epoch) = line.strip_prefix("intent_epoch=") {
@@ -464,6 +490,12 @@ impl PersistMetashardActor {
                 r.lo, r.hi_exclusive, r.log_shard
             ));
         }
+        // Persist predecessor chains so recovery can use spawn_with_predecessors.
+        for (shard_id, info) in &self.state.log_shards {
+            if let Some(pred) = &info.predecessor {
+                lines.push(format!("predecessor={}:{}", shard_id, pred));
+            }
+        }
         if let Some(ref intent) = self.state.pending_intent {
             lines.push(format!("intent_status={:?}", intent.status));
             lines.push(format!("intent_epoch={}", intent.epoch));
@@ -514,8 +546,9 @@ impl PersistMetashardActor {
     /// Rebuild the routing state from the current metashard state.
     ///
     /// Spawns fresh acceptors and learners for every shard in the partition map
-    /// and swaps the routing state. Used during crash recovery when the
-    /// recovered partition map differs from the bootstrap topology.
+    /// and swaps the routing state. Uses `spawn_with_predecessors` when
+    /// predecessor info is available, so recovered learners can replay sealed
+    /// predecessor shards and reconstruct carried-forward state.
     async fn rebuild_routing_from_state(&self) {
         let map = &self.state.partition_map;
         let mut acceptors = BTreeMap::new();
@@ -536,13 +569,38 @@ impl PersistMetashardActor {
             )
             .await;
 
-            let (learner_handle, _task) = PersistLearner::spawn(
-                PersistLearnerConfig::default(),
-                &self.persist_client,
-                shard_id,
-                learner_metrics,
-            )
-            .await;
+            // Look up predecessors from the recovered log_shards metadata.
+            let predecessors: Vec<ShardId> = self
+                .state
+                .log_shards
+                .get(&shard_id)
+                .and_then(|info| info.predecessor.as_ref())
+                .map(|pred| vec![*pred])
+                .unwrap_or_default();
+
+            let (learner_handle, _task) = if predecessors.is_empty() {
+                PersistLearner::spawn(
+                    PersistLearnerConfig::default(),
+                    &self.persist_client,
+                    shard_id,
+                    learner_metrics,
+                )
+                .await
+            } else {
+                info!(
+                    %shard_id,
+                    predecessors = ?predecessors,
+                    "spawning recovered learner with predecessor replay"
+                );
+                PersistLearner::spawn_with_predecessors(
+                    PersistLearnerConfig::default(),
+                    &self.persist_client,
+                    shard_id,
+                    predecessors,
+                    learner_metrics,
+                )
+                .await
+            };
 
             info!(%shard_id, "spawned recovered actor");
             acceptors.insert(shard_id, acceptor_handle);
