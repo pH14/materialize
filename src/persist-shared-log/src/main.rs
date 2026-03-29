@@ -56,6 +56,12 @@ struct Args {
     /// learner, with the key space range-partitioned across them.
     #[arg(long, default_value = "1")]
     num_log_shards: usize,
+
+    /// Shard ID for the metashard persist shard (durable state). If provided,
+    /// the metashard actor persists its partition map and reconfiguration
+    /// intents to this shard, enabling crash recovery.
+    #[arg(long, env = "METASHARD_ID")]
+    metashard_id: Option<String>,
 }
 
 fn main() {
@@ -230,13 +236,24 @@ async fn run(args: Args) {
             pending_intent: None,
         }
     };
-    let (_metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
+    let (mut metashard_actor, _metashard_handle) = PersistMetashardActor::new(
         metashard_state,
         256,
         persist_client,
         metrics_registry,
         routing_handle,
     );
+
+    // If a metashard shard ID is provided, enable durable state persistence
+    // and recover any pending intents from a previous crash.
+    if let Some(ref id) = args.metashard_id {
+        let metashard_shard_id: ShardId = id.parse().expect("invalid --metashard-id");
+        metashard_actor = metashard_actor.with_durable_state(metashard_shard_id).await;
+        info!(%metashard_shard_id, "metashard durable state enabled");
+    }
+
+    let _metashard_task =
+        mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
 
     info!(addr = %args.listen_addr, "starting gRPC server");
     Server::builder()

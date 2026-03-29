@@ -343,14 +343,34 @@ impl PersistMetashardActor {
             }
         }
 
-        // Parse the latest state to recover a pending intent.
+        // Parse the latest state: restore partition map, epoch, and pending intent.
         if let Some(data) = latest_data {
+            let mut persisted_epoch: Option<u64> = None;
+            let mut persisted_ranges: Vec<RangeAssignment> = Vec::new();
             let mut intent_status = None;
             let mut intent_epoch = None;
             let mut intent_ranges = Vec::new();
 
             for line in data.lines() {
-                if let Some(status) = line.strip_prefix("intent_status=") {
+                if let Some(epoch_str) = line.strip_prefix("epoch=") {
+                    persisted_epoch = epoch_str.parse::<u64>().ok();
+                } else if let Some(range_str) = line.strip_prefix("range=") {
+                    if let Some((range_part, shard_str)) = range_str.split_once(':') {
+                        if let Some((lo_str, hi_str)) = range_part.split_once('-') {
+                            if let (Ok(lo), Ok(hi), Ok(shard)) = (
+                                u8::from_str_radix(lo_str, 16),
+                                u16::from_str_radix(hi_str, 16),
+                                shard_str.parse::<ShardId>(),
+                            ) {
+                                persisted_ranges.push(RangeAssignment {
+                                    lo,
+                                    hi_exclusive: hi,
+                                    log_shard: shard,
+                                });
+                            }
+                        }
+                    }
+                } else if let Some(status) = line.strip_prefix("intent_status=") {
                     intent_status = Some(status.to_string());
                 } else if let Some(epoch) = line.strip_prefix("intent_epoch=") {
                     intent_epoch = epoch.parse::<u64>().ok();
@@ -399,6 +419,25 @@ impl PersistMetashardActor {
                         epoch,
                         "recovered pending reconfiguration intent from durable state"
                     );
+                }
+            }
+
+            // Restore the persisted partition map and epoch.
+            if let Some(epoch) = persisted_epoch {
+                if !persisted_ranges.is_empty() {
+                    let map = PartitionMap {
+                        epoch,
+                        ranges: persisted_ranges,
+                    };
+                    if map.validate().is_ok() {
+                        info!(
+                            epoch,
+                            num_ranges = map.ranges.len(),
+                            "restored partition map from durable state"
+                        );
+                        self.state.epoch = epoch;
+                        self.state.partition_map = map;
+                    }
                 }
             }
         }
@@ -866,7 +905,12 @@ impl PersistMetashardActor {
             .await;
 
             let snapshot_entries = snapshot_success.get(&shard_id).copied().unwrap_or(0);
-            let (learner_handle, _task) = if snapshot_entries > 0 || predecessors.is_empty() {
+            // Always use spawn_with_predecessors when predecessors exist.
+            // The snapshot captures state at point U, but proposals between U
+            // and the seal point S are only in the old shard. The predecessor
+            // replay ensures the learner sees the complete history including
+            // the tail (U→S). Without this, those tail proposals are lost.
+            let (learner_handle, _task) = if predecessors.is_empty() {
                 PersistLearner::spawn(
                     PersistLearnerConfig::default(),
                     &self.persist_client,
@@ -878,7 +922,8 @@ impl PersistMetashardActor {
                 info!(
                     %shard_id,
                     predecessors = ?predecessors,
-                    "falling back to chain replay (no snapshot)"
+                    snapshot_entries,
+                    "spawning learner with predecessor chain replay"
                 );
                 PersistLearner::spawn_with_predecessors(
                     PersistLearnerConfig::default(),

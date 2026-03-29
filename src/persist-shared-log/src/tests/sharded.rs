@@ -989,12 +989,14 @@ async fn test_no_silent_loss_during_reconfiguration() {
     let resp = service.compare_and_set(cas_request(key, None, 1, b"initial")).await.unwrap();
     assert!(resp.into_inner().committed);
 
-    // Track all CaS attempts and their outcomes.
+    // Track all CaS attempts, their outcomes, and the highest committed seqno.
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let highest_committed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Spawn a background task that continuously issues CaS operations.
     let service_clone = Arc::clone(&service);
     let results_clone = Arc::clone(&results);
+    let highest_clone = Arc::clone(&highest_committed);
     let writer_task = mz_ore::task::spawn(|| "concurrent-writer", async move {
         let mut seqno = 2u64;
         let mut expected = 1u64;
@@ -1007,6 +1009,7 @@ async fn test_no_silent_loss_during_reconfiguration() {
                     let committed = resp.into_inner().committed;
                     results_clone.lock().unwrap().push(("ok", committed));
                     if committed {
+                        highest_clone.store(seqno, std::sync::atomic::Ordering::SeqCst);
                         expected = seqno;
                         seqno += 1;
                     }
@@ -1062,15 +1065,21 @@ async fn test_no_silent_loss_during_reconfiguration() {
     assert!(total >= 10, "should have issued at least 10 operations, got {total}");
     assert!(committed >= 1, "at least one operation should have committed");
 
-    // The key should be readable from the new shard with the latest committed seqno.
+    // RC2 strong check: the head seqno must EXACTLY equal the highest
+    // committed seqno. If any committed write was silently lost during
+    // reconfiguration, this will catch it.
+    let expected_head = highest_committed.load(std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let resp = service
         .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
         .await
         .unwrap();
     let data = resp.into_inner().data.unwrap();
-    assert!(
-        data.seqno >= 1,
-        "key should have at least initial seqno after reconfiguration"
+    assert_eq!(
+        data.seqno, expected_head,
+        "head seqno must equal the highest committed seqno ({}); \
+         a mismatch means a committed write was silently lost during reconfiguration. \
+         outcomes: committed={committed}, rejected={rejected}, errors={errors}",
+        expected_head,
     );
 }

@@ -194,41 +194,60 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
             .new
             .ok_or_else(|| tonic::Status::invalid_argument("missing new"))?;
 
-        let proposal = ProtoLogProposal {
-            op: Some(proto_log_proposal::Op::Cas(
-                mz_persist::generated::consensus_service::ProtoCasProposal {
-                    key: req.key.clone(),
-                    expected: req.expected,
-                    new_seqno: new.seqno,
-                    data: new.data,
-                },
-            )),
-        };
+        // Retry loop: if the acceptor returns Sealed, refresh routing and retry
+        // on the replacement shard. Bounded to 3 attempts.
+        for attempt in 0..3u32 {
+            let proposal = ProtoLogProposal {
+                op: Some(proto_log_proposal::Op::Cas(
+                    mz_persist::generated::consensus_service::ProtoCasProposal {
+                        key: req.key.clone(),
+                        expected: req.expected,
+                        new_seqno: new.seqno,
+                        data: new.data.clone(),
+                    },
+                )),
+            };
 
-        // Read lock: look up routing and clone the handles (they're cheap Arc-based clones).
-        let (acceptor, learner) = {
-            let routing = self.routing.read().await;
-            let log_shard = routing.partition_map.route(&req.key);
-            let a = routing
-                .acceptors
-                .get(&log_shard)
-                .expect("partition map routes to known log shard")
-                .clone();
-            let l = routing
-                .learners
-                .get(&log_shard)
-                .expect("partition map routes to known log shard")
-                .clone();
-            (a, l)
-        };
-        // Lock dropped — the append + await can take time and must not hold it.
+            let (acceptor, learner) = {
+                let routing = self.routing.read().await;
+                let log_shard = routing.partition_map.route(&req.key);
+                let a = routing
+                    .acceptors
+                    .get(&log_shard)
+                    .expect("partition map routes to known log shard")
+                    .clone();
+                let l = routing
+                    .learners
+                    .get(&log_shard)
+                    .expect("partition map routes to known log shard")
+                    .clone();
+                (a, l)
+            };
 
-        let receipt = acceptor.append(proposal).await?;
-        let result = learner
-            .await_cas_result(receipt.batch_number, receipt.position)
-            .await?;
+            match acceptor.append(proposal).await {
+                Ok(receipt) => {
+                    let result = learner
+                        .await_cas_result(receipt.batch_number, receipt.position)
+                        .await?;
+                    return Ok(tonic::Response::new(result));
+                }
+                Err(crate::AcceptorError::Sealed) => {
+                    debug!(
+                        key = %req.key,
+                        attempt,
+                        "acceptor sealed, refreshing routing and retrying"
+                    );
+                    // Brief yield to let the routing swap propagate.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(e) => return Err(tonic::Status::from(e)),
+            }
+        }
 
-        Ok(tonic::Response::new(result))
+        Err(tonic::Status::unavailable(
+            "acceptor sealed after 3 retry attempts; reconfiguration may be in progress",
+        ))
     }
 
     async fn truncate(
@@ -238,36 +257,54 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
         let req = request.into_inner();
         debug!(key = %req.key, seqno = req.seqno, "sharded truncate");
 
-        let proposal = ProtoLogProposal {
-            op: Some(proto_log_proposal::Op::Truncate(
-                mz_persist::generated::consensus_service::ProtoTruncateProposal {
-                    key: req.key.clone(),
-                    seqno: req.seqno,
-                },
-            )),
-        };
+        for attempt in 0..3u32 {
+            let proposal = ProtoLogProposal {
+                op: Some(proto_log_proposal::Op::Truncate(
+                    mz_persist::generated::consensus_service::ProtoTruncateProposal {
+                        key: req.key.clone(),
+                        seqno: req.seqno,
+                    },
+                )),
+            };
 
-        let (acceptor, learner) = {
-            let routing = self.routing.read().await;
-            let log_shard = routing.partition_map.route(&req.key);
-            let a = routing
-                .acceptors
-                .get(&log_shard)
-                .expect("partition map routes to known log shard")
-                .clone();
-            let l = routing
-                .learners
-                .get(&log_shard)
-                .expect("partition map routes to known log shard")
-                .clone();
-            (a, l)
-        };
+            let (acceptor, learner) = {
+                let routing = self.routing.read().await;
+                let log_shard = routing.partition_map.route(&req.key);
+                let a = routing
+                    .acceptors
+                    .get(&log_shard)
+                    .expect("partition map routes to known log shard")
+                    .clone();
+                let l = routing
+                    .learners
+                    .get(&log_shard)
+                    .expect("partition map routes to known log shard")
+                    .clone();
+                (a, l)
+            };
 
-        let receipt = acceptor.append(proposal).await?;
-        let result = learner
-            .await_truncate_result(receipt.batch_number, receipt.position)
-            .await?;
+            match acceptor.append(proposal).await {
+                Ok(receipt) => {
+                    let result = learner
+                        .await_truncate_result(receipt.batch_number, receipt.position)
+                        .await?;
+                    return Ok(tonic::Response::new(result));
+                }
+                Err(crate::AcceptorError::Sealed) => {
+                    debug!(
+                        key = %req.key,
+                        attempt,
+                        "acceptor sealed during truncate, refreshing routing"
+                    );
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(e) => return Err(tonic::Status::from(e)),
+            }
+        }
 
-        Ok(tonic::Response::new(result))
+        Err(tonic::Status::unavailable(
+            "acceptor sealed after 3 retry attempts; reconfiguration may be in progress",
+        ))
     }
 }
