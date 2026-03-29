@@ -570,36 +570,39 @@ impl PersistMetashardActor {
             )
             .await;
 
-            // Look up predecessors from the recovered log_shards metadata.
-            let predecessors: Vec<ShardId> = self
-                .state
-                .log_shards
-                .get(&shard_id)
-                .map(|info| info.predecessors.clone())
-                .unwrap_or_default();
+            // Walk the full transitive predecessor chain so that multi-hop
+            // carried-forward state (L1→L2→L4) is reconstructed on recovery.
+            let predecessors = self.transitive_predecessors(shard_id);
 
-            let (learner_handle, _task) = if predecessors.is_empty() {
-                PersistLearner::spawn(
+            let learner_handle = if predecessors.is_empty() {
+                let (handle, _task) = PersistLearner::spawn(
                     PersistLearnerConfig::default(),
                     &self.persist_client,
                     shard_id,
                     learner_metrics,
                 )
-                .await
+                .await;
+                handle
             } else {
                 info!(
                     %shard_id,
                     predecessors = ?predecessors,
                     "spawning recovered learner with predecessor replay"
                 );
-                PersistLearner::spawn_with_predecessors(
-                    PersistLearnerConfig::default(),
-                    &self.persist_client,
-                    shard_id,
-                    predecessors,
-                    learner_metrics,
-                )
-                .await
+                let (handle, _task, replay_done_rx) =
+                    PersistLearner::spawn_with_predecessors(
+                        PersistLearnerConfig::default(),
+                        &self.persist_client,
+                        shard_id,
+                        predecessors,
+                        learner_metrics,
+                    )
+                    .await;
+                // Wait for predecessor replay to complete before proceeding.
+                // This ensures CriticalSince holds (if any) are not released
+                // before the learner has consumed predecessor data.
+                let _ = replay_done_rx.await;
+                handle
             };
 
             info!(%shard_id, "spawned recovered actor");
@@ -619,6 +622,52 @@ impl PersistMetashardActor {
             num_shards = map.ranges.len(),
             "rebuilt routing from recovered metashard state"
         );
+    }
+
+    /// Walk the predecessor chain transitively for a shard, returning all
+    /// ancestors in replay order (oldest first).
+    ///
+    /// For example, if L4's predecessor is L2 and L2's predecessor is L1,
+    /// this returns [L1, L2].
+    fn transitive_predecessors(&self, shard_id: ShardId) -> Vec<ShardId> {
+        let mut visited = std::collections::BTreeSet::new();
+        let preds = self
+            .state
+            .log_shards
+            .get(&shard_id)
+            .map(|info| info.predecessors.clone())
+            .unwrap_or_default();
+        let mut chain = Vec::new();
+        for pred in &preds {
+            if visited.insert(*pred) {
+                // Recurse: get this predecessor's own ancestors first (older→newer).
+                chain.extend(self.transitive_predecessors_inner(*pred, &mut visited));
+                chain.push(*pred);
+            }
+        }
+        chain
+    }
+
+    /// Recursive helper for transitive_predecessors.
+    fn transitive_predecessors_inner(
+        &self,
+        shard_id: ShardId,
+        visited: &mut std::collections::BTreeSet<ShardId>,
+    ) -> Vec<ShardId> {
+        let preds = self
+            .state
+            .log_shards
+            .get(&shard_id)
+            .map(|info| info.predecessors.clone())
+            .unwrap_or_default();
+        let mut chain = Vec::new();
+        for pred in &preds {
+            if visited.insert(*pred) {
+                chain.extend(self.transitive_predecessors_inner(*pred, visited));
+                chain.push(*pred);
+            }
+        }
+        chain
     }
 
     /// Handle a non-reconfigure command (fast, synchronous).
@@ -905,6 +954,7 @@ impl PersistMetashardActor {
         // be written as a separate background step once the learner is caught up.
         let mut new_acceptors = BTreeMap::new();
         let mut new_learners = BTreeMap::new();
+        let mut replay_done_receivers: Vec<tokio::sync::oneshot::Receiver<()>> = Vec::new();
 
         // Phase 2: Seal retiring log shards.
         // This happens AFTER snapshots are written, minimizing the
@@ -973,28 +1023,32 @@ impl PersistMetashardActor {
             // Predecessor replay ensures the learner sees the complete history
             // from the old shard, including any tail proposals between the
             // snapshot point and the seal.
-            let (learner_handle, _task) = if predecessors.is_empty() {
-                PersistLearner::spawn(
+            let learner_handle = if predecessors.is_empty() {
+                let (handle, _task) = PersistLearner::spawn(
                     PersistLearnerConfig::default(),
                     &self.persist_client,
                     shard_id,
                     learner_metrics,
                 )
-                .await
+                .await;
+                handle
             } else {
                 info!(
                     %shard_id,
                     predecessors = ?predecessors,
                     "spawning learner with predecessor chain replay"
                 );
-                PersistLearner::spawn_with_predecessors(
-                    PersistLearnerConfig::default(),
-                    &self.persist_client,
-                    shard_id,
-                    predecessors,
-                    learner_metrics,
-                )
-                .await
+                let (handle, _task, replay_done_rx) =
+                    PersistLearner::spawn_with_predecessors(
+                        PersistLearnerConfig::default(),
+                        &self.persist_client,
+                        shard_id,
+                        predecessors,
+                        learner_metrics,
+                    )
+                    .await;
+                replay_done_receivers.push(replay_done_rx);
+                handle
             };
 
             info!(%shard_id, "spawned actors for new log shard");
@@ -1083,10 +1137,13 @@ impl PersistMetashardActor {
         // Persist the updated state durably.
         self.persist_state().await;
 
-        // Phase 5: Release CriticalSince holds on retired shards.
-        // The new learners have finished replaying predecessors by now
-        // (spawn_with_predecessors blocks until replay is complete before
-        // entering the run loop), so the holds are no longer needed.
+        // Phase 5: Wait for all predecessor replays to complete before
+        // releasing CriticalSince holds. Without this, predecessor data could
+        // become collectible before the learner has consumed it.
+        for rx in replay_done_receivers {
+            let _ = rx.await;
+        }
+        info!("all predecessor replays complete");
         for mut hold in critical_holds {
             let opaque = hold.opaque().clone();
             match hold

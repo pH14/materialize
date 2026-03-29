@@ -1461,13 +1461,21 @@ impl PersistLearner<ChannelEventSource> {
     /// The predecessor replay builds up the StateMachine with state from old
     /// log shards, so the learner starts with carried-forward state. This is
     /// the chain replay mechanism described in `05_horizontal_sharding.md`.
+    ///
+    /// Returns the handle, the task, and a oneshot receiver that resolves when
+    /// predecessor replay is complete. The caller MUST await this receiver
+    /// before releasing any CriticalSince holds on the predecessor shards.
     pub async fn spawn_with_predecessors(
         config: PersistLearnerConfig,
         client: &PersistClient,
         shard_id: ShardId,
         predecessors: Vec<ShardId>,
         metrics: LearnerMetrics,
-    ) -> (PersistLearnerHandle, mz_ore::task::JoinHandle<()>) {
+    ) -> (
+        PersistLearnerHandle,
+        mz_ore::task::JoinHandle<()>,
+        oneshot::Receiver<()>,
+    ) {
         let key_schema = Arc::new(OrderedKeySchema);
         let val_schema = Arc::new(ProposalSchema);
 
@@ -1504,15 +1512,19 @@ impl PersistLearner<ChannelEventSource> {
 
         let (mut learner, handle) = Self::new(config, subscribe, retraction_write, metrics);
 
-        // Replay predecessors before starting the main loop.
+        let (replay_done_tx, replay_done_rx) = oneshot::channel();
+
         let client_clone = client.clone();
         let task = mz_ore::task::spawn(|| "persist-learner-with-predecessors", async move {
             for predecessor in predecessors {
                 learner.replay_predecessor(&client_clone, predecessor).await;
             }
+            // Signal that predecessor replay is complete. The caller can now
+            // safely release CriticalSince holds.
+            let _ = replay_done_tx.send(());
             learner.run(upper_handle).await;
         });
 
-        (handle, task)
+        (handle, task, replay_done_rx)
     }
 }
