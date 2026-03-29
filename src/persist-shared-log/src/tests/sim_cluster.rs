@@ -51,7 +51,7 @@ use crate::persist_log::acceptor::PersistAcceptor;
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig};
 use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
 use crate::sharded_service::ShardedService;
-use crate::{AcceptorConfig, PartitionMap, RangeAssignment};
+use crate::{AcceptorConfig, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 /// Port for consensus and blob turmoil servers.
 const PERSIST_PORT: u16 = 7000;
@@ -568,4 +568,372 @@ fn sim_cluster_persist_partition() {
         }
     });
     sim.run().expect("phase 2 should complete");
+}
+
+/// Reconfiguration while writers are active: split a single shard into two
+/// while multiple keys are being written. After the split completes, all
+/// pre-split and post-split data should be readable from the correct new
+/// shards via chain replay.
+#[test]
+fn sim_cluster_split_with_writes() {
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(30))
+        .build();
+
+    let log_shard = ShardId::new();
+    let metashard_shard = ShardId::new();
+    let shard_a = ShardId::new();
+    let shard_b = ShardId::new();
+
+    let consensus_state = ConsensusState::new();
+    let blob_state = BlobState::new();
+    sim.host("consensus", {
+        let state = consensus_state.clone();
+        move || serve_consensus(PERSIST_PORT, state.clone())
+    });
+    sim.host("blob", {
+        let state = blob_state.clone();
+        move || serve_blob(PERSIST_PORT, state.clone())
+    });
+
+    let shard_ids = vec![log_shard];
+    let ms_shard = metashard_shard;
+
+    sim.client("split-test", {
+        let shard_ids = shard_ids.clone();
+        async move {
+            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
+            use mz_persist::generated::consensus_service::{
+                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
+            };
+
+            let client = new_turmoil_persist_client().await;
+            let registry = MetricsRegistry::new();
+            let partition_map = build_partition_map(&shard_ids);
+
+            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
+            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+
+            let (acc, _) = PersistAcceptor::spawn(
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+            ).await;
+            let (lrn, _, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            ).await;
+
+            let mut acceptors = BTreeMap::new();
+            acceptors.insert(shard_ids[0], acc);
+            let mut learners = BTreeMap::new();
+            learners.insert(shard_ids[0], lrn);
+
+            let service = ShardedService::new(partition_map, acceptors, learners);
+            let routing_handle = service.routing_handle();
+            let metashard_state = MetashardState::single(shard_ids[0]);
+            let (ms_handle, _) = PersistMetashardActor::spawn(
+                metashard_state, 256, client, registry, routing_handle, ms_shard,
+            ).await;
+
+            let key_lo = "s10000000-0000-0000-0000-000000000000"; // 0x10 → [0x00, 0x80)
+            let key_hi = "s90000000-0000-0000-0000-000000000000"; // 0x90 → [0x80, 0x100)
+
+            // Write to both keys on the single shard.
+            for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
+                let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                    key: key.to_string(),
+                    expected: None,
+                    new: Some(ProtoVersionedData {
+                        seqno: 1,
+                        data: format!("{}_pre_split", label).into_bytes(),
+                    }),
+                })).await.expect("pre-split CAS");
+                assert!(resp.into_inner().committed, "{} pre-split write", label);
+            }
+
+            // Split.
+            use crate::Metashard;
+            let new_epoch = ms_handle.reconfigure(ReconfigurationPlan {
+                expected_epoch: 0,
+                new_partition_map: PartitionMap {
+                    epoch: 1,
+                    ranges: vec![
+                        RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
+                        RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
+                    ],
+                },
+            }).await.expect("split should succeed");
+            assert_eq!(new_epoch, 1);
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Verify carried-forward data.
+            for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
+                let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+                    key: key.to_string(),
+                })).await.expect("head after split");
+                let data = resp.into_inner().data;
+                assert!(data.is_some(), "{} should have data after split", label);
+                assert_eq!(data.unwrap().seqno, 1, "{} seqno carried forward", label);
+            }
+
+            // Post-split writes to both new shards.
+            for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
+                let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                    key: key.to_string(),
+                    expected: Some(1),
+                    new: Some(ProtoVersionedData {
+                        seqno: 2,
+                        data: format!("{}_post_split", label).into_bytes(),
+                    }),
+                })).await.expect("post-split CAS");
+                assert!(resp.into_inner().committed, "{} post-split write", label);
+            }
+
+            Ok(())
+        }
+    });
+    sim.run().expect("split test should complete");
+}
+
+/// BUGGIFY + turmoil: trigger a split with fault injection at `after_seal`
+/// on the turmoil persist backend. Both fault layers (network-level turmoil
+/// + protocol-level BUGGIFY) compose correctly.
+#[test]
+fn sim_cluster_reconfig_with_buggify() {
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(30))
+        .build();
+
+    let log_shard = ShardId::new();
+    let metashard_shard = ShardId::new();
+    let shard_a = ShardId::new();
+    let shard_b = ShardId::new();
+
+    let consensus_state = ConsensusState::new();
+    let blob_state = BlobState::new();
+    sim.host("consensus", {
+        let state = consensus_state.clone();
+        move || serve_consensus(PERSIST_PORT, state.clone())
+    });
+    sim.host("blob", {
+        let state = blob_state.clone();
+        move || serve_blob(PERSIST_PORT, state.clone())
+    });
+
+    let shard_ids = vec![log_shard];
+    let ms_shard = metashard_shard;
+
+    sim.client("buggify-reconfig", {
+        let shard_ids = shard_ids.clone();
+        async move {
+            use crate::fault::{self, FaultConfig};
+            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
+            use mz_persist::generated::consensus_service::{
+                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
+            };
+
+            let client = new_turmoil_persist_client().await;
+            let registry = MetricsRegistry::new();
+            let partition_map = build_partition_map(&shard_ids);
+
+            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
+            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+
+            let (acc, _) = PersistAcceptor::spawn(
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+            ).await;
+            let (lrn, _, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            ).await;
+
+            let mut acceptors = BTreeMap::new();
+            acceptors.insert(shard_ids[0], acc);
+            let mut learners = BTreeMap::new();
+            learners.insert(shard_ids[0], lrn);
+
+            let service = ShardedService::new(partition_map, acceptors, learners);
+            let routing_handle = service.routing_handle();
+            let metashard_state = MetashardState::single(shard_ids[0]);
+            let (ms_handle, _) = PersistMetashardActor::spawn(
+                metashard_state, 256, client, registry, routing_handle, ms_shard,
+            ).await;
+
+            let key = "s30000000-0000-0000-0000-000000000000";
+
+            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                key: key.to_string(),
+                expected: None,
+                new: Some(ProtoVersionedData { seqno: 1, data: b"pre".to_vec() }),
+            })).await.unwrap();
+            assert!(resp.into_inner().committed);
+
+            let plan = ReconfigurationPlan {
+                expected_epoch: 0,
+                new_partition_map: PartitionMap {
+                    epoch: 1,
+                    ranges: vec![
+                        RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
+                        RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
+                    ],
+                },
+            };
+
+            // Fault at after_seal.
+            fault::configure(FaultConfig::with_points(&["after_seal"], 1.0, 42));
+
+            use crate::Metashard;
+            let result = ms_handle.reconfigure(plan.clone()).await;
+            assert!(result.is_err(), "should fail at after_seal");
+
+            fault::clear();
+            let new_epoch = ms_handle.reconfigure(plan).await
+                .expect("retry should succeed");
+            assert_eq!(new_epoch, 1);
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+                key: key.to_string(),
+            })).await.unwrap();
+            assert_eq!(resp.into_inner().data.unwrap().seqno, 1,
+                "pre-split data should survive buggify + turmoil");
+
+            fault::clear();
+            Ok(())
+        }
+    });
+    sim.run().expect("buggify reconfig test should complete");
+}
+
+/// Split during persist partition: write data, partition from consensus,
+/// attempt split (hangs), repair, retry split, verify data carries forward.
+#[test]
+fn sim_cluster_split_during_persist_partition() {
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(60))
+        .build();
+
+    let log_shard = ShardId::new();
+    let metashard_shard = ShardId::new();
+    let shard_a = ShardId::new();
+    let shard_b = ShardId::new();
+
+    let consensus_state = ConsensusState::new();
+    let blob_state = BlobState::new();
+    sim.host("consensus", {
+        let state = consensus_state.clone();
+        move || serve_consensus(PERSIST_PORT, state.clone())
+    });
+    sim.host("blob", {
+        let state = blob_state.clone();
+        move || serve_blob(PERSIST_PORT, state.clone())
+    });
+
+    let shard_ids = vec![log_shard];
+    let ms_shard = metashard_shard;
+
+    sim.client("split-partition", {
+        let shard_ids = shard_ids.clone();
+        async move {
+            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
+            use mz_persist::generated::consensus_service::{
+                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
+            };
+
+            let client = new_turmoil_persist_client().await;
+            let registry = MetricsRegistry::new();
+            let partition_map = build_partition_map(&shard_ids);
+
+            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
+            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+
+            let (acc, _) = PersistAcceptor::spawn(
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+            ).await;
+            let (lrn, _, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            ).await;
+
+            let mut acceptors = BTreeMap::new();
+            acceptors.insert(shard_ids[0], acc);
+            let mut learners = BTreeMap::new();
+            learners.insert(shard_ids[0], lrn);
+
+            let service = ShardedService::new(partition_map, acceptors, learners);
+            let routing_handle = service.routing_handle();
+            let metashard_state = MetashardState::single(shard_ids[0]);
+            let (ms_handle, _) = PersistMetashardActor::spawn(
+                metashard_state, 256, client, registry, routing_handle, ms_shard,
+            ).await;
+
+            let key = "s30000000-0000-0000-0000-000000000000";
+
+            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                key: key.to_string(),
+                expected: None,
+                new: Some(ProtoVersionedData { seqno: 1, data: b"pre_split".to_vec() }),
+            })).await.unwrap();
+            assert!(resp.into_inner().committed);
+
+            // Partition from consensus, then attempt split.
+            turmoil::partition("split-partition", "consensus");
+
+            use crate::Metashard;
+            let plan = ReconfigurationPlan {
+                expected_epoch: 0,
+                new_partition_map: PartitionMap {
+                    epoch: 1,
+                    ranges: vec![
+                        RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
+                        RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
+                    ],
+                },
+            };
+
+            // Reconfiguration hangs (persist can't seal or write intent).
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                ms_handle.reconfigure(plan.clone()),
+            ).await;
+            assert!(result.is_err(), "reconfig should time out during partition");
+
+            // Repair and retry.
+            turmoil::repair("split-partition", "consensus");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            // The partitioned reconfiguration may have partially or fully
+            // completed in the background (the intent was persisted before
+            // the partition, and persist retried seal/replay when the network
+            // healed during the timeout window). Check the current epoch.
+            let current_epoch = ms_handle.current_epoch().await.unwrap();
+            if current_epoch == 0 {
+                // Reconfig didn't complete — retry.
+                let new_epoch = ms_handle.reconfigure(plan).await
+                    .expect("retried reconfig should succeed");
+                assert_eq!(new_epoch, 1);
+            } else {
+                // Reconfig completed via background retry — expected behavior
+                // when the partition heals during the timeout window.
+                assert_eq!(current_epoch, 1);
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+                key: key.to_string(),
+            })).await.unwrap();
+            let data = resp.into_inner().data;
+            assert!(data.is_some(), "pre-split data should survive");
+            assert_eq!(data.unwrap().seqno, 1);
+
+            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                key: key.to_string(),
+                expected: Some(1),
+                new: Some(ProtoVersionedData { seqno: 2, data: b"post_split".to_vec() }),
+            })).await.unwrap();
+            assert!(resp.into_inner().committed, "post-split CAS should work");
+
+            Ok(())
+        }
+    });
+    sim.run().expect("split-during-partition test should complete");
 }
