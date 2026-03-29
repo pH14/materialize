@@ -524,3 +524,191 @@ async fn test_reconfiguration_state_carryforward() {
         .unwrap();
     assert_eq!(resp.into_inner().data.unwrap().seqno, 3);
 }
+
+/// DST-style test: run a workload across multiple client shards, reconfigure
+/// mid-flight, continue the workload, verify all state is consistent.
+///
+/// Tests N client shards spread across the partition key space. Each shard
+/// gets a sequence of CaS operations building a chain of seqnos. After
+/// reconfiguration, the chains continue correctly on the new log shards.
+#[mz_ore::test(tokio::test)]
+async fn test_dst_workload_with_reconfiguration() {
+    let client = new_persist_client_for_test().await;
+    let registry = MetricsRegistry::new();
+
+    let shard_1 = ShardId::new();
+    let (acceptor, learner) = spawn_shard(&client, shard_1).await;
+
+    let partition_map = PartitionMap::single(shard_1);
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_1, acceptor);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_1, learner);
+
+    let service = ShardedService::new(partition_map, acceptors, learners);
+    let routing_handle = service.routing_handle();
+
+    let metashard_state = MetashardState::single(shard_1);
+    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
+        metashard_state,
+        256,
+        client.clone(),
+        registry,
+        routing_handle,
+    );
+
+    // Client shard keys spread across the partition key space.
+    let keys = [
+        "s10000000-0000-0000-0000-000000000000", // 0x10 → first half
+        "s30000000-0000-0000-0000-000000000000", // 0x30 → first half
+        "s50000000-0000-0000-0000-000000000000", // 0x50 → first half
+        "s90000000-0000-0000-0000-000000000000", // 0x90 → second half
+        "sb0000000-0000-0000-0000-000000000000", // 0xb0 → second half
+        "sd0000000-0000-0000-0000-000000000000", // 0xd0 → second half
+    ];
+
+    // Track expected seqno per key.
+    let mut expected_seqno: BTreeMap<&str, u64> = BTreeMap::new();
+
+    // --- Phase 1: Write initial data (all on single shard) ---
+    for &key in &keys {
+        for seqno in 1..=3u64 {
+            let prev = if seqno == 1 { None } else { Some(seqno - 1) };
+            let data = format!("key={}_seq={}", &key[1..3], seqno);
+            let resp = service
+                .compare_and_set(cas_request(key, prev, seqno, data.as_bytes()))
+                .await
+                .unwrap();
+            assert!(
+                resp.into_inner().committed,
+                "pre-reconfig CAS for {} seqno {} should commit",
+                &key[1..3],
+                seqno
+            );
+            expected_seqno.insert(key, seqno);
+        }
+    }
+
+    // Verify all heads before reconfiguration.
+    for &key in &keys {
+        let resp = service
+            .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+            .await
+            .unwrap();
+        let seqno = resp.into_inner().data.unwrap().seqno;
+        assert_eq!(seqno, 3, "pre-reconfig head for {} should be 3", &key[1..3]);
+    }
+
+    // --- Phase 2: Reconfigure — split into two shards ---
+    let shard_a = ShardId::new(); // [0x00, 0x80)
+    let shard_b = ShardId::new(); // [0x80, 0x100)
+
+    let new_partition_map = PartitionMap {
+        epoch: 1,
+        ranges: vec![
+            RangeAssignment {
+                lo: 0x00,
+                hi_exclusive: 0x80,
+                log_shard: shard_a,
+            },
+            RangeAssignment {
+                lo: 0x80,
+                hi_exclusive: 0x100,
+                log_shard: shard_b,
+            },
+        ],
+    };
+
+    let new_epoch = metashard_handle
+        .reconfigure(ReconfigurationPlan {
+            expected_epoch: 0,
+            new_partition_map,
+        })
+        .await
+        .expect("reconfiguration should succeed");
+    assert_eq!(new_epoch, 1);
+
+    // Wait for learner predecessor replay to complete.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // --- Phase 3: Verify state carried forward for ALL keys ---
+    for &key in &keys {
+        let resp = service
+            .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+            .await
+            .unwrap();
+        let data = resp.into_inner().data;
+        assert!(
+            data.is_some(),
+            "post-reconfig head for {} should have data (carried forward)",
+            &key[1..3]
+        );
+        assert_eq!(
+            data.unwrap().seqno, 3,
+            "post-reconfig seqno for {} should be 3 (carried forward)",
+            &key[1..3]
+        );
+    }
+
+    // --- Phase 4: Continue workload on new shards ---
+    for &key in &keys {
+        let prev_seqno = expected_seqno[key];
+        for delta in 1..=3u64 {
+            let seqno = prev_seqno + delta;
+            let prev = Some(seqno - 1);
+            let data = format!("post_reconfig_key={}_seq={}", &key[1..3], seqno);
+            let resp = service
+                .compare_and_set(cas_request(key, prev, seqno, data.as_bytes()))
+                .await
+                .unwrap();
+            assert!(
+                resp.into_inner().committed,
+                "post-reconfig CAS for {} seqno {} should commit",
+                &key[1..3],
+                seqno
+            );
+            expected_seqno.insert(key, seqno);
+        }
+    }
+
+    // --- Phase 5: Final verification ---
+    for &key in &keys {
+        let resp = service
+            .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
+            .await
+            .unwrap();
+        let data = resp.into_inner().data.unwrap();
+        assert_eq!(
+            data.seqno,
+            expected_seqno[key],
+            "final seqno for {} should be {}",
+            &key[1..3],
+            expected_seqno[key]
+        );
+    }
+
+    // Verify list_keys returns all keys across both shards.
+    let resp = service
+        .list_keys(tonic::Request::new(ProtoListKeysRequest {}))
+        .await
+        .unwrap();
+    let stream = resp.into_inner();
+    let listed: Vec<String> = tokio_stream::StreamExt::collect::<Vec<_>>(stream)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap().key)
+        .collect();
+    assert_eq!(
+        listed.len(),
+        keys.len(),
+        "list_keys should return all {} keys across both shards",
+        keys.len()
+    );
+    for &key in &keys {
+        assert!(
+            listed.contains(&key.to_string()),
+            "list_keys missing {}",
+            key
+        );
+    }
+}
