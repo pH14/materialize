@@ -24,14 +24,19 @@ use timely::progress::Antichain;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{debug, info};
 
+use bytes::Bytes;
+use prost::Message;
+
 use mz_ore::metrics::MetricsRegistry;
+use mz_persist::generated::consensus_service::{ProtoCasProposal, ProtoLogProposal, proto_log_proposal};
 use mz_persist_client::critical::{CriticalReaderId, Opaque, SinceHandle};
+use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
-use crate::persist_log::{OrderedKey, Proposal};
+use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::sharded_service::RoutingState;
 use crate::{AcceptorConfig, MetashardError, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
@@ -257,6 +262,139 @@ impl PersistMetashardActor {
         }
     }
 
+    /// Replay a sealed predecessor shard and write its head state as snapshot
+    /// CaS proposals to a new shard. This makes the new shard self-contained.
+    ///
+    /// Returns the number of client shard entries written.
+    async fn write_snapshot_to_new_shard(
+        &self,
+        predecessor: ShardId,
+        new_shard: ShardId,
+    ) -> Result<usize, String> {
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
+
+        // Replay predecessor to extract head state.
+        let (_, read) = self
+            .persist_client
+            .open::<OrderedKey, Proposal, u64, i64>(
+                predecessor,
+                Arc::clone(&key_schema),
+                Arc::clone(&val_schema),
+                Diagnostics::from_purpose("metashard-snapshot-replay"),
+                false,
+            )
+            .await
+            .map_err(|e| format!("open predecessor for snapshot: {e}"))?;
+
+        let since = read.since().clone();
+        let mut subscribe = read
+            .subscribe(since)
+            .await
+            .map_err(|e| format!("subscribe to predecessor: {e:?}"))?;
+
+        // Build head state per client shard: key → (seqno, data).
+        // We evaluate CaS proposals in order to track only committed state.
+        let mut head_state: BTreeMap<String, (u64, Vec<u8>)> = BTreeMap::new();
+
+        loop {
+            let events = subscribe.fetch_next().await;
+            let mut done = false;
+            for event in &events {
+                match event {
+                    ListenEvent::Progress(frontier) => {
+                        if frontier.is_empty() {
+                            done = true;
+                        }
+                    }
+                    ListenEvent::Updates(updates) => {
+                        for ((_key, proposal_data), _ts, diff) in updates {
+                            if *diff != 1 {
+                                continue; // Skip retractions for head tracking.
+                            }
+                            let proposal: ProtoLogProposal =
+                                match Message::decode(proposal_data.encoded.as_ref()) {
+                                    Ok(p) => p,
+                                    Err(_) => continue,
+                                };
+                            if let Some(proto_log_proposal::Op::Cas(cas)) = proposal.op {
+                                let current_seqno =
+                                    head_state.get(&cas.key).map(|(s, _)| *s);
+                                if current_seqno == cas.expected {
+                                    head_state
+                                        .insert(cas.key, (cas.new_seqno, cas.data));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+
+        if head_state.is_empty() {
+            return Ok(0);
+        }
+
+        // Write head state as CaS proposals to the new shard.
+        let mut write = self
+            .persist_client
+            .open_writer::<OrderedKey, Proposal, u64, i64>(
+                new_shard,
+                Arc::clone(&key_schema),
+                Arc::clone(&val_schema),
+                Diagnostics::from_purpose("metashard-snapshot-write"),
+            )
+            .await
+            .map_err(|e| format!("open writer for snapshot: {e}"))?;
+
+        // Advance upper past T=0 if needed.
+        if write.upper().as_option() == Some(&0) {
+            write.advance_upper(&Antichain::from_elem(1)).await;
+        }
+
+        // Write at T=1 (T=0 is skipped per learner convention).
+        let batch_number = 1u64;
+        let mut updates = Vec::new();
+        for (position, (shard_key, (seqno, data))) in head_state.iter().enumerate() {
+            let cas = ProtoCasProposal {
+                key: shard_key.clone(),
+                expected: None,
+                new_seqno: *seqno,
+                data: data.clone(),
+            };
+            let proposal = ProtoLogProposal {
+                op: Some(proto_log_proposal::Op::Cas(cas)),
+            };
+            let encoded = Proposal {
+                encoded: Bytes::from(proposal.encode_to_vec()),
+            };
+            let ordered_key = OrderedKey {
+                batch_id: batch_number,
+                position: u32::try_from(position).expect("position fits u32"),
+                shard: shard_key.clone(),
+            };
+            updates.push(((ordered_key, encoded), batch_number, 1i64));
+        }
+
+        let upper = write.upper().clone();
+        let new_upper = Antichain::from_elem(batch_number + 1);
+        match write.compare_and_append(&updates, upper, new_upper).await {
+            Ok(Ok(())) => {
+                info!(
+                    %new_shard,
+                    entries = head_state.len(),
+                    "wrote snapshot to new shard"
+                );
+                Ok(head_state.len())
+            }
+            Ok(Err(mismatch)) => Err(format!("snapshot write upper mismatch: {mismatch:?}")),
+            Err(e) => Err(format!("snapshot write error: {e}")),
+        }
+    }
+
     /// Execute a reconfiguration.
     ///
     /// This is the core reconfiguration protocol:
@@ -265,8 +403,6 @@ impl PersistMetashardActor {
     /// 3. Spawn new acceptors + learners
     /// 4. Seal retiring log shards
     /// 5. Update partition map and swap routing state
-    ///
-    /// TODO(horizontal-sharding): Add pre-hydration with CriticalSince:
     /// - Before sealing, new learners should subscribe to old shards and catch up
     /// - Acquire CriticalSince on old shard at the catch-up point
     /// - Write snapshot entries (T=0) to new shard during pre-hydration
@@ -333,76 +469,7 @@ impl PersistMetashardActor {
             critical_holds.push(handle);
         }
 
-        // Phase 1: Spawn new acceptors + learners for added log shards.
-        let mut new_acceptors = BTreeMap::new();
-        let mut new_learners = BTreeMap::new();
-
-        for &shard_id in &added {
-            // Each shard gets its own metrics registry to avoid double-registration
-            // when spawning multiple shards (AcceptorMetrics/LearnerMetrics use
-            // fixed metric names).
-            let shard_registry = MetricsRegistry::new();
-            let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
-            let learner_metrics = LearnerMetrics::register(&shard_registry);
-
-            let (acceptor_handle, _task) = PersistAcceptor::spawn(
-                AcceptorConfig::default(),
-                &self.persist_client,
-                shard_id,
-                acceptor_metrics,
-                new_epoch,
-            )
-            .await;
-
-            // Find predecessor shards for this new log shard.
-            // The predecessor is the old log shard whose range overlapped with
-            // the new log shard's range.
-            let new_range = new_map
-                .ranges
-                .iter()
-                .find(|r| r.log_shard == shard_id)
-                .expect("new shard must be in new partition map");
-            let predecessors: Vec<ShardId> = old_map
-                .ranges
-                .iter()
-                .filter(|r| {
-                    u16::from(new_range.lo) < r.hi_exclusive
-                        && u16::from(r.lo) < new_range.hi_exclusive
-                })
-                .map(|r| r.log_shard)
-                .filter(|s| retiring.contains(s))
-                .collect();
-
-            let (learner_handle, _task) = if predecessors.is_empty() {
-                PersistLearner::spawn(
-                    PersistLearnerConfig::default(),
-                    &self.persist_client,
-                    shard_id,
-                    learner_metrics,
-                )
-                .await
-            } else {
-                info!(
-                    %shard_id,
-                    predecessors = ?predecessors,
-                    "spawning learner with predecessor chain replay"
-                );
-                PersistLearner::spawn_with_predecessors(
-                    PersistLearnerConfig::default(),
-                    &self.persist_client,
-                    shard_id,
-                    predecessors,
-                    learner_metrics,
-                )
-                .await
-            };
-
-            info!(%shard_id, "spawned new acceptor + learner for reconfiguration");
-            new_acceptors.insert(shard_id, acceptor_handle);
-            new_learners.insert(shard_id, learner_handle);
-        }
-
-        // Phase 3: Seal retiring log shards.
+        // Phase 1: Seal retiring log shards.
         for &shard_id in &retiring {
             let key_schema = Arc::new(crate::persist_log::OrderedKeySchema);
             let val_schema = Arc::new(crate::persist_log::ProposalSchema);
@@ -428,7 +495,90 @@ impl PersistMetashardActor {
             }
         }
 
-        // Phase 4: Build new routing state and swap atomically.
+        // Phase 2: Write snapshots to new shards + spawn actors.
+        let mut new_acceptors = BTreeMap::new();
+        let mut new_learners = BTreeMap::new();
+
+        for &shard_id in &added {
+            // Find predecessor shard(s) for this new log shard.
+            let new_range = new_map
+                .ranges
+                .iter()
+                .find(|r| r.log_shard == shard_id)
+                .expect("new shard must be in new partition map");
+            let predecessors: Vec<ShardId> = old_map
+                .ranges
+                .iter()
+                .filter(|r| {
+                    u16::from(new_range.lo) < r.hi_exclusive
+                        && u16::from(r.lo) < new_range.hi_exclusive
+                })
+                .map(|r| r.log_shard)
+                .filter(|s| retiring.contains(s))
+                .collect();
+
+            // Write snapshot: replay predecessor(s) and write head state to new shard.
+            let mut snapshot_entries = 0;
+            for &pred in &predecessors {
+                match self.write_snapshot_to_new_shard(pred, shard_id).await {
+                    Ok(n) => snapshot_entries += n,
+                    Err(e) => {
+                        info!(
+                            %shard_id,
+                            %pred,
+                            error = %e,
+                            "snapshot write failed, learner will use chain replay"
+                        );
+                    }
+                }
+            }
+
+            // Spawn acceptor + learner.
+            let shard_registry = MetricsRegistry::new();
+            let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
+            let learner_metrics = LearnerMetrics::register(&shard_registry);
+
+            let (acceptor_handle, _task) = PersistAcceptor::spawn(
+                AcceptorConfig::default(),
+                &self.persist_client,
+                shard_id,
+                acceptor_metrics,
+                new_epoch,
+            )
+            .await;
+
+            // If snapshot was written, learner just replays its own shard.
+            // If snapshot failed, fall back to chain replay via predecessors.
+            let (learner_handle, _task) = if snapshot_entries > 0 || predecessors.is_empty() {
+                PersistLearner::spawn(
+                    PersistLearnerConfig::default(),
+                    &self.persist_client,
+                    shard_id,
+                    learner_metrics,
+                )
+                .await
+            } else {
+                info!(
+                    %shard_id,
+                    predecessors = ?predecessors,
+                    "falling back to chain replay (no snapshot)"
+                );
+                PersistLearner::spawn_with_predecessors(
+                    PersistLearnerConfig::default(),
+                    &self.persist_client,
+                    shard_id,
+                    predecessors,
+                    learner_metrics,
+                )
+                .await
+            };
+
+            info!(%shard_id, snapshot_entries, "spawned actors for new log shard");
+            new_acceptors.insert(shard_id, acceptor_handle);
+            new_learners.insert(shard_id, learner_handle);
+        }
+
+        // Phase 3: Build new routing state and swap atomically.
         let mut routing = self.routing.write().await;
 
         // Carry forward acceptors/learners for shards that remain.
