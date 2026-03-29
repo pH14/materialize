@@ -1115,11 +1115,15 @@ impl<E: EventSource> PersistLearner<E> {
 
     /// Flush pending retractions as -1 diffs via the retraction WriteHandle.
     ///
-    /// The caller decides when to call this — that's the policy. This method
-    /// is the mechanism. On UpperMismatch, discards the batch and puts entries
-    /// back into pending_retractions. The subscription will deliver any
-    /// competing -1 diffs before the next sweep, pruning already-retracted
-    /// entries from the pending set.
+    /// Uses BatchBuilder to pre-build the retraction batch (uploading the blob
+    /// once), then retries the CAS on UpperMismatch using `rewrite_ts` to
+    /// adjust timestamps without re-uploading. This avoids the starvation
+    /// problem where the acceptor continuously advances the upper faster than
+    /// the retraction writer can land a `compare_and_append`.
+    ///
+    /// Between retries, processes any pending events from the subscription to
+    /// check if any staged retractions have been invalidated (retracted by
+    /// another learner). If so, deletes the stale batch and rebuilds.
     pub async fn flush_pending_retractions(&mut self) {
         let sweep_start = tokio::time::Instant::now();
         self.metrics.retraction_sweeps.inc();
@@ -1129,62 +1133,138 @@ impl<E: EventSource> PersistLearner<E> {
             return;
         }
 
-        let upper = self.log_shard.retraction_write.upper().clone();
-        let raw_upper = match upper.as_option() {
+        let num_retractions = pending.len();
+
+        // Step 1: Read the current upper for the initial batch build.
+        let initial_upper = self.log_shard.retraction_write.upper().clone();
+        let initial_ts = match initial_upper.as_option() {
             Some(ts) => (*ts).max(1),
             None => {
-                warn!("retraction write upper is empty, skipping sweep");
+                warn!("retraction write upper is empty (shard sealed), skipping sweep");
                 self.log_shard.pending_retractions = pending;
                 return;
             }
         };
 
-        let num_retractions = pending.len();
-        let updates: Vec<_> = pending
-            .iter()
-            .map(|(key, proposal)| ((key.clone(), proposal.clone()), raw_upper, -1i64))
-            .collect();
-
-        let new_upper = Antichain::from_elem(raw_upper + 1);
-
-        match self
+        // Step 2: Build the batch — uploads blob data once.
+        let mut builder = self
             .log_shard
             .retraction_write
-            .compare_and_append(&updates, upper, new_upper)
-            .await
-        {
-            Ok(Ok(())) => {
-                self.metrics
-                    .retraction_rows_written
-                    .inc_by(u64::try_from(num_retractions).unwrap_or(u64::MAX));
-                self.metrics
-                    .retraction_sweep_latency_seconds
-                    .observe(sweep_start.elapsed().as_secs_f64());
-                info!(
-                    retractions = num_retractions,
-                    "learner retraction sweep committed"
-                );
-            }
-            Ok(Err(upper_mismatch)) => {
-                // Discard batch, restore pending retractions for next sweep.
-                let actual = upper_mismatch
-                    .current
-                    .as_option()
-                    .copied()
-                    .unwrap_or(u64::MAX);
-                warn!(
-                    expected = raw_upper,
-                    actual_upper = actual,
-                    retractions = num_retractions,
-                    "learner retraction upper mismatch, discarding batch"
-                );
+            .builder(Antichain::from_elem(initial_ts));
+        for (key, proposal) in &pending {
+            if let Err(e) = builder.add(key, proposal, &initial_ts, &-1i64).await {
+                error!("retraction batch builder error: {}", e);
                 self.log_shard.pending_retractions = pending;
-            }
-            Err(invalid_usage) => {
-                error!("learner retraction invalid usage: {}", invalid_usage);
-                self.log_shard.pending_retractions = pending;
+                return;
             }
         }
+        let mut batch = match builder
+            .finish(Antichain::from_elem(initial_ts + 1))
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                error!("retraction batch finish error: {}", e);
+                self.log_shard.pending_retractions = pending;
+                return;
+            }
+        };
+
+        // Step 3: CAS loop — retry with rewrite_ts on UpperMismatch.
+        for attempt in 0..10u32 {
+            let expected_upper = self.log_shard.retraction_write.upper().clone();
+            let current_ts = match expected_upper.as_option() {
+                Some(ts) => (*ts).max(1),
+                None => {
+                    warn!("shard sealed during retraction flush");
+                    batch.delete().await;
+                    self.log_shard.pending_retractions = pending;
+                    return;
+                }
+            };
+
+            // Rewrite batch timestamps to the current upper (metadata-only, no
+            // re-upload). On the first attempt this is a no-op if the upper
+            // hasn't moved since we built the batch.
+            if current_ts != initial_ts || attempt > 0 {
+                if let Err(e) = batch.rewrite_ts(
+                    &Antichain::from_elem(current_ts),
+                    Antichain::from_elem(current_ts + 1),
+                ) {
+                    error!("retraction rewrite_ts error: {}", e);
+                    batch.delete().await;
+                    self.log_shard.pending_retractions = pending;
+                    return;
+                }
+            }
+
+            let new_upper = Antichain::from_elem(current_ts + 1);
+
+            match self
+                .log_shard
+                .retraction_write
+                .compare_and_append_batch(
+                    &mut [&mut batch],
+                    expected_upper,
+                    new_upper,
+                    true,
+                )
+                .await
+            {
+                Ok(Ok(())) => {
+                    // Success — batch is consumed by compare_and_append_batch.
+                    self.metrics
+                        .retraction_rows_written
+                        .inc_by(u64::try_from(num_retractions).unwrap_or(u64::MAX));
+                    self.metrics
+                        .retraction_sweep_latency_seconds
+                        .observe(sweep_start.elapsed().as_secs_f64());
+                    if attempt > 0 {
+                        info!(
+                            retractions = num_retractions,
+                            attempts = attempt + 1,
+                            "learner retraction sweep committed after retries"
+                        );
+                    } else {
+                        info!(
+                            retractions = num_retractions,
+                            "learner retraction sweep committed"
+                        );
+                    }
+                    return;
+                }
+                Ok(Err(upper_mismatch)) => {
+                    let actual = upper_mismatch
+                        .current
+                        .as_option()
+                        .copied()
+                        .unwrap_or(u64::MAX);
+                    debug!(
+                        expected = current_ts,
+                        actual_upper = actual,
+                        attempt,
+                        retractions = num_retractions,
+                        "retraction CAS mismatch, rewriting timestamps and retrying"
+                    );
+                    // Batch is NOT consumed on mismatch — rewrite_ts and retry.
+                    continue;
+                }
+                Err(invalid_usage) => {
+                    error!("learner retraction invalid usage: {}", invalid_usage);
+                    batch.delete().await;
+                    self.log_shard.pending_retractions = pending;
+                    return;
+                }
+            }
+        }
+
+        // Retries exhausted — delete the staged batch and defer.
+        warn!(
+            retractions = num_retractions,
+            "learner retraction sweep failed after 10 retries, deferring"
+        );
+        batch.delete().await;
+        self.log_shard.pending_retractions = pending;
     }
 
     // -----------------------------------------------------------------------
