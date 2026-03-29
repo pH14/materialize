@@ -372,3 +372,200 @@ fn sim_cluster_crash_restart() {
 
     sim.run().expect("phase 2 should complete");
 }
+
+/// Network partition: partition the service from consensus, verify writes
+/// fail, repair the partition, verify writes succeed again.
+///
+/// This exercises the persist-level failure path: when the consensus host
+/// is unreachable, compare_and_append times out and the acceptor propagates
+/// the error to the client.
+#[test]
+fn sim_cluster_persist_partition() {
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(30))
+        .build();
+
+    let log_shard = ShardId::new();
+    let metashard_shard = ShardId::new();
+
+    let consensus_state = ConsensusState::new();
+    let blob_state = BlobState::new();
+    sim.host("consensus", {
+        let state = consensus_state.clone();
+        move || serve_consensus(PERSIST_PORT, state.clone())
+    });
+    sim.host("blob", {
+        let state = blob_state.clone();
+        move || serve_blob(PERSIST_PORT, state.clone())
+    });
+
+    let shard_ids = vec![log_shard];
+    let ms_shard = metashard_shard;
+
+    // Phase 1: Write data normally (no partition).
+    sim.client("phase1", {
+        let shard_ids = shard_ids.clone();
+        async move {
+            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
+            use mz_persist::generated::consensus_service::{
+                ProtoCompareAndSetRequest, ProtoVersionedData,
+            };
+
+            let client = new_turmoil_persist_client().await;
+            let registry = MetricsRegistry::new();
+            let partition_map = build_partition_map(&shard_ids);
+
+            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
+            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+
+            let (acc, _) = PersistAcceptor::spawn(
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+            ).await;
+            let (lrn, _, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            ).await;
+
+            let mut acceptors = BTreeMap::new();
+            acceptors.insert(shard_ids[0], acc);
+            let mut learners = BTreeMap::new();
+            learners.insert(shard_ids[0], lrn);
+
+            let service = ShardedService::new(partition_map, acceptors, learners);
+            let routing_handle = service.routing_handle();
+            let metashard_state = MetashardState::single(shard_ids[0]);
+            let (_, _) = PersistMetashardActor::spawn(
+                metashard_state, 256, client, registry, routing_handle, ms_shard,
+            ).await;
+
+            let key = "s30000000-0000-0000-0000-000000000000";
+            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                key: key.to_string(),
+                expected: None,
+                new: Some(ProtoVersionedData { seqno: 1, data: b"before partition".to_vec() }),
+            })).await.expect("CAS should succeed");
+            assert!(resp.into_inner().committed);
+
+            Ok(())
+        }
+    });
+    sim.run().expect("phase 1 should complete");
+
+    // Phase 2: Boot a service normally, then partition it from consensus
+    // and attempt a write. The write should fail because the acceptor's
+    // compare_and_append can't reach the consensus server.
+    //
+    // We boot the service first (handles opened), then partition and
+    // attempt the write. The service boots normally because consensus
+    // was reachable at boot time; the partition happens only for the
+    // subsequent CAS.
+    sim.client("phase2", {
+        let shard_ids = shard_ids.clone();
+        async move {
+            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
+            use mz_persist::generated::consensus_service::{
+                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
+            };
+
+            let client = new_turmoil_persist_client().await;
+            let registry = MetricsRegistry::new();
+            let partition_map = build_partition_map(&shard_ids);
+
+            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
+            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+
+            let (acc, _) = PersistAcceptor::spawn(
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+            ).await;
+            let (lrn, _, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            ).await;
+
+            let mut acceptors = BTreeMap::new();
+            acceptors.insert(shard_ids[0], acc);
+            let mut learners = BTreeMap::new();
+            learners.insert(shard_ids[0], lrn);
+
+            let service = ShardedService::new(partition_map, acceptors, learners);
+            let routing_handle = service.routing_handle();
+            let metashard_state = MetashardState::single(shard_ids[0]);
+            let (_, _) = PersistMetashardActor::spawn(
+                metashard_state, 256, client, registry, routing_handle, ms_shard,
+            ).await;
+
+            let key = "s30000000-0000-0000-0000-000000000000";
+
+            // Verify pre-partition data is readable from the learner
+            // (learner subscribed and caught up during boot, before partition).
+            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+                key: key.to_string(),
+            })).await.expect("head should succeed (learner has local state)");
+            let data = resp.into_inner().data;
+            assert!(data.is_some(), "phase 1 data should be readable");
+            assert_eq!(data.unwrap().seqno, 1);
+
+            // Now partition ourselves from consensus. This simulates a
+            // network failure between the service and the persist backend.
+            turmoil::partition("phase2", "consensus");
+
+            // The CAS should hang: persist retries indefinitely under
+            // partition (correct production behavior). Use a timeout to
+            // detect the hang and move on.
+            let partitioned_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                    key: key.to_string(),
+                    expected: Some(1),
+                    new: Some(ProtoVersionedData { seqno: 2, data: b"during partition".to_vec() }),
+                })),
+            ).await;
+
+            assert!(
+                partitioned_result.is_err(),
+                "CAS should time out when partitioned from consensus"
+            );
+
+            // Repair the partition.
+            turmoil::repair("phase2", "consensus");
+
+            // After repair, the partitioned CAS may have committed
+            // asynchronously (persist retried in the background). The
+            // outcome is ambiguous — this is correct production behavior.
+            //
+            // Read the current state to determine what actually happened,
+            // then write based on the actual head.
+            // Give the background retry a moment to resolve.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+                key: key.to_string(),
+            })).await.expect("head should succeed after partition heals");
+            let head = resp.into_inner().data.expect("should have data");
+
+            // The head is either seqno 1 (partitioned CAS didn't commit)
+            // or seqno 2 (partitioned CAS committed via background retry).
+            assert!(
+                head.seqno == 1 || head.seqno == 2,
+                "head seqno should be 1 (no commit) or 2 (ambiguous commit), got {}",
+                head.seqno,
+            );
+
+            // Write from the actual head — this must succeed.
+            let next_seqno = head.seqno + 1;
+            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                key: key.to_string(),
+                expected: Some(head.seqno),
+                new: Some(ProtoVersionedData {
+                    seqno: next_seqno,
+                    data: b"after partition".to_vec(),
+                }),
+            })).await.expect("CAS should succeed after partition heals");
+            assert!(
+                resp.into_inner().committed,
+                "CAS with correct expected after partition heal should commit"
+            );
+
+            Ok(())
+        }
+    });
+    sim.run().expect("phase 2 should complete");
+}
