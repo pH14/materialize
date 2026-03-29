@@ -1060,7 +1060,22 @@ impl PersistMetashardActor {
             new_learners.insert(shard_id, learner_handle);
         }
 
-        // Phase 3: Build new routing state and swap atomically.
+        // Phase 3: Wait for all predecessor replays to complete BEFORE
+        // committing the new epoch. If any replay fails, bail out — nothing
+        // has been committed yet, CriticalSince holds are still active, and
+        // the old routing is still in place.
+        for rx in replay_done_receivers {
+            if rx.await.is_err() {
+                return Err(MetashardError::Command(
+                    "predecessor replay task died before completing; \
+                     reconfiguration aborted to preserve predecessor data"
+                        .to_string(),
+                ));
+            }
+        }
+        info!("all predecessor replays complete — committing new epoch");
+
+        // Phase 4: Build new routing state and swap atomically.
         let mut routing = self.routing.write().await;
 
         // Carry forward acceptors/learners for shards that remain.
@@ -1141,24 +1156,9 @@ impl PersistMetashardActor {
         // Persist the updated state durably.
         self.persist_state().await;
 
-        // Phase 5: Wait for all predecessor replays to complete before
-        // releasing CriticalSince holds. Without this, predecessor data could
-        // become collectible before the learner has consumed it.
-        //
-        // If any replay task panics or is aborted, the sender is dropped and
-        // we get RecvError. That is NOT safe to ignore — it means the learner
-        // never consumed its predecessors, so we must not release holds or
-        // commit the epoch.
-        for rx in replay_done_receivers {
-            if rx.await.is_err() {
-                return Err(MetashardError::Command(
-                    "predecessor replay task died before completing; \
-                     reconfiguration aborted to preserve predecessor data"
-                        .to_string(),
-                ));
-            }
-        }
-        info!("all predecessor replays complete");
+        // Phase 6: Release CriticalSince holds on retired shards.
+        // Predecessor replays were confirmed complete in Phase 3, so the
+        // holds are no longer needed.
         for mut hold in critical_holds {
             let opaque = hold.opaque().clone();
             match hold
