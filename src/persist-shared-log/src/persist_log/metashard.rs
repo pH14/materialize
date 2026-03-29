@@ -511,6 +511,58 @@ impl PersistMetashardActor {
         }
     }
 
+    /// Rebuild the routing state from the current metashard state.
+    ///
+    /// Spawns fresh acceptors and learners for every shard in the partition map
+    /// and swaps the routing state. Used during crash recovery when the
+    /// recovered partition map differs from the bootstrap topology.
+    async fn rebuild_routing_from_state(&self) {
+        let map = &self.state.partition_map;
+        let mut acceptors = BTreeMap::new();
+        let mut learners = BTreeMap::new();
+
+        for range in &map.ranges {
+            let shard_id = range.log_shard;
+            let shard_registry = MetricsRegistry::new();
+            let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
+            let learner_metrics = LearnerMetrics::register(&shard_registry);
+
+            let (acceptor_handle, _task) = PersistAcceptor::spawn(
+                AcceptorConfig::default(),
+                &self.persist_client,
+                shard_id,
+                acceptor_metrics,
+                self.state.epoch,
+            )
+            .await;
+
+            let (learner_handle, _task) = PersistLearner::spawn(
+                PersistLearnerConfig::default(),
+                &self.persist_client,
+                shard_id,
+                learner_metrics,
+            )
+            .await;
+
+            info!(%shard_id, "spawned recovered actor");
+            acceptors.insert(shard_id, acceptor_handle);
+            learners.insert(shard_id, learner_handle);
+        }
+
+        let mut routing = self.routing.write().await;
+        *routing = RoutingState {
+            partition_map: map.clone(),
+            acceptors,
+            learners,
+        };
+        drop(routing);
+        info!(
+            epoch = self.state.epoch,
+            num_shards = map.ranges.len(),
+            "rebuilt routing from recovered metashard state"
+        );
+    }
+
     /// Handle a non-reconfigure command (fast, synchronous).
     fn on_query(&self, cmd: MetashardCommand) {
         match cmd {
@@ -534,6 +586,7 @@ impl PersistMetashardActor {
     }
 
     /// Replay a predecessor shard and extract its committed head state.
+    #[allow(dead_code)] // Used for future background snapshot writing after finalization.
     ///
     /// Works on both sealed shards (frontier reaches []) and active shards
     /// (stops when the listen frontier catches up to the upper at the time
@@ -622,6 +675,7 @@ impl PersistMetashardActor {
     /// Write a combined head state as CaS proposals to a new shard, filtered
     /// by the destination range. Only entries whose `partition_key` falls within
     /// `dest_range` are written. Returns the number of entries written.
+    #[allow(dead_code)] // Kept for future background snapshot writing after finalization.
     async fn write_snapshot_entries(
         &self,
         new_shard: ShardId,
@@ -780,66 +834,19 @@ impl PersistMetashardActor {
             critical_holds.push(handle);
         }
 
-        // Phase 1: Replay all retiring predecessors BEFORE sealing.
-        // Collect combined head state from all predecessors. The CriticalSince
-        // holds ensure the data stays readable during this window.
-        let mut combined_head_state: BTreeMap<String, (u64, Vec<u8>)> = BTreeMap::new();
-        for &pred_shard in &retiring {
-            match self.replay_predecessor_head_state(pred_shard).await {
-                Ok(state) => {
-                    info!(
-                        %pred_shard,
-                        entries = state.len(),
-                        "replayed predecessor head state"
-                    );
-                    // Merge into combined state. Later predecessors overwrite
-                    // earlier ones for the same key (though this shouldn't
-                    // happen with non-overlapping ranges in practice).
-                    combined_head_state.extend(state);
-                }
-                Err(e) => {
-                    info!(
-                        %pred_shard,
-                        error = %e,
-                        "predecessor replay failed, learners will use chain replay"
-                    );
-                }
-            }
-        }
-
-        // Phase 1.5: Write snapshots to new shards (still before sealing).
+        // NOTE: We intentionally do NOT write snapshot CaS rows to new shards
+        // during the transition. The predecessor replay (spawn_with_predecessors)
+        // handles state carryforward. Writing snapshot rows here would conflict:
+        // the learner's predecessor replay builds state in memory first, then
+        // when it processes the new shard's events, the expected=None snapshot
+        // rows fail CaS evaluation (state already exists), get queued for
+        // retraction, and are eventually deleted — making the carried-forward
+        // state self-deleting.
+        //
+        // Snapshots for cold-start recovery (after old shard finalization) can
+        // be written as a separate background step once the learner is caught up.
         let mut new_acceptors = BTreeMap::new();
         let mut new_learners = BTreeMap::new();
-        let mut snapshot_success: BTreeMap<ShardId, usize> = BTreeMap::new();
-
-        for &shard_id in &added {
-            let new_range = new_map
-                .ranges
-                .iter()
-                .find(|r| r.log_shard == shard_id)
-                .expect("new shard must be in new partition map");
-
-            // Write range-filtered snapshot from the combined predecessor state.
-            let entries = if !combined_head_state.is_empty() {
-                match self
-                    .write_snapshot_entries(shard_id, new_range, &combined_head_state)
-                    .await
-                {
-                    Ok(n) => n,
-                    Err(e) => {
-                        info!(
-                            %shard_id,
-                            error = %e,
-                            "snapshot write failed"
-                        );
-                        0
-                    }
-                }
-            } else {
-                0
-            };
-            snapshot_success.insert(shard_id, entries);
-        }
 
         // Phase 2: Seal retiring log shards.
         // This happens AFTER snapshots are written, minimizing the
@@ -904,12 +911,10 @@ impl PersistMetashardActor {
             )
             .await;
 
-            let snapshot_entries = snapshot_success.get(&shard_id).copied().unwrap_or(0);
             // Always use spawn_with_predecessors when predecessors exist.
-            // The snapshot captures state at point U, but proposals between U
-            // and the seal point S are only in the old shard. The predecessor
-            // replay ensures the learner sees the complete history including
-            // the tail (U→S). Without this, those tail proposals are lost.
+            // Predecessor replay ensures the learner sees the complete history
+            // from the old shard, including any tail proposals between the
+            // snapshot point and the seal.
             let (learner_handle, _task) = if predecessors.is_empty() {
                 PersistLearner::spawn(
                     PersistLearnerConfig::default(),
@@ -922,7 +927,6 @@ impl PersistMetashardActor {
                 info!(
                     %shard_id,
                     predecessors = ?predecessors,
-                    snapshot_entries,
                     "spawning learner with predecessor chain replay"
                 );
                 PersistLearner::spawn_with_predecessors(
@@ -935,7 +939,7 @@ impl PersistMetashardActor {
                 .await
             };
 
-            info!(%shard_id, snapshot_entries, "spawned actors for new log shard");
+            info!(%shard_id, "spawned actors for new log shard");
             new_acceptors.insert(shard_id, acceptor_handle);
             new_learners.insert(shard_id, learner_handle);
         }
@@ -1051,6 +1055,22 @@ impl PersistMetashardActor {
             num_log_shards = self.state.log_shards.len(),
             "metashard actor starting"
         );
+
+        // If the recovered epoch differs from what the bootstrap routing was
+        // built with, rebuild routing from the recovered partition map. This
+        // handles the case where a reconfiguration committed in a previous run
+        // and the process restarted with stale CLI bootstrap arguments.
+        {
+            let routing_epoch = self.routing.read().await.partition_map.epoch;
+            if self.state.epoch != routing_epoch {
+                info!(
+                    recovered_epoch = self.state.epoch,
+                    bootstrap_epoch = routing_epoch,
+                    "recovered epoch differs from bootstrap — rebuilding routing"
+                );
+                self.rebuild_routing_from_state().await;
+            }
+        }
 
         // Check for a pending reconfiguration intent from a previous crash.
         // Resume the reconfiguration from the last completed phase.
