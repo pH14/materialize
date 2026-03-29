@@ -1190,10 +1190,11 @@ async fn main() {
         queue_depth,
         ..Default::default()
     };
-    let (learner_handle, _learner_task) = PersistLearner::spawn(
+    let (learner_handle, _learner_task, _replay_done) = PersistLearner::spawn(
         learner_config,
         &persist_client,
         shard_id,
+        vec![],
         learner_metrics.clone(),
     )
     .await;

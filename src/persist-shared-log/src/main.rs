@@ -206,10 +206,11 @@ async fn run(args: Args) {
         .await;
 
         let learner_config = PersistLearnerConfig::default();
-        let (learner_handle, _learner_task) = PersistLearner::spawn(
+        let (learner_handle, _learner_task, _replay_done) = PersistLearner::spawn(
             learner_config,
             &persist_client,
             shard_id,
+            vec![],
             learner_metrics,
         )
         .await;
@@ -236,24 +237,23 @@ async fn run(args: Args) {
             pending_intent: None,
         }
     };
-    let (mut metashard_actor, _metashard_handle) = PersistMetashardActor::new(
+    let metashard_shard_id = match &args.metashard_id {
+        Some(id) => id.parse().expect("invalid --metashard-id"),
+        None => {
+            let id = ShardId::new();
+            info!(%id, "generated metashard shard ID");
+            id
+        }
+    };
+    let (_metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
         metashard_state,
         256,
         persist_client,
         metrics_registry,
         routing_handle,
-    );
-
-    // If a metashard shard ID is provided, enable durable state persistence
-    // and recover any pending intents from a previous crash.
-    if let Some(ref id) = args.metashard_id {
-        let metashard_shard_id: ShardId = id.parse().expect("invalid --metashard-id");
-        metashard_actor = metashard_actor.with_durable_state(metashard_shard_id).await;
-        info!(%metashard_shard_id, "metashard durable state enabled");
-    }
-
-    let _metashard_task =
-        mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
+        metashard_shard_id,
+    )
+    .await;
 
     info!(addr = %args.listen_addr, "starting gRPC server");
     Server::builder()

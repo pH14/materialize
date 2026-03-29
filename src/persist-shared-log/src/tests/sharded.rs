@@ -323,7 +323,8 @@ async fn test_reconfiguration_split() {
         client.clone(),
         registry,
         routing_handle,
-    );
+        ShardId::new(),
+    ).await;
 
     // --- Pre-reconfiguration: write data on the single shard ---
     let key_lo = "s10000000-0000-0000-0000-000000000000"; // partition key 0x10
@@ -448,7 +449,8 @@ async fn test_reconfiguration_state_carryforward() {
         client.clone(),
         registry,
         routing_handle,
-    );
+        ShardId::new(),
+    ).await;
 
     // --- Write data before reconfiguration ---
     let key = "s30000000-0000-0000-0000-000000000000"; // partition key 0x30
@@ -555,7 +557,8 @@ async fn test_dst_workload_with_reconfiguration() {
         client.clone(),
         registry,
         routing_handle,
-    );
+        ShardId::new(),
+    ).await;
 
     // Client shard keys spread across the partition key space.
     let keys = [
@@ -794,7 +797,8 @@ async fn test_shard_ownership_invariant_after_split() {
         client.clone(),
         registry,
         routing_handle,
-    );
+        ShardId::new(),
+    ).await;
 
     // Write data across the full key range.
     let keys = [
@@ -925,7 +929,8 @@ async fn test_reconfiguration_merge() {
         client.clone(),
         registry,
         routing_handle,
-    );
+        ShardId::new(),
+    ).await;
 
     // Write data to both shards.
     let key_lo = "s20000000-0000-0000-0000-000000000000"; // 0x20 → shard_a
@@ -1008,7 +1013,8 @@ async fn test_no_silent_loss_during_reconfiguration() {
         client.clone(),
         registry,
         routing_handle,
-    );
+        ShardId::new(),
+    ).await;
 
     // Use a key that will stay in [0x00, 0x80) after the split.
     let key = "s20000000-0000-0000-0000-000000000000";
@@ -1144,8 +1150,8 @@ async fn test_restart_after_reconfiguration_preserves_state() {
         client.clone(),
         registry1,
         routing_handle1,
-    );
-    let actor1 = actor1.with_durable_state(metashard_shard).await;
+        metashard_shard,
+    ).await;
     let _task1 = mz_ore::task::spawn(|| "metashard-1", actor1.run());
 
     // Write data that will need to survive reconfiguration + restart.
@@ -1204,10 +1210,10 @@ async fn test_restart_after_reconfiguration_preserves_state() {
         client.clone(),
         registry2,
         routing_handle2,
-    );
+        metashard_shard,
+    ).await;
     // Recover from the durable metashard shard — this should restore the
     // committed partition map and rebuild routing with predecessors.
-    let actor2 = actor2.with_durable_state(metashard_shard).await;
     let _task2 = mz_ore::task::spawn(|| "metashard-2", actor2.run());
 
     // Give the recovery path time to rebuild routing and replay predecessors.
@@ -1274,8 +1280,8 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
         client.clone(),
         registry1,
         routing_handle1,
-    );
-    let actor1 = actor1.with_durable_state(metashard_shard).await;
+        metashard_shard,
+    ).await;
     let _task1 = mz_ore::task::spawn(|| "metashard-merge-1", actor1.run());
 
     // Write to shard_a and shard_b.
@@ -1327,8 +1333,8 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
         client.clone(),
         registry2,
         routing_handle2,
-    );
-    let actor2 = actor2.with_durable_state(metashard_shard).await;
+        metashard_shard,
+    ).await;
     let _task2 = mz_ore::task::spawn(|| "metashard-merge-2", actor2.run());
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

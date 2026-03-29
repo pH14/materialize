@@ -241,50 +241,34 @@ pub struct PersistMetashardActor {
     routing: Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>>,
     /// Whether a reconfiguration is currently in progress.
     reconfiguring: bool,
-    /// Optional persist shard for durable metashard state. When provided, the
-    /// partition map and reconfiguration intents are written here so they survive
-    /// process restarts. The shard uses a special convention: key
-    /// `"__metashard_epoch_{N}"` with the serialized partition map as data.
-    metashard_shard_id: Option<ShardId>,
-    /// Write handle for the metashard persist shard (if any).
-    metashard_write: Option<mz_persist_client::write::WriteHandle<OrderedKey, Proposal, u64, i64>>,
+    /// Persist shard for durable metashard state. The partition map and
+    /// reconfiguration intents are written here so they survive process
+    /// restarts. Uses in-memory persist backend in tests.
+    #[allow(dead_code)]
+    metashard_shard_id: ShardId,
+    /// Write handle for the metashard persist shard.
+    metashard_write: mz_persist_client::write::WriteHandle<OrderedKey, Proposal, u64, i64>,
 }
 
 impl PersistMetashardActor {
-    /// Create a new metashard actor.
-    pub fn new(
-        state: MetashardState,
+    /// Create a new metashard actor. Opens the durable state persist shard
+    /// eagerly and recovers any persisted state (partition map, pending intents).
+    pub async fn new(
+        mut state: MetashardState,
         queue_depth: usize,
         persist_client: PersistClient,
         metrics_registry: MetricsRegistry,
         routing: Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>>,
+        metashard_shard_id: ShardId,
     ) -> (Self, PersistMetashardHandle) {
         let (tx, rx) = mpsc::channel(queue_depth);
-        let actor = PersistMetashardActor {
-            state,
-            rx,
-            persist_client,
-            metrics_registry,
-            routing,
-            reconfiguring: false,
-            metashard_shard_id: None,
-            metashard_write: None,
-        };
-        let handle = PersistMetashardHandle::new(tx);
-        (actor, handle)
-    }
 
-    /// Configure this actor to persist its state to a persist shard.
-    /// Reads existing state from the shard on startup to recover pending
-    /// intents from a previous crash. Must be called before `run()`.
-    pub async fn with_durable_state(mut self, shard_id: ShardId) -> Self {
         let key_schema = Arc::new(OrderedKeySchema);
         let val_schema = Arc::new(ProposalSchema);
 
-        let mut write = self
-            .persist_client
+        let mut metashard_write = persist_client
             .open_writer::<OrderedKey, Proposal, u64, i64>(
-                shard_id,
+                metashard_shard_id,
                 Arc::clone(&key_schema),
                 Arc::clone(&val_schema),
                 Diagnostics::from_purpose("metashard-durable-state"),
@@ -292,16 +276,16 @@ impl PersistMetashardActor {
             .await
             .expect("open metashard persist shard writer");
 
-        // Advance past T=0 if fresh.
-        if write.upper().as_option() == Some(&0) {
-            write.advance_upper(&Antichain::from_elem(1)).await;
+        if metashard_write.upper().as_option() == Some(&0) {
+            metashard_write
+                .advance_upper(&Antichain::from_elem(1))
+                .await;
         }
 
-        // Read existing state to recover pending intents.
-        let (_, read) = self
-            .persist_client
+        // Recover persisted state (partition map, predecessors, pending intent).
+        let (_, read) = persist_client
             .open::<OrderedKey, Proposal, u64, i64>(
-                shard_id,
+                metashard_shard_id,
                 key_schema,
                 val_schema,
                 Diagnostics::from_purpose("metashard-durable-state-read"),
@@ -316,7 +300,6 @@ impl PersistMetashardActor {
             .await
             .expect("subscribe to metashard shard");
 
-        // Read the latest state entry.
         let mut latest_data: Option<String> = None;
         loop {
             let events = subscribe.fetch_next().await;
@@ -324,16 +307,18 @@ impl PersistMetashardActor {
             for event in &events {
                 match event {
                     ListenEvent::Progress(frontier) => {
-                        // Stop when we've read up to the upper.
-                        if frontier.as_option().copied() >= write.upper().as_option().copied() {
+                        if frontier.as_option().copied()
+                            >= metashard_write.upper().as_option().copied()
+                        {
                             done = true;
                         }
                     }
                     ListenEvent::Updates(updates) => {
                         for ((key, proposal), _ts, diff) in updates {
                             if *diff == 1 && key.shard == "__metashard" {
-                                latest_data =
-                                    Some(String::from_utf8_lossy(&proposal.encoded).to_string());
+                                latest_data = Some(
+                                    String::from_utf8_lossy(&proposal.encoded).to_string(),
+                                );
                             }
                         }
                     }
@@ -344,7 +329,6 @@ impl PersistMetashardActor {
             }
         }
 
-        // Parse the latest state: restore partition map, epoch, and pending intent.
         if let Some(data) = latest_data {
             let mut persisted_epoch: Option<u64> = None;
             let mut persisted_ranges: Vec<RangeAssignment> = Vec::new();
@@ -372,14 +356,12 @@ impl PersistMetashardActor {
                         }
                     }
                 } else if let Some(pred_str) = line.strip_prefix("predecessor=") {
-                    // Format: "shard_id:predecessor_shard_id"
                     if let Some((shard_str, pred_shard_str)) = pred_str.split_once(':') {
                         if let (Ok(shard), Ok(pred)) = (
                             shard_str.parse::<ShardId>(),
                             pred_shard_str.parse::<ShardId>(),
                         ) {
-                            // Store in log_shards for use during rebuild_routing_from_state.
-                            self.state
+                            state
                                 .log_shards
                                 .entry(shard)
                                 .or_insert_with(|| LogShardInfo {
@@ -394,15 +376,15 @@ impl PersistMetashardActor {
                                     predecessors: Vec::new(),
                                     has_snapshot: false,
                                 })
-                                .predecessors.push(pred);
+                                .predecessors
+                                .push(pred);
                         }
                     }
-                } else if let Some(status) = line.strip_prefix("intent_status=") {
-                    intent_status = Some(status.to_string());
+                } else if let Some(s) = line.strip_prefix("intent_status=") {
+                    intent_status = Some(s.to_string());
                 } else if let Some(epoch) = line.strip_prefix("intent_epoch=") {
                     intent_epoch = epoch.parse::<u64>().ok();
                 } else if let Some(range_str) = line.strip_prefix("intent_range=") {
-                    // Parse "lo-hi:shard_id"
                     if let Some((range_part, shard_str)) = range_str.split_once(':') {
                         if let Some((lo_str, hi_str)) = range_part.split_once('-') {
                             if let (Ok(lo), Ok(hi), Ok(shard)) = (
@@ -428,7 +410,6 @@ impl PersistMetashardActor {
                     "Committed" => IntentStatus::Committed,
                     _ => IntentStatus::Preparing,
                 };
-
                 if !intent_ranges.is_empty() {
                     let plan = ReconfigurationPlan {
                         expected_epoch: epoch.saturating_sub(1),
@@ -437,19 +418,15 @@ impl PersistMetashardActor {
                             ranges: intent_ranges,
                         },
                     };
-                    self.state.pending_intent = Some(ReconfigurationIntent {
+                    state.pending_intent = Some(ReconfigurationIntent {
                         epoch,
                         plan,
                         status,
                     });
-                    info!(
-                        epoch,
-                        "recovered pending reconfiguration intent from durable state"
-                    );
+                    info!(epoch, "recovered pending reconfiguration intent");
                 }
             }
 
-            // Restore the persisted partition map and epoch.
             if let Some(epoch) = persisted_epoch {
                 if !persisted_ranges.is_empty() {
                     let map = PartitionMap {
@@ -457,29 +434,31 @@ impl PersistMetashardActor {
                         ranges: persisted_ranges,
                     };
                     if map.validate().is_ok() {
-                        info!(
-                            epoch,
-                            num_ranges = map.ranges.len(),
-                            "restored partition map from durable state"
-                        );
-                        self.state.epoch = epoch;
-                        self.state.partition_map = map;
+                        info!(epoch, num_ranges = map.ranges.len(), "restored partition map");
+                        state.epoch = epoch;
+                        state.partition_map = map;
                     }
                 }
             }
         }
 
-        self.metashard_shard_id = Some(shard_id);
-        self.metashard_write = Some(write);
-        self
+        let actor = PersistMetashardActor {
+            state,
+            rx,
+            persist_client,
+            metrics_registry,
+            routing,
+            reconfiguring: false,
+            metashard_shard_id,
+            metashard_write,
+        };
+        let handle = PersistMetashardHandle::new(tx);
+        (actor, handle)
     }
 
-    /// Persist the current metashard state to the durable shard (if configured).
+    /// Persist the current metashard state to the durable shard.
     async fn persist_state(&mut self) {
-        let write = match self.metashard_write.as_mut() {
-            Some(w) => w,
-            None => return, // No durable shard configured.
-        };
+        let write = &mut self.metashard_write;
 
         // Serialize the full metashard state including the pending intent and
         // its ReconfigurationPlan. Format is line-delimited key=value pairs.
@@ -574,43 +553,30 @@ impl PersistMetashardActor {
             // carried-forward state (L1→L2→L4) is reconstructed on recovery.
             let predecessors = self.transitive_predecessors(shard_id);
 
-            let learner_handle = if predecessors.is_empty() {
-                let (handle, _task) = PersistLearner::spawn(
-                    PersistLearnerConfig::default(),
-                    &self.persist_client,
-                    shard_id,
-                    learner_metrics,
-                )
-                .await;
-                handle
-            } else {
+            if !predecessors.is_empty() {
                 info!(
                     %shard_id,
                     predecessors = ?predecessors,
                     "spawning recovered learner with predecessor replay"
                 );
-                let (handle, _task, replay_done_rx) =
-                    PersistLearner::spawn_with_predecessors(
-                        PersistLearnerConfig::default(),
-                        &self.persist_client,
-                        shard_id,
-                        predecessors.clone(),
-                        learner_metrics,
-                    )
-                    .await;
-                // Wait for predecessor replay to complete. If it fails, halt —
-                // serving from an empty learner would violate the carry-forward
-                // invariant. Retrying is safe because predecessor shards are
-                // sealed and immutable.
-                if replay_done_rx.await.is_err() {
-                    panic!(
-                        "predecessor replay for shard {} failed during recovery; \
-                         cannot serve without carried-forward state from {:?}",
-                        shard_id, predecessors
-                    );
-                }
-                handle
-            };
+            }
+            let (learner_handle, _task, replay_done_rx) = PersistLearner::spawn(
+                PersistLearnerConfig::default(),
+                &self.persist_client,
+                shard_id,
+                predecessors.clone(),
+                learner_metrics,
+            )
+            .await;
+            // Wait for predecessor replay. If it fails, halt — serving from
+            // an empty learner would violate the carry-forward invariant.
+            if replay_done_rx.await.is_err() {
+                panic!(
+                    "predecessor replay for shard {} failed during recovery; \
+                     cannot serve without carried-forward state from {:?}",
+                    shard_id, predecessors
+                );
+            }
 
             info!(%shard_id, "spawned recovered actor");
             acceptors.insert(shard_id, acceptor_handle);
@@ -1026,37 +992,22 @@ impl PersistMetashardActor {
             )
             .await;
 
-            // Always use spawn_with_predecessors when predecessors exist.
-            // Predecessor replay ensures the learner sees the complete history
-            // from the old shard, including any tail proposals between the
-            // snapshot point and the seal.
-            let learner_handle = if predecessors.is_empty() {
-                let (handle, _task) = PersistLearner::spawn(
-                    PersistLearnerConfig::default(),
-                    &self.persist_client,
-                    shard_id,
-                    learner_metrics,
-                )
-                .await;
-                handle
-            } else {
+            if !predecessors.is_empty() {
                 info!(
                     %shard_id,
                     predecessors = ?predecessors,
                     "spawning learner with predecessor chain replay"
                 );
-                let (handle, _task, replay_done_rx) =
-                    PersistLearner::spawn_with_predecessors(
-                        PersistLearnerConfig::default(),
-                        &self.persist_client,
-                        shard_id,
-                        predecessors,
-                        learner_metrics,
-                    )
-                    .await;
-                replay_done_receivers.push(replay_done_rx);
-                handle
-            };
+            }
+            let (learner_handle, _task, replay_done_rx) = PersistLearner::spawn(
+                PersistLearnerConfig::default(),
+                &self.persist_client,
+                shard_id,
+                predecessors,
+                learner_metrics,
+            )
+            .await;
+            replay_done_receivers.push(replay_done_rx);
 
             info!(%shard_id, "spawned actors for new log shard");
             new_acceptors.insert(shard_id, acceptor_handle);
@@ -1268,12 +1219,13 @@ impl PersistMetashardActor {
     }
 
     /// Spawn the metashard actor as a tokio task.
-    pub fn spawn(
+    pub async fn spawn(
         state: MetashardState,
         queue_depth: usize,
         persist_client: PersistClient,
         metrics_registry: MetricsRegistry,
         routing: Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>>,
+        metashard_shard_id: ShardId,
     ) -> (PersistMetashardHandle, mz_ore::task::JoinHandle<()>) {
         let (actor, handle) = Self::new(
             state,
@@ -1281,7 +1233,9 @@ impl PersistMetashardActor {
             persist_client,
             metrics_registry,
             routing,
-        );
+            metashard_shard_id,
+        )
+        .await;
         let task = mz_ore::task::spawn(|| "persist-metashard", actor.run());
         (handle, task)
     }
