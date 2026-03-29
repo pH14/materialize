@@ -599,9 +599,13 @@ impl PersistMetashardActor {
                     )
                     .await;
                 // Wait for predecessor replay to complete before proceeding.
-                // This ensures CriticalSince holds (if any) are not released
-                // before the learner has consumed predecessor data.
-                let _ = replay_done_rx.await;
+                if replay_done_rx.await.is_err() {
+                    tracing::error!(
+                        %shard_id,
+                        "predecessor replay task died during recovery; \
+                         learner may be missing carried-forward state"
+                    );
+                }
                 handle
             };
 
@@ -1140,8 +1144,19 @@ impl PersistMetashardActor {
         // Phase 5: Wait for all predecessor replays to complete before
         // releasing CriticalSince holds. Without this, predecessor data could
         // become collectible before the learner has consumed it.
+        //
+        // If any replay task panics or is aborted, the sender is dropped and
+        // we get RecvError. That is NOT safe to ignore — it means the learner
+        // never consumed its predecessors, so we must not release holds or
+        // commit the epoch.
         for rx in replay_done_receivers {
-            let _ = rx.await;
+            if rx.await.is_err() {
+                return Err(MetashardError::Command(
+                    "predecessor replay task died before completing; \
+                     reconfiguration aborted to preserve predecessor data"
+                        .to_string(),
+                ));
+            }
         }
         info!("all predecessor replays complete");
         for mut hold in critical_holds {

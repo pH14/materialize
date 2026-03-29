@@ -1315,7 +1315,7 @@ impl PersistLearner<ChannelEventSource> {
         &mut self,
         client: &PersistClient,
         predecessor_shard: ShardId,
-    ) {
+    ) -> Result<(), String> {
         info!(%predecessor_shard, "replaying sealed predecessor shard");
 
         let key_schema = Arc::new(OrderedKeySchema);
@@ -1330,13 +1330,13 @@ impl PersistLearner<ChannelEventSource> {
                 false,
             )
             .await
-            .expect("failed to open predecessor shard for replay");
+            .map_err(|e| format!("failed to open predecessor shard for replay: {e}"))?;
 
         let since = read.since().clone();
         let mut subscribe = read
             .subscribe(since)
             .await
-            .expect("subscribe to predecessor should succeed");
+            .map_err(|e| format!("subscribe to predecessor failed: {e:?}"))?;
 
         let mut events_processed: u64 = 0;
         loop {
@@ -1402,6 +1402,7 @@ impl PersistLearner<ChannelEventSource> {
             total_entries = self.state.total_entries,
             "predecessor replay complete"
         );
+        Ok(())
     }
 
     /// Opens a persist shard and spawns the learner as a tokio task.
@@ -1516,11 +1517,19 @@ impl PersistLearner<ChannelEventSource> {
 
         let client_clone = client.clone();
         let task = mz_ore::task::spawn(|| "persist-learner-with-predecessors", async move {
-            for predecessor in predecessors {
-                learner.replay_predecessor(&client_clone, predecessor).await;
+            for predecessor in &predecessors {
+                if let Err(e) = learner.replay_predecessor(&client_clone, *predecessor).await {
+                    tracing::error!(
+                        %predecessor,
+                        error = %e,
+                        "predecessor replay failed; not signaling completion"
+                    );
+                    // Don't send replay_done — the metashard will detect the
+                    // dropped sender and abort the reconfiguration.
+                    return;
+                }
             }
-            // Signal that predecessor replay is complete. The caller can now
-            // safely release CriticalSince holds.
+            // Signal that ALL predecessor replays completed successfully.
             let _ = replay_done_tx.send(());
             learner.run(upper_handle).await;
         });
