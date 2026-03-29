@@ -274,7 +274,8 @@ impl PersistMetashardActor {
     }
 
     /// Configure this actor to persist its state to a persist shard.
-    /// Must be called before `run()`.
+    /// Reads existing state from the shard on startup to recover pending
+    /// intents from a previous crash. Must be called before `run()`.
     pub async fn with_durable_state(mut self, shard_id: ShardId) -> Self {
         let key_schema = Arc::new(OrderedKeySchema);
         let val_schema = Arc::new(ProposalSchema);
@@ -283,8 +284,8 @@ impl PersistMetashardActor {
             .persist_client
             .open_writer::<OrderedKey, Proposal, u64, i64>(
                 shard_id,
-                key_schema,
-                val_schema,
+                Arc::clone(&key_schema),
+                Arc::clone(&val_schema),
                 Diagnostics::from_purpose("metashard-durable-state"),
             )
             .await
@@ -293,6 +294,113 @@ impl PersistMetashardActor {
         // Advance past T=0 if fresh.
         if write.upper().as_option() == Some(&0) {
             write.advance_upper(&Antichain::from_elem(1)).await;
+        }
+
+        // Read existing state to recover pending intents.
+        let (_, read) = self
+            .persist_client
+            .open::<OrderedKey, Proposal, u64, i64>(
+                shard_id,
+                key_schema,
+                val_schema,
+                Diagnostics::from_purpose("metashard-durable-state-read"),
+                false,
+            )
+            .await
+            .expect("open metashard persist shard reader");
+
+        let since = read.since().clone();
+        let mut subscribe = read
+            .subscribe(since)
+            .await
+            .expect("subscribe to metashard shard");
+
+        // Read the latest state entry.
+        let mut latest_data: Option<String> = None;
+        loop {
+            let events = subscribe.fetch_next().await;
+            let mut done = false;
+            for event in &events {
+                match event {
+                    ListenEvent::Progress(frontier) => {
+                        // Stop when we've read up to the upper.
+                        if frontier.as_option().copied() >= write.upper().as_option().copied() {
+                            done = true;
+                        }
+                    }
+                    ListenEvent::Updates(updates) => {
+                        for ((key, proposal), _ts, diff) in updates {
+                            if *diff == 1 && key.shard == "__metashard" {
+                                latest_data =
+                                    Some(String::from_utf8_lossy(&proposal.encoded).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+
+        // Parse the latest state to recover a pending intent.
+        if let Some(data) = latest_data {
+            let mut intent_status = None;
+            let mut intent_epoch = None;
+            let mut intent_ranges = Vec::new();
+
+            for line in data.lines() {
+                if let Some(status) = line.strip_prefix("intent_status=") {
+                    intent_status = Some(status.to_string());
+                } else if let Some(epoch) = line.strip_prefix("intent_epoch=") {
+                    intent_epoch = epoch.parse::<u64>().ok();
+                } else if let Some(range_str) = line.strip_prefix("intent_range=") {
+                    // Parse "lo-hi:shard_id"
+                    if let Some((range_part, shard_str)) = range_str.split_once(':') {
+                        if let Some((lo_str, hi_str)) = range_part.split_once('-') {
+                            if let (Ok(lo), Ok(hi), Ok(shard)) = (
+                                u8::from_str_radix(lo_str, 16),
+                                u16::from_str_radix(hi_str, 16),
+                                shard_str.parse::<ShardId>(),
+                            ) {
+                                intent_ranges.push(RangeAssignment {
+                                    lo,
+                                    hi_exclusive: hi,
+                                    log_shard: shard,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let (Some(status_str), Some(epoch)) = (intent_status, intent_epoch) {
+                let status = match status_str.as_str() {
+                    "Preparing" => IntentStatus::Preparing,
+                    "Sealed" => IntentStatus::Sealed,
+                    "Committed" => IntentStatus::Committed,
+                    _ => IntentStatus::Preparing,
+                };
+
+                if !intent_ranges.is_empty() {
+                    let plan = ReconfigurationPlan {
+                        expected_epoch: epoch.saturating_sub(1),
+                        new_partition_map: PartitionMap {
+                            epoch,
+                            ranges: intent_ranges,
+                        },
+                    };
+                    self.state.pending_intent = Some(ReconfigurationIntent {
+                        epoch,
+                        plan,
+                        status,
+                    });
+                    info!(
+                        epoch,
+                        "recovered pending reconfiguration intent from durable state"
+                    );
+                }
+            }
         }
 
         self.metashard_shard_id = Some(shard_id);
@@ -307,18 +415,28 @@ impl PersistMetashardActor {
             None => return, // No durable shard configured.
         };
 
-        // Serialize the partition map as a simple string representation.
-        // Format: "epoch={epoch};ranges={lo1}-{hi1}:{shard1},{lo2}-{hi2}:{shard2},..."
-        let mut data = format!("epoch={}", self.state.epoch);
+        // Serialize the full metashard state including the pending intent and
+        // its ReconfigurationPlan. Format is line-delimited key=value pairs.
+        let mut lines = Vec::new();
+        lines.push(format!("epoch={}", self.state.epoch));
         for r in &self.state.partition_map.ranges {
-            data.push_str(&format!(
-                ";{:02x}-{:03x}:{}",
+            lines.push(format!(
+                "range={:02x}-{:03x}:{}",
                 r.lo, r.hi_exclusive, r.log_shard
             ));
         }
         if let Some(ref intent) = self.state.pending_intent {
-            data.push_str(&format!(";intent={:?}", intent.status));
+            lines.push(format!("intent_status={:?}", intent.status));
+            lines.push(format!("intent_epoch={}", intent.epoch));
+            // Serialize the target partition map from the plan.
+            for r in &intent.plan.new_partition_map.ranges {
+                lines.push(format!(
+                    "intent_range={:02x}-{:03x}:{}",
+                    r.lo, r.hi_exclusive, r.log_shard
+                ));
+            }
         }
+        let data = lines.join("\n");
 
         let batch_number = write
             .upper()
@@ -376,30 +494,38 @@ impl PersistMetashardActor {
         }
     }
 
-    /// Replay a sealed predecessor shard and write its head state as snapshot
-    /// CaS proposals to a new shard. This makes the new shard self-contained.
+    /// Replay a predecessor shard and extract its committed head state.
     ///
-    /// Returns the number of client shard entries written.
-    async fn write_snapshot_to_new_shard(
+    /// Works on both sealed shards (frontier reaches []) and active shards
+    /// (stops when the listen frontier catches up to the upper at the time
+    /// this method was called). This allows snapshotting BEFORE the seal.
+    ///
+    /// Returns a map of client_shard_key → (seqno, data).
+    async fn replay_predecessor_head_state(
         &self,
         predecessor: ShardId,
-        new_shard: ShardId,
-    ) -> Result<usize, String> {
+    ) -> Result<BTreeMap<String, (u64, Vec<u8>)>, String> {
         let key_schema = Arc::new(OrderedKeySchema);
         let val_schema = Arc::new(ProposalSchema);
 
-        // Replay predecessor to extract head state.
-        let (_, read) = self
+        let (write_handle, read) = self
             .persist_client
             .open::<OrderedKey, Proposal, u64, i64>(
                 predecessor,
-                Arc::clone(&key_schema),
-                Arc::clone(&val_schema),
+                key_schema,
+                val_schema,
                 Diagnostics::from_purpose("metashard-snapshot-replay"),
                 false,
             )
             .await
             .map_err(|e| format!("open predecessor for snapshot: {e}"))?;
+
+        // Record the current upper — we'll read up to this point.
+        let target_upper = write_handle
+            .upper()
+            .as_option()
+            .copied()
+            .unwrap_or(u64::MAX);
 
         let since = read.since().clone();
         let mut subscribe = read
@@ -407,8 +533,6 @@ impl PersistMetashardActor {
             .await
             .map_err(|e| format!("subscribe to predecessor: {e:?}"))?;
 
-        // Build head state per client shard: key → (seqno, data).
-        // We evaluate CaS proposals in order to track only committed state.
         let mut head_state: BTreeMap<String, (u64, Vec<u8>)> = BTreeMap::new();
 
         loop {
@@ -417,14 +541,19 @@ impl PersistMetashardActor {
             for event in &events {
                 match event {
                     ListenEvent::Progress(frontier) => {
+                        // Stop if sealed (frontier=[]) or caught up to target.
                         if frontier.is_empty() {
                             done = true;
+                        } else if let Some(ts) = frontier.as_option() {
+                            if *ts >= target_upper {
+                                done = true;
+                            }
                         }
                     }
                     ListenEvent::Updates(updates) => {
                         for ((_key, proposal_data), _ts, diff) in updates {
                             if *diff != 1 {
-                                continue; // Skip retractions for head tracking.
+                                continue;
                             }
                             let proposal: ProtoLogProposal =
                                 match Message::decode(proposal_data.encoded.as_ref()) {
@@ -448,33 +577,54 @@ impl PersistMetashardActor {
             }
         }
 
-        if head_state.is_empty() {
+        Ok(head_state)
+    }
+
+    /// Write a combined head state as CaS proposals to a new shard, filtered
+    /// by the destination range. Only entries whose `partition_key` falls within
+    /// `dest_range` are written. Returns the number of entries written.
+    async fn write_snapshot_entries(
+        &self,
+        new_shard: ShardId,
+        dest_range: &RangeAssignment,
+        head_state: &BTreeMap<String, (u64, Vec<u8>)>,
+    ) -> Result<usize, String> {
+        // Filter head_state by partition key against the destination range.
+        let filtered: Vec<(&String, &(u64, Vec<u8>))> = head_state
+            .iter()
+            .filter(|(key, _)| {
+                let pk = crate::partition_key(key);
+                pk >= dest_range.lo && u16::from(pk) < dest_range.hi_exclusive
+            })
+            .collect();
+
+        if filtered.is_empty() {
             return Ok(0);
         }
 
-        // Write head state as CaS proposals to the new shard.
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
+
         let mut write = self
             .persist_client
             .open_writer::<OrderedKey, Proposal, u64, i64>(
                 new_shard,
-                Arc::clone(&key_schema),
-                Arc::clone(&val_schema),
+                key_schema,
+                val_schema,
                 Diagnostics::from_purpose("metashard-snapshot-write"),
             )
             .await
             .map_err(|e| format!("open writer for snapshot: {e}"))?;
 
-        // Advance upper past T=0 if needed.
         if write.upper().as_option() == Some(&0) {
             write.advance_upper(&Antichain::from_elem(1)).await;
         }
 
-        // Write at T=1 (T=0 is skipped per learner convention).
         let batch_number = 1u64;
         let mut updates = Vec::new();
-        for (position, (shard_key, (seqno, data))) in head_state.iter().enumerate() {
+        for (position, (shard_key, (seqno, data))) in filtered.iter().enumerate() {
             let cas = ProtoCasProposal {
-                key: shard_key.clone(),
+                key: (*shard_key).clone(),
                 expected: None,
                 new_seqno: *seqno,
                 data: data.clone(),
@@ -488,7 +638,7 @@ impl PersistMetashardActor {
             let ordered_key = OrderedKey {
                 batch_id: batch_number,
                 position: u32::try_from(position).expect("position fits u32"),
-                shard: shard_key.clone(),
+                shard: (*shard_key).clone(),
             };
             updates.push(((ordered_key, encoded), batch_number, 1i64));
         }
@@ -499,10 +649,10 @@ impl PersistMetashardActor {
             Ok(Ok(())) => {
                 info!(
                     %new_shard,
-                    entries = head_state.len(),
-                    "wrote snapshot to new shard"
+                    entries = filtered.len(),
+                    "wrote range-filtered snapshot to new shard"
                 );
-                Ok(head_state.len())
+                Ok(filtered.len())
             }
             Ok(Err(mismatch)) => Err(format!("snapshot write upper mismatch: {mismatch:?}")),
             Err(e) => Err(format!("snapshot write error: {e}")),
@@ -591,26 +741,88 @@ impl PersistMetashardActor {
             critical_holds.push(handle);
         }
 
-        // Phase 1: Seal retiring log shards.
+        // Phase 1: Replay all retiring predecessors BEFORE sealing.
+        // Collect combined head state from all predecessors. The CriticalSince
+        // holds ensure the data stays readable during this window.
+        let mut combined_head_state: BTreeMap<String, (u64, Vec<u8>)> = BTreeMap::new();
+        for &pred_shard in &retiring {
+            match self.replay_predecessor_head_state(pred_shard).await {
+                Ok(state) => {
+                    info!(
+                        %pred_shard,
+                        entries = state.len(),
+                        "replayed predecessor head state"
+                    );
+                    // Merge into combined state. Later predecessors overwrite
+                    // earlier ones for the same key (though this shouldn't
+                    // happen with non-overlapping ranges in practice).
+                    combined_head_state.extend(state);
+                }
+                Err(e) => {
+                    info!(
+                        %pred_shard,
+                        error = %e,
+                        "predecessor replay failed, learners will use chain replay"
+                    );
+                }
+            }
+        }
+
+        // Phase 1.5: Write snapshots to new shards (still before sealing).
+        let mut new_acceptors = BTreeMap::new();
+        let mut new_learners = BTreeMap::new();
+        let mut snapshot_success: BTreeMap<ShardId, usize> = BTreeMap::new();
+
+        for &shard_id in &added {
+            let new_range = new_map
+                .ranges
+                .iter()
+                .find(|r| r.log_shard == shard_id)
+                .expect("new shard must be in new partition map");
+
+            // Write range-filtered snapshot from the combined predecessor state.
+            let entries = if !combined_head_state.is_empty() {
+                match self
+                    .write_snapshot_entries(shard_id, new_range, &combined_head_state)
+                    .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        info!(
+                            %shard_id,
+                            error = %e,
+                            "snapshot write failed"
+                        );
+                        0
+                    }
+                }
+            } else {
+                0
+            };
+            snapshot_success.insert(shard_id, entries);
+        }
+
+        // Phase 2: Seal retiring log shards.
+        // This happens AFTER snapshots are written, minimizing the
+        // unavailability window. The old acceptors see the seal and return
+        // AcceptorError::Sealed; the serving layer retries with the new routing.
         for &shard_id in &retiring {
-            let key_schema = Arc::new(crate::persist_log::OrderedKeySchema);
-            let val_schema = Arc::new(crate::persist_log::ProposalSchema);
+            let key_schema = Arc::new(OrderedKeySchema);
+            let val_schema = Arc::new(ProposalSchema);
             let mut write = self
                 .persist_client
-                .open_writer::<crate::persist_log::OrderedKey, crate::persist_log::Proposal, u64, i64>(
+                .open_writer::<OrderedKey, Proposal, u64, i64>(
                     shard_id,
                     key_schema,
                     val_schema,
-                    mz_persist_client::Diagnostics::from_purpose("metashard-seal"),
+                    Diagnostics::from_purpose("metashard-seal"),
                 )
                 .await
                 .expect("open writer for sealing");
 
-            // Advance the upper to the empty antichain to seal the shard.
             write.advance_upper(&Antichain::new()).await;
             info!(%shard_id, "sealed log shard");
 
-            // Track in metashard state.
             if let Some(info) = self.state.log_shards.get_mut(&shard_id) {
                 info.status = LogShardStatus::Sealed;
                 info.epoch_sealed = Some(new_epoch);
@@ -622,12 +834,8 @@ impl PersistMetashardActor {
             intent.status = IntentStatus::Sealed;
         }
 
-        // Phase 2: Write snapshots to new shards + spawn actors.
-        let mut new_acceptors = BTreeMap::new();
-        let mut new_learners = BTreeMap::new();
-
+        // Phase 2.5: Spawn actors for new log shards.
         for &shard_id in &added {
-            // Find predecessor shard(s) for this new log shard.
             let new_range = new_map
                 .ranges
                 .iter()
@@ -644,23 +852,6 @@ impl PersistMetashardActor {
                 .filter(|s| retiring.contains(s))
                 .collect();
 
-            // Write snapshot: replay predecessor(s) and write head state to new shard.
-            let mut snapshot_entries = 0;
-            for &pred in &predecessors {
-                match self.write_snapshot_to_new_shard(pred, shard_id).await {
-                    Ok(n) => snapshot_entries += n,
-                    Err(e) => {
-                        info!(
-                            %shard_id,
-                            %pred,
-                            error = %e,
-                            "snapshot write failed, learner will use chain replay"
-                        );
-                    }
-                }
-            }
-
-            // Spawn acceptor + learner.
             let shard_registry = MetricsRegistry::new();
             let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
             let learner_metrics = LearnerMetrics::register(&shard_registry);
@@ -674,8 +865,7 @@ impl PersistMetashardActor {
             )
             .await;
 
-            // If snapshot was written, learner just replays its own shard.
-            // If snapshot failed, fall back to chain replay via predecessors.
+            let snapshot_entries = snapshot_success.get(&shard_id).copied().unwrap_or(0);
             let (learner_handle, _task) = if snapshot_entries > 0 || predecessors.is_empty() {
                 PersistLearner::spawn(
                     PersistLearnerConfig::default(),

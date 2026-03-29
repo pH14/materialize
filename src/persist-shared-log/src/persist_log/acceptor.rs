@@ -55,7 +55,7 @@ pub enum PersistAcceptorCommand {
     Append {
         proposal: Proposal,
         encoded_len: usize,
-        reply: oneshot::Sender<Result<ProtoAppendResponse, String>>,
+        reply: oneshot::Sender<Result<ProtoAppendResponse, AcceptorError>>,
     },
     /// Flush barrier: reply after all preceding proposals have been flushed.
     /// Used in tests to force deterministic flush boundaries.
@@ -109,7 +109,6 @@ impl crate::Acceptor for PersistAcceptorHandle {
         reply_rx
             .await
             .map_err(|_| AcceptorError::DroppedReply)?
-            .map_err(AcceptorError::Command)
     }
 }
 
@@ -128,7 +127,7 @@ enum PendingItem {
 struct PendingAppend {
     proposal: Proposal,
     encoded_len: usize,
-    reply: oneshot::Sender<Result<ProtoAppendResponse, String>>,
+    reply: oneshot::Sender<Result<ProtoAppendResponse, AcceptorError>>,
     received_at: tokio::time::Instant,
 }
 
@@ -335,12 +334,11 @@ async fn flush_inner(
             Some(u) => *u,
             None => {
                 // Upper is the empty antichain — the shard has been sealed.
-                let msg = "log shard sealed".to_string();
-                warn!("{}", msg);
+                warn!("log shard sealed");
                 for reply in replies {
-                    let _ = reply.send(Err(msg.clone()));
+                    let _ = reply.send(Err(AcceptorError::Sealed));
                 }
-                return Err(msg);
+                return Err("log shard sealed".to_string());
             }
         };
         // Skip T=0: listen(as_of=since) where since=[0] treats T=0 as an
@@ -415,12 +413,11 @@ async fn flush_inner(
             Ok(Err(upper_mismatch)) => {
                 // Check if the shard was sealed by someone else.
                 if upper_mismatch.current.as_option().is_none() {
-                    let msg = "log shard sealed (detected on upper mismatch)".to_string();
-                    warn!("{}", msg);
+                    warn!("log shard sealed (detected on upper mismatch)");
                     for reply in replies {
-                        let _ = reply.send(Err(msg.clone()));
+                        let _ = reply.send(Err(AcceptorError::Sealed));
                     }
-                    return Err(msg);
+                    return Err("log shard sealed".to_string());
                 }
                 // Another writer advanced the upper — retryable.
                 // WriteHandle auto-updates its cached upper on mismatch.
@@ -442,20 +439,19 @@ async fn flush_inner(
                 let msg = format!("persist internal error: {}", invalid_usage);
                 error!("{}", msg);
                 for reply in replies {
-                    let _ = reply.send(Err(msg.clone()));
+                    let _ = reply.send(Err(AcceptorError::Command(msg.clone())));
                 }
                 return Err(msg);
             }
         }
     }
 
-    let msg = "persist acceptor flush failed: retries exhausted after repeated upper mismatch"
-        .to_string();
+    let msg = "persist acceptor flush failed: retries exhausted after repeated upper mismatch";
     error!("{}", msg);
     for reply in replies {
-        let _ = reply.send(Err(msg.clone()));
+        let _ = reply.send(Err(AcceptorError::Command(msg.to_string())));
     }
-    Err(msg)
+    Err(msg.to_string())
 }
 
 // ---------------------------------------------------------------------------
