@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
-bytesize = "2.1.0"
+bytesize = "2.3.1"
 chrono = { version = "0.4.39", default-features = false, features = ["std"] }
 futures = "0.3.32"
 itertools = "0.14.0"
@@ -42,7 +42,7 @@ tracing = "0.1.44"
 uuid = { version = "1.19.0" }
 
 [dev-dependencies]
-bytesize = "2.1.0"
+bytesize = "2.3.1"
 
 [features]
 default = []

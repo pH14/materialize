@@ -19,7 +19,7 @@ axum = { version = "0.8.8", features = ["ws"] }
 axum-extra = { version = "0.12.5", features = ["typed-header"] }
 base64 = "0.22.1"
 bytes = "1.11.1"
-bytesize = "2.1.0"
+bytesize = "2.3.1"
 chrono = { version = "0.4.39", default-features = false, features = ["std"] }
 clap = { version = "4.5.23", features = ["wrap_help", "env", "derive"] }
 derivative = "2.2.0"
