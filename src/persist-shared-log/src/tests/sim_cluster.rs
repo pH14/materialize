@@ -156,6 +156,7 @@ fn sim_cluster_smoke() {
             shard_ids[0],
             acceptor_metrics,
             0,
+            None,
         )
         .await;
 
@@ -272,7 +273,7 @@ fn sim_cluster_crash_restart() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc_handle, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
             ).await;
 
             let (lrn_handle, _, _) = PersistLearner::spawn(
@@ -329,7 +330,7 @@ fn sim_cluster_crash_restart() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc_handle, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
             ).await;
 
             let (lrn_handle, _, _) = PersistLearner::spawn(
@@ -419,7 +420,7 @@ fn sim_cluster_persist_partition() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
             ).await;
             let (lrn, _, _) = PersistLearner::spawn(
                 PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
@@ -474,7 +475,7 @@ fn sim_cluster_persist_partition() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
             ).await;
             let (lrn, _, _) = PersistLearner::spawn(
                 PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
@@ -615,7 +616,7 @@ fn sim_cluster_split_with_writes() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
             ).await;
             let (lrn, _, _) = PersistLearner::spawn(
                 PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
@@ -739,7 +740,7 @@ fn sim_cluster_reconfig_with_buggify() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
             ).await;
             let (lrn, _, _) = PersistLearner::spawn(
                 PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
@@ -847,7 +848,7 @@ fn sim_cluster_split_during_persist_partition() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
             ).await;
             let (lrn, _, _) = PersistLearner::spawn(
                 PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,

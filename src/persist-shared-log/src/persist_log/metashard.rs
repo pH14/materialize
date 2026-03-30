@@ -546,6 +546,7 @@ impl PersistMetashardActor {
                 shard_id,
                 acceptor_metrics,
                 self.state.epoch,
+                None,
             )
             .await;
 
@@ -1014,6 +1015,7 @@ impl PersistMetashardActor {
                 shard_id,
                 acceptor_metrics,
                 new_epoch,
+                None,
             )
             .await;
 
@@ -1521,6 +1523,7 @@ mod tests {
             dummy_shard,
             acceptor_metrics,
             0,
+            None,
         )
         .await;
 

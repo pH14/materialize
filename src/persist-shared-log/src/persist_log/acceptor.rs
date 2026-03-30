@@ -534,6 +534,7 @@ impl PersistAcceptor {
         shard_id: ShardId,
         metrics: AcceptorMetrics,
         epoch: u64,
+        retraction_source: Option<Box<dyn crate::RetractionSource>>,
     ) -> (PersistAcceptorHandle, mz_ore::task::JoinHandle<()>) {
         let write = client
             .open_writer::<OrderedKey, Proposal, u64, i64>(
@@ -545,7 +546,10 @@ impl PersistAcceptor {
             .await
             .expect("failed to open persist shard for acceptor");
 
-        let (acceptor, write, handle) = Self::new(config, write, metrics, shard_id, epoch);
+        let (mut acceptor, write, handle) = Self::new(config, write, metrics, shard_id, epoch);
+        if let Some(source) = retraction_source {
+            acceptor.set_retraction_source(source);
+        }
         let task = mz_ore::task::spawn(|| "persist-acceptor", acceptor.run(write));
         (handle, task)
     }

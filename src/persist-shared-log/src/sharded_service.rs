@@ -34,7 +34,43 @@ use mz_persist::generated::consensus_service::{
 use mz_persist_client::ShardId;
 
 use crate::persist_log::metashard::PersistMetashardHandle;
+use crate::persist_log::{OrderedKey, Proposal};
 use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
+
+// ---------------------------------------------------------------------------
+// ShardedRetractionSource
+// ---------------------------------------------------------------------------
+
+/// Implements [`RetractionSource`] by fanning out to learner replicas and
+/// returning the first response. All replicas are deterministic, so any
+/// response is correct given the same `through_upper`.
+pub struct ShardedRetractionSource {
+    learners: Vec<crate::persist_log::learner::PersistLearnerHandle>,
+}
+
+impl ShardedRetractionSource {
+    pub fn new(learners: Vec<crate::persist_log::learner::PersistLearnerHandle>) -> Self {
+        ShardedRetractionSource { learners }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::RetractionSource for ShardedRetractionSource {
+    async fn get_retractions(
+        &self,
+        through_upper: u64,
+    ) -> Vec<(OrderedKey, Proposal)> {
+        // Try each learner replica in order. All replicas are deterministic,
+        // so any response is correct. The first success is returned.
+        for learner in &self.learners {
+            match learner.get_retractions(through_upper).await {
+                Ok(retractions) => return retractions,
+                Err(_) => continue, // Try next replica.
+            }
+        }
+        Vec::new()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RoutingState

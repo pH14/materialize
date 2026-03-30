@@ -1183,6 +1183,7 @@ async fn main() {
         shard_id,
         acceptor_metrics.clone(),
         0,
+        None,
     )
     .await;
 

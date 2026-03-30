@@ -228,24 +228,13 @@ async fn run(args: Args) {
         )).collect::<Vec<_>>()
     );
 
-    // --- Step 3: Spawn log shard actors from the partition map ---
-    let mut acceptor_handles = BTreeMap::new();
+    // --- Step 3: Spawn learners first (acceptors need learner handles for retraction source) ---
     let mut learner_handles = BTreeMap::new();
 
     for (i, range) in partition_map.ranges.iter().enumerate() {
         let shard_id = range.log_shard;
         let shard_registry = MetricsRegistry::new();
-        let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
         let learner_metrics = LearnerMetrics::register(&shard_registry);
-
-        let (acceptor_handle, _) = PersistAcceptor::spawn(
-            AcceptorConfig::default(),
-            &persist_client,
-            shard_id,
-            acceptor_metrics,
-            epoch,
-        )
-        .await;
 
         let predecessors = metashard_actor.transitive_predecessors_for(shard_id);
         let (learner_handle, _, replay_done) = PersistLearner::spawn(
@@ -260,9 +249,39 @@ async fn run(args: Args) {
             panic!("predecessor replay failed for shard {shard_id} during startup");
         }
 
-        info!(%shard_id, index = i, "log shard ready");
-        acceptor_handles.insert(shard_id, acceptor_handle);
+        info!(%shard_id, index = i, "learner ready");
         learner_handles.insert(shard_id, learner_handle);
+    }
+
+    // --- Step 3.5: Spawn acceptors with retraction sources from learners ---
+    let mut acceptor_handles = BTreeMap::new();
+
+    for range in &partition_map.ranges {
+        let shard_id = range.log_shard;
+        let shard_registry = MetricsRegistry::new();
+        let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
+
+        // Wire retraction source: learner(s) for this shard feed retractions
+        // to the acceptor via the RetractionSource trait.
+        let retraction_source: Option<Box<dyn mz_persist_shared_log::RetractionSource>> =
+            learner_handles.get(&shard_id).map(|learner| -> Box<dyn mz_persist_shared_log::RetractionSource> {
+                Box::new(mz_persist_shared_log::sharded_service::ShardedRetractionSource::new(
+                    vec![learner.clone()],
+                ))
+            });
+
+        let (acceptor_handle, _) = PersistAcceptor::spawn(
+            AcceptorConfig::default(),
+            &persist_client,
+            shard_id,
+            acceptor_metrics,
+            epoch,
+            retraction_source,
+        )
+        .await;
+
+        info!(%shard_id, "acceptor ready");
+        acceptor_handles.insert(shard_id, acceptor_handle);
     }
 
     info!(num_shards = partition_map.ranges.len(), "all log shards ready");
