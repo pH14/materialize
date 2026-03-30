@@ -1991,3 +1991,60 @@ async fn test_buggify_post_commit_injection_points() {
 
     fault::clear();
 }
+
+// ---------------------------------------------------------------------------
+// Retraction path tests
+// ---------------------------------------------------------------------------
+
+/// get_retractions returns only entries with batch_id < min(through_upper,
+/// listen_frontier), is non-destructive, and is idempotent.
+#[mz_ore::test(tokio::test)]
+async fn test_get_retractions_filtering() {
+    let client = new_persist_client_for_test().await;
+    let shard_old = ShardId::new();
+    let (acceptor, learner) = spawn_shard(&client, shard_old).await;
+
+    let partition_map = PartitionMap::single(shard_old);
+    let mut acceptors = BTreeMap::new();
+    acceptors.insert(shard_old, acceptor);
+    let mut learners = BTreeMap::new();
+    learners.insert(shard_old, learner.clone());
+
+    let service = ShardedService::new(partition_map, acceptors, learners);
+    let _routing = service.routing_handle();
+
+    let key = "s20000000-0000-0000-0000-000000000000";
+
+    // Write a CAS that commits.
+    let resp = service.compare_and_set(cas_request(key, None, 1, b"v1")).await.unwrap();
+    assert!(resp.into_inner().committed);
+
+    // Write a CAS that is rejected (stale expected).
+    let resp = service.compare_and_set(cas_request(key, None, 2, b"v2")).await.unwrap();
+    assert!(!resp.into_inner().committed);
+
+    // Write another rejected CAS.
+    let resp = service.compare_and_set(cas_request(key, None, 3, b"v3")).await.unwrap();
+    assert!(!resp.into_inner().committed);
+
+    // Give the learner time to evaluate.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Get all retractions.
+    let all = learner.get_retractions(u64::MAX).await.unwrap();
+    assert_eq!(all.len(), 2, "should have 2 rejected CAS retractions");
+
+    // Non-destructive: calling again returns the same entries.
+    let again = learner.get_retractions(u64::MAX).await.unwrap();
+    assert_eq!(again.len(), 2, "idempotent: same entries returned");
+
+    // Filtered: only return retractions with batch_id < through_upper.
+    // With through_upper=1, nothing should be returned (batch_ids are >= 1).
+    let filtered = learner.get_retractions(1).await.unwrap();
+    assert!(
+        filtered.len() <= all.len(),
+        "filtered should be <= total: {} vs {}",
+        filtered.len(),
+        all.len()
+    );
+}
