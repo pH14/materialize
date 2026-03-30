@@ -34,7 +34,7 @@ bytes = "1.11.1"
 cfg-if = "1.0.4"
 columnar = "0.12.0"
 columnation = "0.1.2"
-chrono = { version = "0.4.39", default-features = false, features = ["serde", "std"] }
+chrono = { version = "0.4.44", default-features = false, features = ["serde", "std"] }
 compact_bytes = "0.2.1"
 dec = { version = "0.4.8", features = ["serde"] }
 differential-dataflow = "0.21.1"
