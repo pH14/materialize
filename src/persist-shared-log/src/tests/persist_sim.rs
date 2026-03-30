@@ -584,9 +584,21 @@ impl PersistSimulator {
             .await
             .unwrap();
 
+        // Verify no duplicate OrderedKeys in the retraction set (each
+        // rejected proposal should appear exactly once).
+        let unique_keys: std::collections::BTreeSet<_> = retractions
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert_eq!(
+            unique_keys.len(),
+            retractions.len(),
+            "retraction set should have no duplicate OrderedKeys"
+        );
+
         self.trace.record_note(
             step,
-            format!("retraction check: {} entries pending", retractions.len()),
+            format!("retraction check: {} entries pending (all unique)", retractions.len()),
         );
     }
 }

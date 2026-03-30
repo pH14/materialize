@@ -853,16 +853,17 @@ impl PersistMetashardActor {
     /// Execute a reconfiguration.
     ///
     /// This is the core reconfiguration protocol:
-    /// 1. Validate epoch
-    /// 2. Identify new and retiring log shards
-    /// 3. Spawn new acceptors + learners
-    /// 4. Seal retiring log shards
-    /// 5. Update partition map and swap routing state
-    /// - Before sealing, new learners should subscribe to old shards and catch up
-    /// - Acquire CriticalSince on old shard at the catch-up point
-    /// - Write snapshot entries (T=0) to new shard during pre-hydration
-    /// - Write delta entries (T=1) after seal
-    /// - Release CriticalSince after delta confirmed
+    /// 0. Validate epoch, write durable intent, acquire CriticalSince holds
+    /// 2. Spawn new acceptors + learners (learners subscribe to live predecessors)
+    /// 2.5. Seal retiring log shards (predecessors become finite)
+    /// 3. Wait for predecessor replay to complete
+    /// 4. Swap routing state atomically
+    /// 5. Persist new state, release CriticalSince holds
+    ///
+    /// By spawning learners before sealing, the new learners pre-hydrate from
+    /// live predecessors, minimizing the unavailability window to just the tail
+    /// of writes between the subscribe point and the seal.
+    ///
     /// See doc/reference/05_horizontal_sharding.md Section 12 for the full protocol.
     async fn do_reconfigure(&mut self, plan: ReconfigurationPlan) -> Result<u64, MetashardError> {
         // Phase 0: Validate.
@@ -951,43 +952,12 @@ impl PersistMetashardActor {
         let mut new_learners = BTreeMap::new();
         let mut replay_done_receivers: Vec<tokio::sync::oneshot::Receiver<()>> = Vec::new();
 
-        // Phase 2: Seal retiring log shards.
-        // This happens AFTER snapshots are written, minimizing the
-        // unavailability window. The old acceptors see the seal and return
-        // AcceptorError::Sealed; the serving layer retries with the new routing.
-        for &shard_id in &retiring {
-            let key_schema = Arc::new(OrderedKeySchema);
-            let val_schema = Arc::new(ProposalSchema);
-            let mut write = self
-                .persist_client
-                .open_writer::<OrderedKey, Proposal, u64, i64>(
-                    shard_id,
-                    key_schema,
-                    val_schema,
-                    Diagnostics::from_purpose("metashard-seal"),
-                )
-                .await
-                .expect("open writer for sealing");
-
-            write.advance_upper(&Antichain::new()).await;
-            info!(%shard_id, "sealed log shard");
-
-            if let Some(info) = self.state.log_shards.get_mut(&shard_id) {
-                info.status = LogShardStatus::Sealed;
-                info.epoch_sealed = Some(new_epoch);
-            }
-        }
-
-        // Update intent: sealed.
-        if let Some(ref mut intent) = self.state.pending_intent {
-            intent.status = IntentStatus::Sealed;
-        }
-
-        // BUGGIFY: crash after seal but before spawning new actors.
-        crate::fault::maybe_fail("after_seal")
-            .map_err(MetashardError::Command)?;
-
-        // Phase 2.5: Spawn actors for new log shards.
+        // Phase 2: Spawn actors for new log shards BEFORE sealing.
+        //
+        // New learners subscribe to live (unsealed) predecessors and start
+        // catching up in real-time. This pre-hydration means they're nearly
+        // current by the time we seal, minimizing the unavailability window
+        // to just the tail of writes between subscribe and seal.
         for &shard_id in &added {
             let new_range = new_map
                 .ranges
@@ -1041,10 +1011,48 @@ impl PersistMetashardActor {
             new_learners.insert(shard_id, learner_handle);
         }
 
-        // BUGGIFY: crash after spawning new actors but before waiting for
-        // predecessor replay. Actors are running but replay hasn't been
-        // confirmed. On recovery, fresh actors are spawned and replay restarts.
+        // BUGGIFY: crash after spawning new actors but before seal.
+        // Actors are running and replaying live predecessors. On recovery,
+        // fresh actors are spawned and replay restarts.
         crate::fault::maybe_fail("after_actor_spawn")
+            .map_err(MetashardError::Command)?;
+
+        // Phase 2.5: Seal retiring log shards.
+        //
+        // The new learners are already subscribed and catching up. Sealing
+        // makes each predecessor finite, so replay_predecessor sees
+        // frontier.is_empty() and completes. The unavailability window is
+        // only the time to process the tail after the subscribe point.
+        for &shard_id in &retiring {
+            let key_schema = Arc::new(OrderedKeySchema);
+            let val_schema = Arc::new(ProposalSchema);
+            let mut write = self
+                .persist_client
+                .open_writer::<OrderedKey, Proposal, u64, i64>(
+                    shard_id,
+                    key_schema,
+                    val_schema,
+                    Diagnostics::from_purpose("metashard-seal"),
+                )
+                .await
+                .expect("open writer for sealing");
+
+            write.advance_upper(&Antichain::new()).await;
+            info!(%shard_id, "sealed log shard");
+
+            if let Some(info) = self.state.log_shards.get_mut(&shard_id) {
+                info.status = LogShardStatus::Sealed;
+                info.epoch_sealed = Some(new_epoch);
+            }
+        }
+
+        // Update intent: sealed.
+        if let Some(ref mut intent) = self.state.pending_intent {
+            intent.status = IntentStatus::Sealed;
+        }
+
+        // BUGGIFY: crash after seal but before waiting for predecessor replay.
+        crate::fault::maybe_fail("after_seal")
             .map_err(MetashardError::Command)?;
 
         // Phase 3: Wait for all predecessor replays to complete BEFORE

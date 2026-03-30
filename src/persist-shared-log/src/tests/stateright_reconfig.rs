@@ -350,18 +350,32 @@ struct ProtocolState {
     /// Whether a reconfiguration has been started (limits to 1).
     started_reconfig: bool,
 
+    // --- Retraction state ---
+
+    /// Pending retractions per shard: unique retraction IDs.
+    /// Each rejected write generates a unique ID (monotonic counter).
+    pending_retractions: BTreeMap<u8, BTreeSet<u16>>,
+    /// Next retraction ID (monotonic, unique across all shards).
+    next_retraction_id: u16,
+    /// Number of retraction polls that have happened (bounded).
+    retraction_polls: u8,
+
     // --- Ghost state (for property checking, not part of system) ---
 
     /// All (client_shard, seqno) pairs the client has seen committed.
     /// Used to verify RC2: no committed write is lost.
     committed_writes: BTreeSet<(usize, u8)>,
+    /// All retraction IDs that have been flushed by the acceptor.
+    retracted: BTreeSet<u16>,
 }
 
 /// Actions in the protocol model.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum ProtocolAction {
-    /// Client writes to the active shard for this client shard.
+    /// Client writes to the active shard for this client shard (committed).
     Write { cs: usize },
+    /// Client writes a stale CaS that is rejected, producing a pending retraction.
+    StaleWrite { cs: usize },
     /// Begin reconfiguration: validate plan, persist intent.
     BeginReconfig,
     /// Acquire CriticalSince holds on retiring shards.
@@ -379,6 +393,9 @@ enum ProtocolAction {
     PersistCommit,
     /// Release CriticalSince holds.
     ReleaseHolds,
+    /// Acceptor polls learner for pending retractions (every Nth flush).
+    /// The acceptor includes them as -1 diffs in its next flush.
+    PollRetractions { shard: u8 },
     /// Crash and recover. Resets volatile state, recovers from durable.
     Crash,
 }
@@ -454,7 +471,11 @@ impl Model for ProtocolModel {
                     next_shard: 1,
                     crashes: 0,
                     started_reconfig: false,
+                    pending_retractions: BTreeMap::new(),
+                    next_retraction_id: 0,
+                    retraction_polls: 0,
                     committed_writes: BTreeSet::new(),
+                    retracted: BTreeSet::new(),
                 }]
             }
             Scenario::Merge => {
@@ -476,7 +497,11 @@ impl Model for ProtocolModel {
                     next_shard: 2,
                     crashes: 0,
                     started_reconfig: false,
+                    pending_retractions: BTreeMap::new(),
+                    next_retraction_id: 0,
+                    retraction_polls: 0,
                     committed_writes: BTreeSet::new(),
+                    retracted: BTreeSet::new(),
                 }]
             }
         }
@@ -490,6 +515,26 @@ impl Model for ProtocolModel {
             if let Some(shard) = active_shard_for(&state.map, &state.sealed, cs) {
                 if state.data[&shard][cs] < MAX_SEQ {
                     actions.push(ProtocolAction::Write { cs });
+                    // A stale write is also possible (rejected CaS → retraction).
+                    // Bounded to prevent unbounded state space.
+                    if state.data[&shard][cs] > 0 && state.next_retraction_id < 3 {
+                        actions.push(ProtocolAction::StaleWrite { cs });
+                    }
+                }
+            }
+        }
+
+        // --- Retraction polling ---
+        // Available when any active shard has pending retractions.
+        // Bounded to limit state space.
+        if state.retraction_polls < 2 {
+            for &(_, _, shard) in &state.map {
+                if !state.sealed.contains(&shard) {
+                    if let Some(pending) = state.pending_retractions.get(&shard) {
+                        if !pending.is_empty() {
+                            actions.push(ProtocolAction::PollRetractions { shard });
+                        }
+                    }
                 }
             }
         }
@@ -592,6 +637,38 @@ impl Model for ProtocolModel {
                 let entry = s.data.get_mut(&shard).expect("shard must have data entry");
                 entry[cs] += 1;
                 s.committed_writes.insert((cs, entry[cs]));
+            }
+
+            ProtocolAction::StaleWrite { cs } => {
+                // A rejected CaS: the proposal is appended to the log but
+                // the learner evaluates it as a no-op. It becomes a pending
+                // retraction with a unique ID.
+                let shard = active_shard_for(&s.map, &s.sealed, cs)
+                    .expect("StaleWrite requires active shard");
+                let retraction_id = s.next_retraction_id;
+                s.next_retraction_id += 1;
+                s.pending_retractions
+                    .entry(shard)
+                    .or_default()
+                    .insert(retraction_id);
+            }
+
+            ProtocolAction::PollRetractions { shard } => {
+                // The acceptor polls the learner for pending retractions and
+                // includes them as -1 diffs in its next flush. The pending
+                // retractions are cleared (the learner will see the -1 diffs
+                // arrive via subscription and prune them).
+                if let Some(pending) = s.pending_retractions.remove(&shard) {
+                    for id in &pending {
+                        // Verify no double retraction (no negative multiplicity).
+                        assert!(
+                            s.retracted.insert(*id),
+                            "double retraction: shard={}, id={}",
+                            shard, id,
+                        );
+                    }
+                }
+                s.retraction_polls += 1;
             }
 
             ProtocolAction::BeginReconfig => {
@@ -833,6 +910,26 @@ impl Model for ProtocolModel {
                         && state.started_reconfig
                         && !state.committed_writes.is_empty()
                 },
+            ),
+            // No negative multiplicity: a retraction can only happen once
+            // per (shard, cs, seq) triple. The assert! in the PollRetractions
+            // transition enforces this structurally, but we also check it as
+            // a property for clarity.
+            Property::<Self>::always("no double retraction", |_, state| {
+                // A pending retraction must NOT already be in the retracted set.
+                for (_, pending) in &state.pending_retractions {
+                    for id in pending {
+                        if state.retracted.contains(id) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }),
+            // Reachability: retractions actually happen.
+            Property::<Self>::sometimes(
+                "retractions are polled",
+                |_, state| !state.retracted.is_empty(),
             ),
         ]
     }

@@ -155,6 +155,17 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
         }
     }
 
+    /// Create a service that shares an existing routing state Arc.
+    ///
+    /// Use this when the routing state is also held by the metashard actor,
+    /// so that reconfiguration swaps are visible to the service.
+    pub fn from_routing(routing: Arc<RwLock<RoutingState<A, L>>>) -> Self {
+        ShardedService {
+            routing,
+            metashard: None,
+        }
+    }
+
     /// Get a handle to the routing state for external updates (e.g., from the
     /// metashard actor during reconfiguration).
     pub fn routing_handle(&self) -> Arc<RwLock<RoutingState<A, L>>> {
@@ -288,11 +299,11 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
                         .await?;
                     return Ok(tonic::Response::new(result));
                 }
-                Err(crate::AcceptorError::Sealed) => {
+                Err(crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown) => {
                     debug!(
                         key = %req.key,
                         attempt,
-                        "acceptor sealed, refreshing routing and retrying"
+                        "acceptor sealed/shutdown, refreshing routing and retrying"
                     );
                     // Brief yield to let the routing swap propagate.
                     tokio::task::yield_now().await;
@@ -347,11 +358,11 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
                         .await?;
                     return Ok(tonic::Response::new(result));
                 }
-                Err(crate::AcceptorError::Sealed) => {
+                Err(crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown) => {
                     debug!(
                         key = %req.key,
                         attempt,
-                        "acceptor sealed during truncate, refreshing routing"
+                        "acceptor sealed/shutdown during truncate, refreshing routing"
                     );
                     tokio::task::yield_now().await;
                     continue;

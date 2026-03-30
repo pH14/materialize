@@ -286,23 +286,19 @@ async fn run(args: Args) {
 
     info!(num_shards = partition_map.ranges.len(), "all log shards ready");
 
-    // --- Step 4: Build ShardedService and populate routing ---
-    let service = ShardedService::new(
-        partition_map.clone(),
-        acceptor_handles,
-        learner_handles,
-    );
-    // Replace the empty routing with the real one.
+    // --- Step 4: Populate shared routing and build ShardedService ---
+    // The metashard actor already holds a clone of `empty_routing`. Populate it
+    // with the real acceptor/learner handles and then create the service from
+    // the *same* Arc so that reconfiguration swaps are visible to the service.
     {
-        let real = service.routing_handle();
-        let real_state = real.read().await;
-        let mut empty = empty_routing.write().await;
-        *empty = RoutingState::new(
-            real_state.partition_map.clone(),
-            real_state.acceptors.clone(),
-            real_state.learners.clone(),
+        let mut routing = empty_routing.write().await;
+        *routing = RoutingState::new(
+            partition_map.clone(),
+            acceptor_handles,
+            learner_handles,
         );
     }
+    let service = ShardedService::from_routing(empty_routing);
 
     // --- Step 5: Start metashard actor + gRPC server ---
     let _metashard_task = mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
