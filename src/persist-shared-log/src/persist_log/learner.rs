@@ -51,7 +51,7 @@ use bytes::Bytes;
 use prost::Message;
 use timely::progress::Antichain;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use mz_ore::cast::CastFrom;
 use mz_persist::generated::consensus_service::{
@@ -1242,132 +1242,23 @@ impl<E: EventSource> PersistLearner<E> {
 }
 
 impl PersistLearner<ChannelEventSource> {
-    /// Replay a sealed predecessor shard into this learner's StateMachine.
-    ///
-    /// Subscribes to the predecessor, processes all events to completion
-    /// (frontier = []), and returns. Only updates the global StateMachine —
-    /// results and retractions for the predecessor shard are discarded since
-    /// the predecessor is sealed and will never serve result queries.
-    async fn replay_predecessor(
-        &mut self,
-        client: &PersistClient,
-        predecessor_shard: ShardId,
-    ) -> Result<(), String> {
-        info!(%predecessor_shard, "replaying sealed predecessor shard");
-
-        let key_schema = Arc::new(OrderedKeySchema);
-        let val_schema = Arc::new(ProposalSchema);
-
-        let (_, read) = client
-            .open::<OrderedKey, Proposal, u64, i64>(
-                predecessor_shard,
-                key_schema,
-                val_schema,
-                Diagnostics::from_purpose("persist-shared-log-predecessor-replay"),
-                false,
-            )
-            .await
-            .map_err(|e| format!("failed to open predecessor shard for replay: {e}"))?;
-
-        let since = read.since().clone();
-        let mut subscribe = read
-            .subscribe(since)
-            .await
-            .map_err(|e| format!("subscribe to predecessor failed: {e:?}"))?;
-
-        let mut events_processed: u64 = 0;
-        loop {
-            let events = subscribe
-                .fetch_next()
-                .await;
-
-            let mut done = false;
-            for event in &events {
-                match event {
-                    ListenEvent::Progress(frontier) => {
-                        if frontier.is_empty() {
-                            done = true;
-                        }
-                    }
-                    ListenEvent::Updates(updates) => {
-                        // Apply to StateMachine only (not LogShardState).
-                        for ((key, proposal_data), _ts, diff) in updates {
-                            if *diff == 1 {
-                                self.state.live_keys.insert(key.clone());
-                                let proposal: ProtoLogProposal =
-                                    match Message::decode(proposal_data.encoded.as_ref()) {
-                                        Ok(p) => p,
-                                        Err(_) => continue,
-                                    };
-                                match proposal.op {
-                                    Some(proto_log_proposal::Op::Cas(cas)) => {
-                                        let (_, retraction) = self.state.apply_cas(
-                                            cas,
-                                            key.clone(),
-                                            proposal_data.clone(),
-                                        );
-                                        // Discard retraction — predecessor is sealed.
-                                        let _ = retraction;
-                                    }
-                                    Some(proto_log_proposal::Op::Truncate(trunc)) => {
-                                        let (_, _retractions) = self.state.apply_truncate(
-                                            &trunc,
-                                            key.clone(),
-                                            proposal_data.clone(),
-                                        );
-                                    }
-                                    None => {}
-                                }
-                            } else {
-                                debug_assert_eq!(*diff, -1);
-                                self.state.apply_retraction(key);
-                            }
-                            events_processed += 1;
-                        }
-                    }
-                }
-            }
-
-            if done {
-                break;
-            }
-        }
-
-        // BUGGIFY: fail during predecessor replay. This simulates a crash or
-        // error partway through replay. The caller (metashard) detects the
-        // failure via the replay_done oneshot and aborts the reconfiguration.
-        crate::fault::maybe_fail("during_predecessor_replay")
-            .map_err(|e| format!("predecessor replay interrupted: {e}"))?;
-
-        info!(
-            %predecessor_shard,
-            events_processed,
-            total_entries = self.state.total_entries,
-            "predecessor replay complete"
-        );
-        Ok(())
-    }
-
     /// Opens a persist shard and spawns the learner as a tokio task.
     ///
-    /// If `predecessors` is non-empty, the learner replays those sealed shards
-    /// before entering its normal event loop (chain replay for state
-    /// carryforward). Returns a `replay_done` receiver that signals when
-    /// predecessor replay is complete — callers MUST await it before releasing
-    /// any CriticalSince holds on predecessor shards.
-    ///
-    /// If `predecessors` is empty, the `replay_done` receiver fires immediately.
+    /// The learner subscribes to its own shard and processes events. It does
+    /// NOT read predecessor shards — the acceptor is responsible for writing
+    /// predecessor state into the shard (batch_id=1 bulk snapshot, batch_id=2
+    /// delta snapshot) before accepting regular traffic. The learner just sees
+    /// those entries via its subscribe and applies CaS/truncate semantics.
     pub async fn spawn(
         config: PersistLearnerConfig,
         client: &PersistClient,
         shard_id: ShardId,
-        predecessors: Vec<ShardId>,
         metrics: LearnerMetrics,
-    ) -> (PersistLearnerHandle, mz_ore::task::JoinHandle<()>, oneshot::Receiver<()>) {
+    ) -> (PersistLearnerHandle, mz_ore::task::JoinHandle<()>) {
         let key_schema = Arc::new(OrderedKeySchema);
         let val_schema = Arc::new(ProposalSchema);
 
-        let (mut upper_handle, read) = client
+        let (upper_handle, read) = client
             .open::<OrderedKey, Proposal, u64, i64>(
                 shard_id,
                 Arc::clone(&key_schema),
@@ -1378,11 +1269,10 @@ impl PersistLearner<ChannelEventSource> {
             .await
             .expect("failed to open persist shard for learner");
 
-        // Advance upper past T=0 if this is a fresh shard, so that
-        // subscribe's snapshot doesn't block waiting for data.
-        if upper_handle.upper().as_option() == Some(&0) {
-            upper_handle.advance_upper(&Antichain::from_elem(1)).await;
-        }
+        // NOTE: We do NOT advance upper past T=0 here. The acceptor always
+        // writes setup batches at batch_id=1 and batch_id=2 (even when empty),
+        // which advances upper. The learner's subscribe unblocks when the
+        // acceptor writes batch_id=1.
 
         let since = read.since().clone();
         let subscribe = read
@@ -1390,26 +1280,13 @@ impl PersistLearner<ChannelEventSource> {
             .await
             .expect("subscribe should succeed");
 
-        let (mut learner, handle) = Self::new(config, subscribe, metrics);
+        let (learner, handle) = Self::new(config, subscribe, metrics);
 
-        let (replay_done_tx, replay_done_rx) = oneshot::channel();
-        let client_clone = client.clone();
         let task = mz_ore::task::spawn(|| "persist-learner", async move {
-            for predecessor in &predecessors {
-                if let Err(e) = learner.replay_predecessor(&client_clone, *predecessor).await {
-                    tracing::error!(
-                        %predecessor,
-                        error = %e,
-                        "predecessor replay failed; not signaling completion"
-                    );
-                    return;
-                }
-            }
-            let _ = replay_done_tx.send(());
             learner.run(upper_handle).await;
         });
 
-        (handle, task, replay_done_rx)
+        (handle, task)
     }
 
 }

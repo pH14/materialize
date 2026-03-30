@@ -291,13 +291,17 @@ enum Phase {
     IntentPersisted,
     /// CriticalSince holds acquired on retiring shards.
     HoldsAcquired,
+    /// Bulk snapshot writing in progress. Some (new_shard, predecessor) pairs
+    /// have been snapshot but not all. Crash clears progress, requiring re-write.
+    SnapshotWriting,
+    /// All bulk snapshots (batch_id=1) written. Metashard can now seal.
+    SnapshotsWritten,
     /// Retiring shards sealed (upper = []). This is durable in the log shards.
     Sealed,
-    /// Replay in progress. Some (new_shard, predecessor) pairs have been
-    /// replayed but not all. Crash here clears `replayed`, requiring re-replay.
-    Replaying,
-    /// All new shards have replayed all predecessor data.
-    Replayed,
+    /// Delta snapshot writing in progress.
+    DeltaWriting,
+    /// All delta snapshots (batch_id=2) written. Can now swap routing.
+    DeltasWritten,
     /// Routing swapped to new shards. The in-memory map and epoch have been
     /// updated, but durable_intent still exists and the durable epoch/map
     /// have NOT been updated. A crash here recovers from the durable state
@@ -338,8 +342,10 @@ struct ProtocolState {
     phase: Phase,
     /// CriticalSince holds (prevent compaction of sealed shards during replay).
     holds: BTreeSet<u8>,
-    /// (new_shard, predecessor) pairs that have completed replay.
-    replayed: BTreeSet<(u8, u8)>,
+    /// (new_shard, predecessor) pairs that have completed bulk snapshot (batch_id=1).
+    bulk_snapshots: BTreeSet<(u8, u8)>,
+    /// (new_shard, predecessor) pairs that have completed delta snapshot (batch_id=2).
+    delta_snapshots: BTreeSet<(u8, u8)>,
 
     // --- Bookkeeping ---
 
@@ -380,11 +386,14 @@ enum ProtocolAction {
     BeginReconfig,
     /// Acquire CriticalSince holds on retiring shards.
     AcquireHolds,
-    /// Seal retiring log shards.
+    /// Acceptor writes bulk snapshot of one predecessor into one new shard
+    /// at batch_id=1. Available BEFORE seal (while predecessor is still live).
+    WriteBulkSnapshot { new_shard: u8, predecessor: u8 },
+    /// Seal retiring log shards. Available after all bulk snapshots written.
     Seal,
-    /// Replay one predecessor shard into one new shard. Per-predecessor
-    /// granularity so crash-during-partial-replay is a modeled state.
-    ReplayPredecessor { new_shard: u8, predecessor: u8 },
+    /// Acceptor writes delta snapshot of one predecessor into one new shard
+    /// at batch_id=2. Available AFTER seal (predecessor frontier = []).
+    WriteDeltaSnapshot { new_shard: u8, predecessor: u8 },
     /// Swap routing to new partition map. In-memory map/epoch updated,
     /// intent cleared in memory but NOT yet durably persisted.
     SwapRouting,
@@ -447,6 +456,29 @@ impl ProtocolModel {
     }
 }
 
+/// Check if all overlapping (new_shard, predecessor) pairs are present in `done`.
+fn all_predecessor_pairs_done(
+    plan: &Plan,
+    old_map: &[(u8, u16, u8)],
+    done: &BTreeSet<(u8, u8)>,
+) -> bool {
+    plan.new_shards.iter().all(|&ns| {
+        let new_r = plan.new_map.iter().find(|&&(_, _, sid)| sid == ns);
+        plan.retiring.iter().all(|&pred| {
+            let pred_r = old_map.iter().find(|&&(_, _, sid)| sid == pred);
+            match (new_r, pred_r) {
+                (Some(nr), Some(pr)) => {
+                    let overlaps = (0..NUM_CS).any(|cs| {
+                        range_covers(nr.0, nr.1, cs) && range_covers(pr.0, pr.1, cs)
+                    });
+                    !overlaps || done.contains(&(ns, pred))
+                }
+                _ => true,
+            }
+        })
+    })
+}
+
 impl Model for ProtocolModel {
     type State = ProtocolState;
     type Action = ProtocolAction;
@@ -467,7 +499,8 @@ impl Model for ProtocolModel {
                     durable_intent: None,
                     phase: Phase::Idle,
                     holds: BTreeSet::new(),
-                    replayed: BTreeSet::new(),
+                    bulk_snapshots: BTreeSet::new(),
+                    delta_snapshots: BTreeSet::new(),
                     next_shard: 1,
                     crashes: 0,
                     started_reconfig: false,
@@ -493,7 +526,8 @@ impl Model for ProtocolModel {
                     durable_intent: None,
                     phase: Phase::Idle,
                     holds: BTreeSet::new(),
-                    replayed: BTreeSet::new(),
+                    bulk_snapshots: BTreeSet::new(),
+                    delta_snapshots: BTreeSet::new(),
                     next_shard: 2,
                     crashes: 0,
                     started_reconfig: false,
@@ -555,50 +589,64 @@ impl Model for ProtocolModel {
             Phase::IntentPersisted => {
                 actions.push(ProtocolAction::AcquireHolds);
             }
-            Phase::HoldsAcquired => {
-                actions.push(ProtocolAction::Seal);
-            }
-            Phase::Sealed | Phase::Replaying => {
-                // Offer per-predecessor replay actions for any (new_shard,
-                // predecessor) pair that hasn't been replayed yet.
+            Phase::HoldsAcquired | Phase::SnapshotWriting => {
+                // Acceptor writes bulk snapshot (batch_id=1) BEFORE seal.
+                // Per-predecessor granularity so crash-during-partial-snapshot
+                // is a modeled state.
                 if let Some(plan) = &state.durable_intent {
                     let old_map = &state.durable_map;
-                    let mut any_remaining = false;
                     for &new_shard in &plan.new_shards {
-                        let new_range = plan
-                            .new_map
-                            .iter()
-                            .find(|&&(_, _, sid)| sid == new_shard);
+                        let new_range = plan.new_map.iter().find(|&&(_, _, sid)| sid == new_shard);
                         if let Some(new_range) = new_range {
                             for &pred in &plan.retiring {
-                                let pred_range = old_map
-                                    .iter()
-                                    .find(|&&(_, _, sid)| sid == pred);
+                                let pred_range = old_map.iter().find(|&&(_, _, sid)| sid == pred);
                                 if let Some(pred_range) = pred_range {
-                                    // Check overlap: ranges must share client shards.
                                     let overlaps = (0..NUM_CS).any(|cs| {
                                         range_covers(new_range.0, new_range.1, cs)
                                             && range_covers(pred_range.0, pred_range.1, cs)
                                     });
-                                    if overlaps && !state.replayed.contains(&(new_shard, pred)) {
-                                        actions.push(ProtocolAction::ReplayPredecessor {
+                                    if overlaps && !state.bulk_snapshots.contains(&(new_shard, pred)) {
+                                        actions.push(ProtocolAction::WriteBulkSnapshot {
                                             new_shard,
                                             predecessor: pred,
                                         });
-                                        any_remaining = true;
                                     }
                                 }
                             }
                         }
                     }
-                    if !any_remaining && state.phase == Phase::Replaying {
-                        // All predecessors replayed — no more replay actions,
-                        // but SwapRouting becomes available via Replayed phase.
-                        // Transition happens in next_state for the last replay.
+                }
+            }
+            Phase::SnapshotsWritten => {
+                actions.push(ProtocolAction::Seal);
+            }
+            Phase::Sealed | Phase::DeltaWriting => {
+                // Acceptor writes delta snapshot (batch_id=2) AFTER seal.
+                if let Some(plan) = &state.durable_intent {
+                    let old_map = &state.durable_map;
+                    for &new_shard in &plan.new_shards {
+                        let new_range = plan.new_map.iter().find(|&&(_, _, sid)| sid == new_shard);
+                        if let Some(new_range) = new_range {
+                            for &pred in &plan.retiring {
+                                let pred_range = old_map.iter().find(|&&(_, _, sid)| sid == pred);
+                                if let Some(pred_range) = pred_range {
+                                    let overlaps = (0..NUM_CS).any(|cs| {
+                                        range_covers(new_range.0, new_range.1, cs)
+                                            && range_covers(pred_range.0, pred_range.1, cs)
+                                    });
+                                    if overlaps && !state.delta_snapshots.contains(&(new_shard, pred)) {
+                                        actions.push(ProtocolAction::WriteDeltaSnapshot {
+                                            new_shard,
+                                            predecessor: pred,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-            Phase::Replayed => {
+            Phase::DeltasWritten => {
                 actions.push(ProtocolAction::SwapRouting);
             }
             Phase::RoutingSwapped => {
@@ -615,9 +663,11 @@ impl Model for ProtocolModel {
             match state.phase {
                 Phase::IntentPersisted
                 | Phase::HoldsAcquired
+                | Phase::SnapshotWriting
+                | Phase::SnapshotsWritten
                 | Phase::Sealed
-                | Phase::Replaying
-                | Phase::Replayed
+                | Phase::DeltaWriting
+                | Phase::DeltasWritten
                 | Phase::RoutingSwapped
                 | Phase::DurableCommitted => {
                     actions.push(ProtocolAction::Crash);
@@ -692,30 +742,16 @@ impl Model for ProtocolModel {
                 s.phase = Phase::HoldsAcquired;
             }
 
-            ProtocolAction::Seal => {
-                let plan = s.durable_intent.as_ref().expect("must have intent");
-                for &shard in &plan.retiring {
-                    s.sealed.insert(shard);
-                }
-                s.phase = Phase::Sealed;
-            }
-
-            ProtocolAction::ReplayPredecessor {
+            ProtocolAction::WriteBulkSnapshot {
                 new_shard,
                 predecessor,
             } => {
                 let plan = s.durable_intent.as_ref().expect("must have intent").clone();
-                let new_range = plan
-                    .new_map
-                    .iter()
-                    .find(|&&(_, _, sid)| sid == new_shard)
+                let new_range = plan.new_map.iter().find(|&&(_, _, sid)| sid == new_shard)
                     .expect("new shard must be in new map");
-                let pred_range = state
-                    .durable_map
-                    .iter()
-                    .find(|&&(_, _, sid)| sid == predecessor)
+                let pred_range = state.durable_map.iter().find(|&&(_, _, sid)| sid == predecessor)
                     .expect("predecessor must be in old map");
-                // Copy each client shard that both ranges cover.
+                // Copy each client shard that both ranges cover (idempotent max).
                 for cs in 0..NUM_CS {
                     if range_covers(new_range.0, new_range.1, cs)
                         && range_covers(pred_range.0, pred_range.1, cs)
@@ -725,35 +761,52 @@ impl Model for ProtocolModel {
                         entry[cs] = entry[cs].max(pred_seq);
                     }
                 }
-                s.replayed.insert((new_shard, predecessor));
+                s.bulk_snapshots.insert((new_shard, predecessor));
 
-                // Check if all (new_shard, predecessor) pairs are replayed.
-                let all_done = plan.new_shards.iter().all(|&ns| {
-                    let new_r = plan
-                        .new_map
-                        .iter()
-                        .find(|&&(_, _, sid)| sid == ns);
-                    plan.retiring.iter().all(|&pred| {
-                        let pred_r = state
-                            .durable_map
-                            .iter()
-                            .find(|&&(_, _, sid)| sid == pred);
-                        match (new_r, pred_r) {
-                            (Some(nr), Some(pr)) => {
-                                let overlaps = (0..NUM_CS).any(|cs| {
-                                    range_covers(nr.0, nr.1, cs)
-                                        && range_covers(pr.0, pr.1, cs)
-                                });
-                                !overlaps || s.replayed.contains(&(ns, pred))
-                            }
-                            _ => true,
-                        }
-                    })
-                });
+                // Check if all bulk snapshots are written.
+                let all_done = all_predecessor_pairs_done(&plan, &state.durable_map, &s.bulk_snapshots);
                 s.phase = if all_done {
-                    Phase::Replayed
+                    Phase::SnapshotsWritten
                 } else {
-                    Phase::Replaying
+                    Phase::SnapshotWriting
+                };
+            }
+
+            ProtocolAction::Seal => {
+                let plan = s.durable_intent.as_ref().expect("must have intent");
+                for &shard in &plan.retiring {
+                    s.sealed.insert(shard);
+                }
+                s.phase = Phase::Sealed;
+            }
+
+            ProtocolAction::WriteDeltaSnapshot {
+                new_shard,
+                predecessor,
+            } => {
+                let plan = s.durable_intent.as_ref().expect("must have intent").clone();
+                let new_range = plan.new_map.iter().find(|&&(_, _, sid)| sid == new_shard)
+                    .expect("new shard must be in new map");
+                let pred_range = state.durable_map.iter().find(|&&(_, _, sid)| sid == predecessor)
+                    .expect("predecessor must be in old map");
+                // Re-copy (idempotent max) — captures writes between snapshot and seal.
+                for cs in 0..NUM_CS {
+                    if range_covers(new_range.0, new_range.1, cs)
+                        && range_covers(pred_range.0, pred_range.1, cs)
+                    {
+                        let pred_seq = s.data[&predecessor][cs];
+                        let entry = s.data.get_mut(&new_shard).unwrap();
+                        entry[cs] = entry[cs].max(pred_seq);
+                    }
+                }
+                s.delta_snapshots.insert((new_shard, predecessor));
+
+                // Check if all delta snapshots are written.
+                let all_done = all_predecessor_pairs_done(&plan, &state.durable_map, &s.delta_snapshots);
+                s.phase = if all_done {
+                    Phase::DeltasWritten
+                } else {
+                    Phase::DeltaWriting
                 };
             }
 
@@ -787,7 +840,8 @@ impl Model for ProtocolModel {
                 // Reset all volatile state.
                 s.phase = Phase::Idle;
                 s.holds.clear();
-                s.replayed.clear();
+                s.bulk_snapshots.clear();
+                s.delta_snapshots.clear();
                 s.crashes += 1;
 
                 // Recovery: if durable intent exists, re-enter the protocol.
@@ -853,16 +907,23 @@ impl Model for ProtocolModel {
                     state.sealed.is_disjoint(&active)
                 },
             ),
-            // Seal-before-commit: at commit time, all retiring shards from
-            // the plan are sealed. This is the causal ordering guarantee
-            // from Delos: old Loglet sealed before new Loglet activated.
-            Property::<Self>::always("seal before commit", |_, state| {
-                if state.phase != Phase::Replayed {
-                    // Check just before commit (Replayed is the precondition).
+            // Snapshot-before-seal: bulk snapshots are written before seal.
+            Property::<Self>::always("snapshots before seal", |_, state| {
+                if state.phase != Phase::SnapshotsWritten {
                     return true;
                 }
-                // The retiring shards from the plan should all be sealed.
-                // (durable_intent still exists at this point.)
+                // All bulk snapshots must be done before we allow seal.
+                if let Some(plan) = &state.durable_intent {
+                    all_predecessor_pairs_done(plan, &state.durable_map, &state.bulk_snapshots)
+                } else {
+                    true
+                }
+            }),
+            // Seal-before-delta: at delta time, all retiring shards are sealed.
+            Property::<Self>::always("seal before delta", |_, state| {
+                if state.phase != Phase::DeltasWritten {
+                    return true;
+                }
                 if let Some(plan) = &state.durable_intent {
                     plan.retiring.iter().all(|s| state.sealed.contains(s))
                 } else {

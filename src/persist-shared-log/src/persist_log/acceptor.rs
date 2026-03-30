@@ -61,6 +61,12 @@ pub enum PersistAcceptorCommand {
     /// Used in tests to force deterministic flush boundaries.
     #[allow(dead_code)]
     Flush { reply: oneshot::Sender<()> },
+    /// Set the retraction source after the acceptor is already running.
+    /// Used when acceptors must be spawned before learners (learner subscribe
+    /// blocks until the acceptor writes setup batches to advance upper).
+    SetRetractionSource {
+        source: Box<dyn crate::RetractionSource>,
+    },
 }
 
 /// A typed handle to the acceptor's command channel.
@@ -81,6 +87,19 @@ impl PersistAcceptorHandle {
             .await
             .map_err(|_| AcceptorError::Shutdown)?;
         reply_rx.await.map_err(|_| AcceptorError::DroppedReply)
+    }
+
+    /// Wire a retraction source to a running acceptor. Used when acceptors
+    /// are spawned before learners (setup batches must advance upper before
+    /// learner subscribe can proceed).
+    pub async fn set_retraction_source(
+        &self,
+        source: Box<dyn crate::RetractionSource>,
+    ) -> Result<(), AcceptorError> {
+        self.tx
+            .send(PersistAcceptorCommand::SetRetractionSource { source })
+            .await
+            .map_err(|_| AcceptorError::Shutdown)
     }
 }
 
@@ -224,6 +243,9 @@ impl PersistAcceptor {
             PersistAcceptorCommand::Flush { reply } => {
                 self.metrics.flush_explicit_triggered.inc();
                 self.pending.push(PendingItem::FlushBarrier(reply));
+            }
+            PersistAcceptorCommand::SetRetractionSource { source } => {
+                self.retraction_source = Some(source);
             }
         }
     }
@@ -523,11 +545,286 @@ async fn flush_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Predecessor setup: bulk snapshot (batch_id=1) + delta snapshot (batch_id=2)
+// ---------------------------------------------------------------------------
+
+/// A predecessor shard and the CriticalSince frontier at which to read it.
+pub type PredecessorSpec = (ShardId, Antichain<u64>);
+
+/// Write the two setup batches into a new log shard before the acceptor enters
+/// its normal flush loop.
+///
+/// **batch_id=1 (bulk snapshot):** Copies the consolidated snapshot of each
+/// predecessor shard (at its CriticalSince `since`) into the new shard.
+///
+/// **batch_id=2 (delta snapshot):** Copies the events from each predecessor
+/// between the snapshot point and the predecessor's seal (frontier = []).
+///
+/// If `predecessors` is empty, both batches are empty (upper is advanced through
+/// batch_id=2 so the acceptor starts regular traffic at batch_id=3).
+///
+/// Entries are blind-copied: Proposals are opaque bytes, only OrderedKeys are
+/// re-keyed to `(batch_id, position, shard)`. The learner applies CaS semantics
+/// when it processes these entries from its subscribe.
+async fn write_setup_batches(
+    write: &mut WriteHandle<OrderedKey, Proposal, u64, i64>,
+    client: &PersistClient,
+    predecessors: &[PredecessorSpec],
+    range: &crate::RangeAssignment,
+) {
+    use mz_persist_client::read::ListenEvent;
+
+    // -----------------------------------------------------------------------
+    // Phase 1: Bulk snapshot at batch_id=1
+    // -----------------------------------------------------------------------
+
+    // Skip if another acceptor already wrote (upper ≥ 2).
+    let current_upper = write.upper().as_option().copied().unwrap_or(u64::MAX);
+    if current_upper >= 2 {
+        info!("bulk snapshot already written (upper={}), skipping", current_upper);
+    } else if predecessors.is_empty() {
+        // No predecessors: empty advance through batch_id=1.
+        info!("no predecessors, advancing upper through batch_id=1 (empty)");
+        let upper = write.upper().clone();
+        let new_upper = Antichain::from_elem(2);
+        let empty: Vec<((OrderedKey, Proposal), u64, i64)> = vec![];
+        match write.compare_and_append(&empty, upper, new_upper).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_upper_mismatch)) => {
+                info!("upper mismatch during empty bulk snapshot, another acceptor won");
+            }
+            Err(e) => {
+                error!("invalid usage during empty bulk snapshot: {}", e);
+            }
+        }
+    } else {
+        // Subscribe to each predecessor at its CriticalSince, read snapshot.
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
+        let mut snapshot_entries: Vec<((OrderedKey, Proposal), u64, i64)> = Vec::new();
+        let mut position: u32 = 0;
+
+        for (pred_shard, since) in predecessors {
+            let (_, read) = client
+                .open::<OrderedKey, Proposal, u64, i64>(
+                    *pred_shard,
+                    Arc::clone(&key_schema),
+                    Arc::clone(&val_schema),
+                    Diagnostics::from_purpose("acceptor-predecessor-snapshot"),
+                    false,
+                )
+                .await
+                .expect("failed to open predecessor for snapshot");
+
+            let mut subscribe = read
+                .subscribe(since.clone())
+                .await
+                .expect("subscribe to predecessor failed");
+
+            // Read until Progress advances past since (snapshot complete).
+            let since_ts = since.as_option().copied().unwrap_or(0);
+            loop {
+                let events = subscribe.fetch_next().await;
+                let mut snapshot_done = false;
+                for event in &events {
+                    match event {
+                        ListenEvent::Progress(frontier) => {
+                            if frontier.as_option().map_or(true, |&t| t > since_ts) {
+                                snapshot_done = true;
+                            }
+                        }
+                        ListenEvent::Updates(updates) => {
+                            for ((key, proposal), _ts, diff) in updates {
+                                if *diff != 1 {
+                                    continue;
+                                }
+                                // Range filter: only include keys in our range.
+                                let pk = crate::partition_key(&key.shard);
+                                if pk < range.lo || u16::from(pk) >= range.hi_exclusive {
+                                    continue;
+                                }
+                                let new_key = OrderedKey {
+                                    batch_id: 1,
+                                    position,
+                                    shard: key.shard.clone(),
+                                };
+                                snapshot_entries.push((
+                                    (new_key, proposal.clone()),
+                                    1, // timestamp = batch_id
+                                    1, // diff = +1
+                                ));
+                                position += 1;
+                            }
+                        }
+                    }
+                }
+                if snapshot_done {
+                    break;
+                }
+            }
+        }
+
+        info!(
+            entries = snapshot_entries.len(),
+            "writing bulk snapshot at batch_id=1"
+        );
+
+        // Write snapshot at batch_id=1.
+        let upper = write.upper().clone();
+        let new_upper = Antichain::from_elem(2);
+        match write
+            .compare_and_append(&snapshot_entries, upper, new_upper)
+            .await
+        {
+            Ok(Ok(())) => {
+                info!("bulk snapshot written successfully");
+            }
+            Ok(Err(_upper_mismatch)) => {
+                info!("upper mismatch during bulk snapshot, another acceptor won");
+            }
+            Err(e) => {
+                error!("invalid usage during bulk snapshot: {}", e);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Delta snapshot at batch_id=2
+    // -----------------------------------------------------------------------
+
+    let current_upper = write.upper().as_option().copied().unwrap_or(u64::MAX);
+    if current_upper >= 3 {
+        info!("delta snapshot already written (upper={}), skipping", current_upper);
+    } else if predecessors.is_empty() {
+        // No predecessors: empty advance through batch_id=2.
+        info!("no predecessors, advancing upper through batch_id=2 (empty)");
+        let upper = write.upper().clone();
+        let new_upper = Antichain::from_elem(3);
+        let empty: Vec<((OrderedKey, Proposal), u64, i64)> = vec![];
+        match write.compare_and_append(&empty, upper, new_upper).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_upper_mismatch)) => {
+                info!("upper mismatch during empty delta snapshot, another acceptor won");
+            }
+            Err(e) => {
+                error!("invalid usage during empty delta snapshot: {}", e);
+            }
+        }
+    } else {
+        // Subscribe to each predecessor again at CriticalSince. Read the
+        // snapshot (skip it — already written at batch_id=1), then collect
+        // delta events until predecessor frontier = [] (sealed).
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
+        let mut delta_entries: Vec<((OrderedKey, Proposal), u64, i64)> = Vec::new();
+        let mut position: u32 = 0;
+
+        for (pred_shard, since) in predecessors {
+            let (_, read) = client
+                .open::<OrderedKey, Proposal, u64, i64>(
+                    *pred_shard,
+                    Arc::clone(&key_schema),
+                    Arc::clone(&val_schema),
+                    Diagnostics::from_purpose("acceptor-predecessor-delta"),
+                    false,
+                )
+                .await
+                .expect("failed to open predecessor for delta");
+
+            let mut subscribe = read
+                .subscribe(since.clone())
+                .await
+                .expect("subscribe to predecessor for delta failed");
+
+            // Read events: skip snapshot (already written), collect delta.
+            let since_ts = since.as_option().copied().unwrap_or(0);
+            let mut past_snapshot = false;
+            loop {
+                let events = subscribe.fetch_next().await;
+                let mut sealed = false;
+                for event in &events {
+                    match event {
+                        ListenEvent::Progress(frontier) => {
+                            if !past_snapshot
+                                && frontier.as_option().map_or(true, |&t| t > since_ts)
+                            {
+                                past_snapshot = true;
+                            }
+                            if frontier.is_empty() {
+                                sealed = true;
+                            }
+                        }
+                        ListenEvent::Updates(updates) => {
+                            if !past_snapshot {
+                                // Still in snapshot region — skip.
+                                continue;
+                            }
+                            for ((key, proposal), _ts, diff) in updates {
+                                if *diff != 1 {
+                                    continue; // Skip predecessor retractions.
+                                }
+                                let pk = crate::partition_key(&key.shard);
+                                if pk < range.lo || u16::from(pk) >= range.hi_exclusive {
+                                    continue;
+                                }
+                                let new_key = OrderedKey {
+                                    batch_id: 2,
+                                    position,
+                                    shard: key.shard.clone(),
+                                };
+                                delta_entries.push((
+                                    (new_key, proposal.clone()),
+                                    2, // timestamp = batch_id
+                                    1, // diff = +1
+                                ));
+                                position += 1;
+                            }
+                        }
+                    }
+                }
+                if sealed {
+                    break;
+                }
+            }
+        }
+
+        info!(
+            entries = delta_entries.len(),
+            "writing delta snapshot at batch_id=2"
+        );
+
+        let upper = write.upper().clone();
+        let new_upper = Antichain::from_elem(3);
+        match write
+            .compare_and_append(&delta_entries, upper, new_upper)
+            .await
+        {
+            Ok(Ok(())) => {
+                info!("delta snapshot written successfully");
+            }
+            Ok(Err(_upper_mismatch)) => {
+                info!("upper mismatch during delta snapshot, another acceptor won");
+            }
+            Err(e) => {
+                error!("invalid usage during delta snapshot: {}", e);
+            }
+        }
+    }
+
+    info!("setup batches complete, acceptor ready for regular traffic");
+}
+
+// ---------------------------------------------------------------------------
 // Spawn helper
 // ---------------------------------------------------------------------------
 
 impl PersistAcceptor {
     /// Opens a persist shard and spawns the acceptor as a tokio task.
+    ///
+    /// If `predecessors` is non-empty, the acceptor writes the bulk snapshot
+    /// (batch_id=1) and delta snapshot (batch_id=2) before entering its normal
+    /// flush loop. If empty, it advances upper through batch_id=2 with empty
+    /// writes. Either way, regular traffic starts at batch_id=3.
     pub async fn spawn(
         config: AcceptorConfig,
         client: &PersistClient,
@@ -535,6 +832,8 @@ impl PersistAcceptor {
         metrics: AcceptorMetrics,
         epoch: u64,
         retraction_source: Option<Box<dyn crate::RetractionSource>>,
+        predecessors: Vec<PredecessorSpec>,
+        range: crate::RangeAssignment,
     ) -> (PersistAcceptorHandle, mz_ore::task::JoinHandle<()>) {
         let write = client
             .open_writer::<OrderedKey, Proposal, u64, i64>(
@@ -546,11 +845,15 @@ impl PersistAcceptor {
             .await
             .expect("failed to open persist shard for acceptor");
 
-        let (mut acceptor, write, handle) = Self::new(config, write, metrics, shard_id, epoch);
+        let (mut acceptor, mut write, handle) = Self::new(config, write, metrics, shard_id, epoch);
         if let Some(source) = retraction_source {
             acceptor.set_retraction_source(source);
         }
-        let task = mz_ore::task::spawn(|| "persist-acceptor", acceptor.run(write));
+        let client = client.clone();
+        let task = mz_ore::task::spawn(|| "persist-acceptor", async move {
+            write_setup_batches(&mut write, &client, &predecessors, &range).await;
+            acceptor.run(write).await;
+        });
         (handle, task)
     }
 }

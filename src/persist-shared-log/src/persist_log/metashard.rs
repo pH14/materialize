@@ -540,6 +540,28 @@ impl PersistMetashardActor {
             let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
             let learner_metrics = LearnerMetrics::register(&shard_registry);
 
+            // Walk the full transitive predecessor chain so that multi-hop
+            // carried-forward state (L1→L2→L4) is reconstructed on recovery.
+            let predecessors = self.transitive_predecessors(shard_id);
+
+            // For each predecessor, read its current since (the compaction
+            // frontier). On recovery, CriticalSince holds may have been lost,
+            // so we use whatever since is available.
+            let mut pred_specs = Vec::new();
+            for &pred_shard in &predecessors {
+                let (_, read) = self.persist_client
+                    .open::<OrderedKey, Proposal, u64, i64>(
+                        pred_shard,
+                        Arc::new(OrderedKeySchema),
+                        Arc::new(ProposalSchema),
+                        Diagnostics::from_purpose("metashard-recovery-since-read"),
+                        false,
+                    )
+                    .await
+                    .expect("failed to open predecessor for since read");
+                pred_specs.push((pred_shard, read.since().clone()));
+            }
+
             let (acceptor_handle, _task) = PersistAcceptor::spawn(
                 AcceptorConfig::default(),
                 &self.persist_client,
@@ -547,12 +569,10 @@ impl PersistMetashardActor {
                 acceptor_metrics,
                 self.state.epoch,
                 None,
+                pred_specs,
+                range.clone(),
             )
             .await;
-
-            // Walk the full transitive predecessor chain so that multi-hop
-            // carried-forward state (L1→L2→L4) is reconstructed on recovery.
-            let predecessors = self.transitive_predecessors(shard_id);
 
             if !predecessors.is_empty() {
                 info!(
@@ -561,23 +581,13 @@ impl PersistMetashardActor {
                     "spawning recovered learner with predecessor replay"
                 );
             }
-            let (learner_handle, _task, replay_done_rx) = PersistLearner::spawn(
+            let (learner_handle, _task) = PersistLearner::spawn(
                 PersistLearnerConfig::default(),
                 &self.persist_client,
                 shard_id,
-                predecessors.clone(),
                 learner_metrics,
             )
             .await;
-            // Wait for predecessor replay. If it fails, halt — serving from
-            // an empty learner would violate the carry-forward invariant.
-            if replay_done_rx.await.is_err() {
-                panic!(
-                    "predecessor replay for shard {} failed during recovery; \
-                     cannot serve without carried-forward state from {:?}",
-                    shard_id, predecessors
-                );
-            }
 
             info!(%shard_id, "spawned recovered actor");
             acceptors.insert(shard_id, acceptor_handle);
@@ -933,9 +943,17 @@ impl PersistMetashardActor {
                 .await
                 .expect("open_critical_since should succeed");
 
-            info!(%shard_id, "acquired CriticalSince hold for predecessor replay");
+            info!(%shard_id, since = ?handle.since(), "acquired CriticalSince hold for predecessor replay");
             critical_holds.push(handle);
         }
+
+        // Build a map from predecessor shard → CriticalSince frontier for the
+        // acceptor's setup batches. The acceptor subscribes at this since.
+        let predecessor_sinces: BTreeMap<ShardId, Antichain<u64>> = critical_holds
+            .iter()
+            .zip(retiring.iter())
+            .map(|(handle, &shard_id)| (shard_id, handle.since().clone()))
+            .collect();
 
         // NOTE: We intentionally do NOT write snapshot CaS rows to new shards
         // during the transition. The predecessor replay (spawn_with_predecessors)
@@ -950,7 +968,6 @@ impl PersistMetashardActor {
         // be written as a separate background step once the learner is caught up.
         let mut new_acceptors = BTreeMap::new();
         let mut new_learners = BTreeMap::new();
-        let mut replay_done_receivers: Vec<tokio::sync::oneshot::Receiver<()>> = Vec::new();
 
         // Phase 2: Spawn actors for new log shards BEFORE sealing.
         //
@@ -986,6 +1003,12 @@ impl PersistMetashardActor {
                 acceptor_metrics,
                 new_epoch,
                 None,
+                predecessors.iter().map(|s| {
+                    let since = predecessor_sinces.get(s).cloned()
+                        .unwrap_or_else(|| Antichain::from_elem(0));
+                    (*s, since)
+                }).collect(),
+                new_range.clone(),
             )
             .await;
 
@@ -996,15 +1019,13 @@ impl PersistMetashardActor {
                     "spawning learner with predecessor chain replay"
                 );
             }
-            let (learner_handle, _task, replay_done_rx) = PersistLearner::spawn(
+            let (learner_handle, _task) = PersistLearner::spawn(
                 PersistLearnerConfig::default(),
                 &self.persist_client,
                 shard_id,
-                predecessors,
                 learner_metrics,
             )
             .await;
-            replay_done_receivers.push(replay_done_rx);
 
             info!(%shard_id, "spawned actors for new log shard");
             new_acceptors.insert(shard_id, acceptor_handle);
@@ -1051,27 +1072,8 @@ impl PersistMetashardActor {
             intent.status = IntentStatus::Sealed;
         }
 
-        // BUGGIFY: crash after seal but before waiting for predecessor replay.
+        // BUGGIFY: crash after seal but before routing swap.
         crate::fault::maybe_fail("after_seal")
-            .map_err(MetashardError::Command)?;
-
-        // Phase 3: Wait for all predecessor replays to complete BEFORE
-        // committing the new epoch. If any replay fails, bail out — nothing
-        // has been committed yet, CriticalSince holds are still active, and
-        // the old routing is still in place.
-        for rx in replay_done_receivers {
-            if rx.await.is_err() {
-                return Err(MetashardError::Command(
-                    "predecessor replay task died before completing; \
-                     reconfiguration aborted to preserve predecessor data"
-                        .to_string(),
-                ));
-            }
-        }
-        info!("all predecessor replays complete — committing new epoch");
-
-        // BUGGIFY: crash after replays complete but before routing swap.
-        crate::fault::maybe_fail("after_replay_complete")
             .map_err(MetashardError::Command)?;
 
         // Phase 4: Build new routing state and swap atomically.
@@ -1532,14 +1534,15 @@ mod tests {
             acceptor_metrics,
             0,
             None,
+            vec![],
+            crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: dummy_shard },
         )
         .await;
 
-        let (lrn_handle, _lrn_task, _replay_rx) = PersistLearner::spawn(
+        let (lrn_handle, _lrn_task) = PersistLearner::spawn(
             PersistLearnerConfig::default(),
             &client,
             dummy_shard,
-            Vec::new(),
             learner_metrics,
         )
         .await;

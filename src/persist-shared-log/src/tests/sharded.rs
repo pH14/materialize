@@ -1755,12 +1755,13 @@ async fn test_buggify_reconfiguration_recovery() {
 
     // Pre-commit injection points: the reconfiguration has not committed yet,
     // so the error propagates and the caller can retry cleanly.
+    // NOTE: "during_predecessor_replay" and "after_replay_complete" were
+    // removed — predecessor handling moved from learner to acceptor (setup
+    // batches at batch_id=1/2), so there's no in-protocol replay step.
     let injection_points = [
         "after_intent_persist",
-        "after_seal",
         "after_actor_spawn",
-        "during_predecessor_replay",
-        "after_replay_complete",
+        "after_seal",
     ];
 
     let client = new_persist_client_for_test().await;

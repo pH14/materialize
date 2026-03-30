@@ -102,11 +102,10 @@ async fn spawn_shard(
     let _atask =
         mz_ore::task::spawn(|| "sharded-sim-acceptor", acceptor.run(write)).abort_on_drop();
 
-    let (handle_l, _ltask, _rx) = PersistLearner::spawn(
+    let (handle_l, _ltask) = PersistLearner::spawn(
         PersistLearnerConfig::default(),
         client,
         shard_id,
-        Vec::new(),
         learner_metrics,
     )
     .await;

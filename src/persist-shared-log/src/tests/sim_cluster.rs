@@ -157,14 +157,15 @@ fn sim_cluster_smoke() {
             acceptor_metrics,
             0,
             None,
+            vec![],
+            crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
         )
         .await;
 
-        let (lrn_handle, _lrn_task, _replay_rx) = PersistLearner::spawn(
+        let (lrn_handle, _lrn_task) = PersistLearner::spawn(
             PersistLearnerConfig::default(),
             &client,
             shard_ids[0],
-            Vec::new(),
             learner_metrics,
         )
         .await;
@@ -274,10 +275,12 @@ fn sim_cluster_crash_restart() {
 
             let (acc_handle, _) = PersistAcceptor::spawn(
                 AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                vec![],
+                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
 
-            let (lrn_handle, _, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            let (lrn_handle, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
             ).await;
 
             let mut acceptors = BTreeMap::new();
@@ -331,10 +334,12 @@ fn sim_cluster_crash_restart() {
 
             let (acc_handle, _) = PersistAcceptor::spawn(
                 AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                vec![],
+                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
 
-            let (lrn_handle, _, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            let (lrn_handle, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
             ).await;
 
             let mut acceptors = BTreeMap::new();
@@ -421,9 +426,11 @@ fn sim_cluster_persist_partition() {
 
             let (acc, _) = PersistAcceptor::spawn(
                 AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                vec![],
+                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
-            let (lrn, _, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            let (lrn, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
             ).await;
 
             let mut acceptors = BTreeMap::new();
@@ -476,9 +483,11 @@ fn sim_cluster_persist_partition() {
 
             let (acc, _) = PersistAcceptor::spawn(
                 AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                vec![],
+                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
-            let (lrn, _, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            let (lrn, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
             ).await;
 
             let mut acceptors = BTreeMap::new();
@@ -617,9 +626,11 @@ fn sim_cluster_split_with_writes() {
 
             let (acc, _) = PersistAcceptor::spawn(
                 AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                vec![],
+                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
-            let (lrn, _, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            let (lrn, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
             ).await;
 
             let mut acceptors = BTreeMap::new();
@@ -741,9 +752,11 @@ fn sim_cluster_reconfig_with_buggify() {
 
             let (acc, _) = PersistAcceptor::spawn(
                 AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                vec![],
+                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
-            let (lrn, _, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            let (lrn, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
             ).await;
 
             let mut acceptors = BTreeMap::new();
@@ -849,9 +862,11 @@ fn sim_cluster_split_during_persist_partition() {
 
             let (acc, _) = PersistAcceptor::spawn(
                 AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                vec![],
+                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
-            let (lrn, _, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], Vec::new(), learner_metrics,
+            let (lrn, _) = PersistLearner::spawn(
+                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
             ).await;
 
             let mut acceptors = BTreeMap::new();

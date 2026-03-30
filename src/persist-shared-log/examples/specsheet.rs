@@ -1184,6 +1184,8 @@ async fn main() {
         acceptor_metrics.clone(),
         0,
         None,
+        vec![],
+        mz_persist_shared_log::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_id },
     )
     .await;
 
@@ -1191,11 +1193,10 @@ async fn main() {
         queue_depth,
         ..Default::default()
     };
-    let (learner_handle, _learner_task, _replay_done) = PersistLearner::spawn(
+    let (learner_handle, _learner_task) = PersistLearner::spawn(
         learner_config,
         &persist_client,
         shard_id,
-        vec![],
         learner_metrics.clone(),
     )
     .await;
