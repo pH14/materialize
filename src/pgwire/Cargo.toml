@@ -40,7 +40,7 @@ tokio-openssl = "0.6.5"
 tokio-util = { version = "0.7.18", features = ["codec"] }
 tokio-metrics = "0.4.9"
 tracing = "0.1.44"
-uuid = { version = "1.19.0", features = ["v4"] }
+uuid = { version = "1.23.0", features = ["v4"] }
 
 [features]
 default = []

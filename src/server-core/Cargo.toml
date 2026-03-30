@@ -27,7 +27,7 @@ mz-dyncfg = { path = "../dyncfg", default-features = false }
 mz-ore = { path = "../ore", default-features = false, features = ["async", "network", "test"] }
 tokio = "1.49.0"
 tokio-metrics = "0.4.9"
-uuid = { version = "1.19.0", features = ["v4"] }
+uuid = { version = "1.23.0", features = ["v4"] }
 
 [features]
 default = []

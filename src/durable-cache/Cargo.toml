@@ -26,7 +26,7 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 timely = "0.28.0"
 tokio = { version = "1.49.0", default-features = false, features = ["rt", "rt-multi-thread"] }
 tracing = "0.1.44"
-uuid = { version = "1.19.0", features = ["v4"] }
+uuid = { version = "1.23.0", features = ["v4"] }
 
 [features]
 default = []

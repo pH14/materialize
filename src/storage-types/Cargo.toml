@@ -73,7 +73,7 @@ tokio = { version = "1.49.0", features = ["fs", "rt", "sync", "test-util", "time
 tokio-postgres = { version = "0.7.15", features = ["serde"] }
 tracing = "0.1.44"
 url = { version = "2.5.8", features = ["serde"] }
-uuid = { version = "1.19.0", features = ["serde", "v4"] }
+uuid = { version = "1.23.0", features = ["serde", "v4"] }
 base64 = "0.22.1"
 iceberg = "0.7.0"
 iceberg-catalog-rest = "0.7.0"

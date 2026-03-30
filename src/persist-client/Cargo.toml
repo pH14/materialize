@@ -64,7 +64,7 @@ tokio-stream = { version = "0.1.18", features = ["sync"] }
 tonic = "0.14.2"
 tonic-prost = "0.14.5"
 tracing = "0.1.44"
-uuid = { version = "1.19.0", features = ["v4"] }
+uuid = { version = "1.23.0", features = ["v4"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
