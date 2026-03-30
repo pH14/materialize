@@ -51,7 +51,7 @@ use bytes::Bytes;
 use prost::Message;
 use timely::progress::Antichain;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use mz_ore::cast::CastFrom;
 use mz_persist::generated::consensus_service::{
@@ -137,8 +137,6 @@ struct StateMachine {
 pub(crate) struct LogShardState<E: EventSource> {
     /// Event source (persist subscribe channel).
     pub(crate) event_source: E,
-    /// WriteHandle for writing retractions (-1 diffs) during periodic sweeps.
-    pub(crate) retraction_write: WriteHandle<OrderedKey, Proposal, u64, i64>,
     /// The listen frontier, mirrored from Progress events.
     pub(crate) listen_frontier: Antichain<u64>,
     /// Result cache: batch_number → vec of proposal results.
@@ -345,9 +343,13 @@ pub enum PersistLearnerCommand {
         reply: oneshot::Sender<Result<ProtoTruncateResponse, String>>,
         received_at: tokio::time::Instant,
     },
-    /// Force a retraction sweep immediately. Returns the number of retractions
-    /// written, or 0 if pending retractions was empty or the write failed.
-    ForceRetractionSweep { reply: oneshot::Sender<usize> },
+    /// Return a snapshot of pending retractions for proposals evaluated through
+    /// `through_upper`. The learner retains the entries — they're only removed
+    /// when the -1 diffs arrive via subscription.
+    GetRetractions {
+        through_upper: u64,
+        reply: oneshot::Sender<Vec<(OrderedKey, Proposal)>>,
+    },
 }
 
 /// A read command waiting for linearization.
@@ -470,11 +472,19 @@ impl PersistLearnerHandle {
             .map_err(LearnerError::Command)
     }
 
-    /// Force a retraction sweep. Returns the number of retractions written.
-    pub async fn force_retraction_sweep(&self) -> Result<usize, LearnerError> {
+    /// Return a snapshot of pending retractions for proposals evaluated
+    /// through `through_upper`. Non-destructive — entries stay in the learner
+    /// until confirmed via subscription.
+    pub async fn get_retractions(
+        &self,
+        through_upper: u64,
+    ) -> Result<Vec<(OrderedKey, Proposal)>, LearnerError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(PersistLearnerCommand::ForceRetractionSweep { reply: reply_tx })
+            .send(PersistLearnerCommand::GetRetractions {
+                through_upper,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| LearnerError::Shutdown)?;
         reply_rx.await.map_err(|_| LearnerError::DroppedReply)
@@ -633,6 +643,7 @@ pub struct PersistLearner<E: EventSource = ChannelEventSource> {
     log_shard: LogShardState<E>,
 
     // --- Configuration ---
+    #[allow(dead_code)] // Retraction interval removed; config kept for future use.
     config: PersistLearnerConfig,
 
     // --- Metrics ---
@@ -659,11 +670,10 @@ impl PersistLearner<ChannelEventSource> {
     pub fn new(
         config: PersistLearnerConfig,
         subscribe: Subscribe<OrderedKey, Proposal, u64, i64>,
-        retraction_write: WriteHandle<OrderedKey, Proposal, u64, i64>,
         metrics: LearnerMetrics,
     ) -> (Self, PersistLearnerHandle) {
         let event_source = ChannelEventSource::new(subscribe);
-        Self::new_with_event_source(config, event_source, retraction_write, metrics)
+        Self::new_with_event_source(config, event_source, metrics)
     }
 }
 
@@ -675,14 +685,12 @@ impl<E: EventSource> PersistLearner<E> {
     pub fn new_with_event_source(
         config: PersistLearnerConfig,
         event_source: E,
-        retraction_write: WriteHandle<OrderedKey, Proposal, u64, i64>,
         metrics: LearnerMetrics,
     ) -> (Self, PersistLearnerHandle) {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.queue_depth);
 
         let log_shard = LogShardState {
             event_source,
-            retraction_write,
             listen_frontier: Antichain::from_elem(0),
             results: BTreeMap::new(),
             result_waiters: BTreeMap::new(),
@@ -772,11 +780,6 @@ impl<E: EventSource> PersistLearner<E> {
     /// Fetches events from the event source, fetches upper when reads are
     /// pending, sweeps retractions on a timer, and handles commands.
     pub async fn run(mut self, upper_handle: WriteHandle<OrderedKey, Proposal, u64, i64>) {
-        let mut retraction_ticker = tokio::time::interval(self.config.retraction_interval);
-        retraction_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the initial tick that fires immediately.
-        retraction_ticker.tick().await;
-
         // Spawn a dedicated task for upper fetches. This avoids wasted
         // consensus reads: the old approach recreated the fetch_recent_upper
         // future each select! iteration, so in-flight RPCs were cancelled
@@ -823,20 +826,9 @@ impl<E: EventSource> PersistLearner<E> {
                     fetch_in_flight = false;
                     self.on_upper(upper);
                 }
-                // Periodic retraction sweep.
-                _ = retraction_ticker.tick(),
-                    if self.has_pending_retractions() =>
-                {
-                    self.flush_pending_retractions().await;
-                }
                 // cancel-safety: per tokio docs
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
-                        Some(PersistLearnerCommand::ForceRetractionSweep { reply }) => {
-                            let count = self.log_shard.pending_retractions.len();
-                            self.flush_pending_retractions().await;
-                            let _ = reply.send(count);
-                        }
                         Some(cmd) => self.on_command(cmd),
                         None => return,
                     }
@@ -1103,8 +1095,25 @@ impl<E: EventSource> PersistLearner<E> {
                         received_at,
                     });
             }
-            PersistLearnerCommand::ForceRetractionSweep { .. } => {
-                unreachable!("ForceRetractionSweep handled in run() select loop")
+            PersistLearnerCommand::GetRetractions {
+                through_upper,
+                reply,
+            } => {
+                let frontier = self
+                    .log_shard
+                    .listen_frontier
+                    .as_option()
+                    .copied()
+                    .unwrap_or(u64::MAX);
+                let effective_upper = through_upper.min(frontier);
+                let retractions: Vec<_> = self
+                    .log_shard
+                    .pending_retractions
+                    .iter()
+                    .filter(|(key, _)| key.batch_id < effective_upper)
+                    .map(|(key, proposal)| (key.clone(), proposal.clone()))
+                    .collect();
+                let _ = reply.send(retractions);
             }
         }
     }
@@ -1113,159 +1122,7 @@ impl<E: EventSource> PersistLearner<E> {
     // Learner retractions
     // -----------------------------------------------------------------------
 
-    /// Flush pending retractions as -1 diffs via the retraction WriteHandle.
-    ///
-    /// Uses BatchBuilder to pre-build the retraction batch (uploading the blob
-    /// once), then retries the CAS on UpperMismatch using `rewrite_ts` to
-    /// adjust timestamps without re-uploading. This avoids the starvation
-    /// problem where the acceptor continuously advances the upper faster than
-    /// the retraction writer can land a `compare_and_append`.
-    ///
-    /// Between retries, processes any pending events from the subscription to
-    /// check if any staged retractions have been invalidated (retracted by
-    /// another learner). If so, deletes the stale batch and rebuilds.
-    pub async fn flush_pending_retractions(&mut self) {
-        let sweep_start = tokio::time::Instant::now();
-        self.metrics.retraction_sweeps.inc();
 
-        let pending = std::mem::take(&mut self.log_shard.pending_retractions);
-        if pending.is_empty() {
-            return;
-        }
-
-        let num_retractions = pending.len();
-
-        // Step 1: Read the current upper for the initial batch build.
-        let initial_upper = self.log_shard.retraction_write.upper().clone();
-        let initial_ts = match initial_upper.as_option() {
-            Some(ts) => (*ts).max(1),
-            None => {
-                warn!("retraction write upper is empty (shard sealed), skipping sweep");
-                self.log_shard.pending_retractions = pending;
-                return;
-            }
-        };
-
-        // Step 2: Build the batch — uploads blob data once.
-        let mut builder = self
-            .log_shard
-            .retraction_write
-            .builder(Antichain::from_elem(initial_ts));
-        for (key, proposal) in &pending {
-            if let Err(e) = builder.add(key, proposal, &initial_ts, &-1i64).await {
-                error!("retraction batch builder error: {}", e);
-                self.log_shard.pending_retractions = pending;
-                return;
-            }
-        }
-        let mut batch = match builder
-            .finish(Antichain::from_elem(initial_ts + 1))
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                error!("retraction batch finish error: {}", e);
-                self.log_shard.pending_retractions = pending;
-                return;
-            }
-        };
-
-        // Step 3: CAS loop — retry with rewrite_ts on UpperMismatch.
-        for attempt in 0..10u32 {
-            let expected_upper = self.log_shard.retraction_write.upper().clone();
-            let current_ts = match expected_upper.as_option() {
-                Some(ts) => (*ts).max(1),
-                None => {
-                    warn!("shard sealed during retraction flush");
-                    batch.delete().await;
-                    self.log_shard.pending_retractions = pending;
-                    return;
-                }
-            };
-
-            // Rewrite batch timestamps to the current upper (metadata-only, no
-            // re-upload). On the first attempt this is a no-op if the upper
-            // hasn't moved since we built the batch.
-            if current_ts != initial_ts || attempt > 0 {
-                if let Err(e) = batch.rewrite_ts(
-                    &Antichain::from_elem(current_ts),
-                    Antichain::from_elem(current_ts + 1),
-                ) {
-                    error!("retraction rewrite_ts error: {}", e);
-                    batch.delete().await;
-                    self.log_shard.pending_retractions = pending;
-                    return;
-                }
-            }
-
-            let new_upper = Antichain::from_elem(current_ts + 1);
-
-            match self
-                .log_shard
-                .retraction_write
-                .compare_and_append_batch(
-                    &mut [&mut batch],
-                    expected_upper,
-                    new_upper,
-                    true,
-                )
-                .await
-            {
-                Ok(Ok(())) => {
-                    // Success — batch is consumed by compare_and_append_batch.
-                    self.metrics
-                        .retraction_rows_written
-                        .inc_by(u64::try_from(num_retractions).unwrap_or(u64::MAX));
-                    self.metrics
-                        .retraction_sweep_latency_seconds
-                        .observe(sweep_start.elapsed().as_secs_f64());
-                    if attempt > 0 {
-                        info!(
-                            retractions = num_retractions,
-                            attempts = attempt + 1,
-                            "learner retraction sweep committed after retries"
-                        );
-                    } else {
-                        info!(
-                            retractions = num_retractions,
-                            "learner retraction sweep committed"
-                        );
-                    }
-                    return;
-                }
-                Ok(Err(upper_mismatch)) => {
-                    let actual = upper_mismatch
-                        .current
-                        .as_option()
-                        .copied()
-                        .unwrap_or(u64::MAX);
-                    debug!(
-                        expected = current_ts,
-                        actual_upper = actual,
-                        attempt,
-                        retractions = num_retractions,
-                        "retraction CAS mismatch, rewriting timestamps and retrying"
-                    );
-                    // Batch is NOT consumed on mismatch — rewrite_ts and retry.
-                    continue;
-                }
-                Err(invalid_usage) => {
-                    error!("learner retraction invalid usage: {}", invalid_usage);
-                    batch.delete().await;
-                    self.log_shard.pending_retractions = pending;
-                    return;
-                }
-            }
-        }
-
-        // Retries exhausted — delete the staged batch and defer.
-        warn!(
-            retractions = num_retractions,
-            "learner retraction sweep failed after 10 retries, deferring"
-        );
-        batch.delete().await;
-        self.log_shard.pending_retractions = pending;
-    }
 
     // -----------------------------------------------------------------------
     // Bus-stand read linearization
@@ -1521,16 +1378,6 @@ impl PersistLearner<ChannelEventSource> {
             .await
             .expect("failed to open persist shard for learner");
 
-        let retraction_write = client
-            .open_writer::<OrderedKey, Proposal, u64, i64>(
-                shard_id,
-                key_schema,
-                val_schema,
-                Diagnostics::from_purpose("persist-shared-log-learner-retraction"),
-            )
-            .await
-            .expect("failed to open retraction writer for learner");
-
         // Advance upper past T=0 if this is a fresh shard, so that
         // subscribe's snapshot doesn't block waiting for data.
         if upper_handle.upper().as_option() == Some(&0) {
@@ -1543,7 +1390,7 @@ impl PersistLearner<ChannelEventSource> {
             .await
             .expect("subscribe should succeed");
 
-        let (mut learner, handle) = Self::new(config, subscribe, retraction_write, metrics);
+        let (mut learner, handle) = Self::new(config, subscribe, metrics);
 
         let (replay_done_tx, replay_done_rx) = oneshot::channel();
         let client_clone = client.clone();

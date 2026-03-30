@@ -302,16 +302,6 @@ async fn spawn_persist_pair(
     let since = read.since().clone();
     let subscribe = read.subscribe(since).await.expect("subscribe");
 
-    let retraction_write = client
-        .open_writer::<OrderedKey, Proposal, u64, i64>(
-            shard_id,
-            Arc::new(OrderedKeySchema),
-            Arc::new(ProposalSchema),
-            Diagnostics::from_purpose("persist-sim-learner-retraction"),
-        )
-        .await
-        .expect("open retraction writer");
-
     let (acceptor_metrics, learner_metrics) = test_metrics();
 
     let (acceptor, write, acceptor_handle) =
@@ -324,7 +314,7 @@ async fn spawn_persist_pair(
         ..Default::default()
     };
     let (learner, learner_handle) =
-        PersistLearner::new(learner_config, subscribe, retraction_write, learner_metrics);
+        PersistLearner::new(learner_config, subscribe, learner_metrics);
     let learner_task =
         mz_ore::task::spawn(|| "persist-sim-learner", learner.run(upper_handle)).abort_on_drop();
 
@@ -588,11 +578,15 @@ impl PersistSimulator {
         self.trace
             .record_system(step, &SystemEvent::RetractionSweep);
 
-        let count = self.learner_handle.force_retraction_sweep().await.unwrap();
+        let retractions = self
+            .learner_handle
+            .get_retractions(u64::MAX)
+            .await
+            .unwrap();
 
         self.trace.record_note(
             step,
-            format!("retraction sweep: {} entries retracted", count),
+            format!("retraction check: {} entries pending", retractions.len()),
         );
     }
 }
@@ -689,16 +683,6 @@ async fn persist_sim_multi_writer() {
         let since = read.since().clone();
         let subscribe = read.subscribe(since).await.expect("subscribe");
 
-        let retraction_write = client
-            .open_writer::<OrderedKey, Proposal, u64, i64>(
-                shard_id,
-                Arc::new(OrderedKeySchema),
-                Arc::new(ProposalSchema),
-                Diagnostics::from_purpose("persist-sim-learner-retraction"),
-            )
-            .await
-            .expect("open retraction writer");
-
         let (acceptor_metrics_a, learner_metrics) = test_metrics();
         let (acceptor_metrics_b, _) = test_metrics();
 
@@ -717,7 +701,7 @@ async fn persist_sim_multi_writer() {
             ..Default::default()
         };
         let (learner, learner_handle) =
-            PersistLearner::new(learner_config, subscribe, retraction_write, learner_metrics);
+            PersistLearner::new(learner_config, subscribe, learner_metrics);
         let _learner_task =
             mz_ore::task::spawn(|| "persist-sim-learner", learner.run(upper_handle))
                 .abort_on_drop();

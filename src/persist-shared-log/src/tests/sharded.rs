@@ -81,16 +81,6 @@ async fn spawn_shard(
     let since = read.since().clone();
     let subscribe = read.subscribe(since).await.expect("subscribe");
 
-    let retraction_write = client
-        .open_writer::<OrderedKey, Proposal, u64, i64>(
-            shard_id,
-            Arc::new(OrderedKeySchema),
-            Arc::new(ProposalSchema),
-            Diagnostics::from_purpose("test-sharded-learner-retraction"),
-        )
-        .await
-        .expect("open retraction writer");
-
     let acceptor_metrics = AcceptorMetrics::register(&registry);
     let learner_metrics = LearnerMetrics::register(&registry);
 
@@ -100,7 +90,7 @@ async fn spawn_shard(
         mz_ore::task::spawn(|| "test-sharded-acceptor", acceptor.run(write)).abort_on_drop();
 
     let (learner, learner_handle) =
-        PersistLearner::new(PersistLearnerConfig::default(), subscribe, retraction_write, learner_metrics);
+        PersistLearner::new(PersistLearnerConfig::default(), subscribe, learner_metrics);
     let _learner_task =
         mz_ore::task::spawn(|| "test-sharded-learner", learner.run(upper_handle)).abort_on_drop();
 

@@ -100,16 +100,6 @@ impl PersistTestHarness {
         let since = read.since().clone();
         let subscribe = read.subscribe(since).await.expect("subscribe");
 
-        let retraction_write = client
-            .open_writer::<OrderedKey, Proposal, u64, i64>(
-                shard_id,
-                Arc::new(OrderedKeySchema),
-                Arc::new(ProposalSchema),
-                Diagnostics::from_purpose("test-learner-retraction"),
-            )
-            .await
-            .expect("open retraction writer");
-
         // Now spawn tasks.
         let acceptor_config = AcceptorConfig::default();
         let registry = MetricsRegistry::new();
@@ -123,7 +113,7 @@ impl PersistTestHarness {
 
         let learner_config = PersistLearnerConfig::default();
         let (learner, learner_handle) =
-            PersistLearner::new(learner_config, subscribe, retraction_write, learner_metrics);
+            PersistLearner::new(learner_config, subscribe, learner_metrics);
         let learner_task =
             mz_ore::task::spawn(|| "test-persist-learner", learner.run(upper_handle))
                 .abort_on_drop();
@@ -583,10 +573,9 @@ async fn test_persist_retraction_rejected_cas() {
         // Commit another valid entry.
         assert!(h.cas("s0", Some(1), 2, b"second").await);
 
-        // Force a retraction sweep — the two rejected proposals should be
-        // retracted.
-        let count = h.learner_handle.force_retraction_sweep().await.unwrap();
-        assert_eq!(count, 2, "expected 2 rejected CAS retractions");
+        // Verify the learner has pending retractions for the rejected proposals.
+        let retractions = h.learner_handle.get_retractions(u64::MAX).await.unwrap();
+        assert_eq!(retractions.len(), 2, "expected 2 rejected CAS pending retractions");
     }
     // Everything dropped.
 
@@ -646,14 +635,14 @@ async fn test_persist_retraction_truncate() {
             .unwrap();
         assert_eq!(result.deleted, Some(2));
 
-        // Force retraction sweep. Garbage should include:
+        // Verify pending retractions include:
         // - 2 truncated CAS entries (seqno 1, 2)
         // - 1 truncate proposal itself
-        // = 3 total retractions
-        let count = h.learner_handle.force_retraction_sweep().await.unwrap();
+        // = 3 total
+        let retractions = h.learner_handle.get_retractions(u64::MAX).await.unwrap();
         assert_eq!(
-            count, 3,
-            "expected 3 retractions (2 truncated entries + truncate op)"
+            retractions.len(), 3,
+            "expected 3 pending retractions (2 truncated entries + truncate op)"
         );
 
         // Verify scan still works.

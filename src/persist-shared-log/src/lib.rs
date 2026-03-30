@@ -314,6 +314,25 @@ pub trait Metashard: Clone + std::fmt::Debug + Send + Sync + 'static {
     async fn reconfigure(&self, plan: ReconfigurationPlan) -> Result<u64, MetashardError>;
 }
 
+/// A source of retraction entries for the acceptor.
+///
+/// The serving layer implements this by querying learner replicas. The acceptor
+/// calls `get_retractions` periodically and includes the returned entries as
+/// -1 diffs in its flush batches. This eliminates write contention between the
+/// acceptor and retraction writer — the acceptor is the single writer.
+#[async_trait::async_trait]
+pub trait RetractionSource: Send + Sync + 'static {
+    /// Return pending retractions for proposals evaluated through `through_upper`.
+    ///
+    /// Returns a read-only snapshot — the learner retains entries in
+    /// `pending_retractions` until it sees the -1 diffs arrive via the
+    /// subscription (confirming the acceptor flushed them).
+    async fn get_retractions(
+        &self,
+        through_upper: u64,
+    ) -> Vec<(persist_log::OrderedKey, persist_log::Proposal)>;
+}
+
 /// A plan for a reconfiguration operation.
 #[derive(Debug, Clone)]
 pub struct ReconfigurationPlan {
