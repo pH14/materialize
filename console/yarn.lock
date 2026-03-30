@@ -4006,16 +4006,16 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@stripe/react-stripe-js@npm:^5.6.1":
-  version: 5.6.1
-  resolution: "@stripe/react-stripe-js@npm:5.6.1"
+"@stripe/react-stripe-js@npm:^6.0.0":
+  version: 6.0.0
+  resolution: "@stripe/react-stripe-js@npm:6.0.0"
   dependencies:
     prop-types: "npm:^15.7.2"
   peerDependencies:
-    "@stripe/stripe-js": ">=8.0.0 <9.0.0"
+    "@stripe/stripe-js": ">=9.0.0 <10.0.0"
     react: ">=16.8.0 <20.0.0"
     react-dom: ">=16.8.0 <20.0.0"
-  checksum: 10c0/fad382094873e860f25c91f91b7d04e18852c1442da2845f7d61974862041cb7852324165fd08abfa8b1f2549dc4343bc4140bcea73d8b7416f699d6cecc9c36
+  checksum: 10c0/a5637a70352bf105689870204fdb30a6bad57fea592c98b5ba099f7927b441237fa4109d55ed21a19ea922afd61f3caeb5c4594ad44ef69c8ef2e6a66563ed43
   languageName: node
   linkType: hard
 
@@ -10940,7 +10940,7 @@ __metadata:
     "@segment/analytics-next": "npm:^1.82.0"
     "@sentry/react": "npm:^10.45.0"
     "@sentry/vite-plugin": "npm:^5.1.1"
-    "@stripe/react-stripe-js": "npm:^5.6.1"
+    "@stripe/react-stripe-js": "npm:^6.0.0"
     "@stripe/stripe-js": "npm:^7.1.0"
     "@svgr/babel-plugin-transform-svg-component": "npm:^8.0.0"
     "@tanstack/eslint-plugin-query": "npm:^5.95.0"
