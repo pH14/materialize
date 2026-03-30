@@ -903,8 +903,9 @@ impl PersistMetashardActor {
         info!(
             old_epoch = self.state.epoch,
             new_epoch,
-            added = ?added,
-            retiring = ?retiring,
+            added_shards = added.len(),
+            retiring_shards = retiring.len(),
+            new_ranges = new_map.ranges.len(),
             "starting reconfiguration"
         );
 
@@ -943,7 +944,7 @@ impl PersistMetashardActor {
                 .await
                 .expect("open_critical_since should succeed");
 
-            info!(%shard_id, since = ?handle.since(), "acquired CriticalSince hold for predecessor replay");
+            info!(%shard_id, since = ?handle.since(), "acquired CriticalSince hold");
             critical_holds.push(handle);
         }
 
@@ -1012,13 +1013,6 @@ impl PersistMetashardActor {
             )
             .await;
 
-            if !predecessors.is_empty() {
-                info!(
-                    %shard_id,
-                    predecessors = ?predecessors,
-                    "spawning learner with predecessor chain replay"
-                );
-            }
             let (learner_handle, _task) = PersistLearner::spawn(
                 PersistLearnerConfig::default(),
                 &self.persist_client,
@@ -1027,7 +1021,13 @@ impl PersistMetashardActor {
             )
             .await;
 
-            info!(%shard_id, "spawned actors for new log shard");
+            info!(
+                %shard_id,
+                range_lo = new_range.lo,
+                range_hi = new_range.hi_exclusive,
+                num_predecessors = predecessors.len(),
+                "spawned acceptor + learner for new log shard"
+            );
             new_acceptors.insert(shard_id, acceptor_handle);
             new_learners.insert(shard_id, learner_handle);
         }
@@ -1059,7 +1059,7 @@ impl PersistMetashardActor {
                 .expect("open writer for sealing");
 
             write.advance_upper(&Antichain::new()).await;
-            info!(%shard_id, "sealed log shard");
+            info!(%shard_id, epoch = new_epoch, "sealed log shard");
 
             if let Some(info) = self.state.log_shards.get_mut(&shard_id) {
                 info.status = LogShardStatus::Sealed;
@@ -1200,9 +1200,9 @@ impl PersistMetashardActor {
     /// Run the actor loop until the command channel closes.
     pub async fn run(mut self) {
         info!(
+            metashard_shard = %self.metashard_shard_id,
             epoch = self.state.epoch,
             num_ranges = self.state.partition_map.ranges.len(),
-            num_log_shards = self.state.log_shards.len(),
             "metashard actor starting"
         );
 

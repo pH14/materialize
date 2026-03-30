@@ -251,7 +251,11 @@ async fn run(args: Args) {
         )
         .await;
 
-        info!(%shard_id, "acceptor ready");
+        info!(
+            %shard_id,
+            range = %format!("[0x{:02x}, 0x{:03x})", range.lo, range.hi_exclusive),
+            "acceptor ready"
+        );
         acceptor_handles.insert(shard_id, acceptor_handle);
     }
 
@@ -271,7 +275,12 @@ async fn run(args: Args) {
         )
         .await;
 
-        info!(%shard_id, index = i, "learner ready");
+        info!(
+            %shard_id,
+            range = %format!("[0x{:02x}, 0x{:03x})", range.lo, range.hi_exclusive),
+            index = i,
+            "learner ready"
+        );
         learner_handles.insert(shard_id, learner_handle);
     }
 

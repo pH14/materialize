@@ -125,9 +125,7 @@ impl crate::Acceptor for PersistAcceptorHandle {
             })
             .await
             .map_err(|_| AcceptorError::Shutdown)?;
-        reply_rx
-            .await
-            .map_err(|_| AcceptorError::DroppedReply)?
+        reply_rx.await.map_err(|_| AcceptorError::DroppedReply)?
     }
 }
 
@@ -285,13 +283,13 @@ impl PersistAcceptor {
 
     /// Poll the retraction source and buffer results for the next flush.
     async fn poll_retractions(&mut self, current_upper: u64) {
+        // REVIEW: simplify by requiring a retraction source. If it doesn't make sense
+        /// (e.g. some tests, maybe?), just provide a no-op retraction source that does nothing
         if let Some(ref source) = self.retraction_source {
             let retractions = source.get_retractions(current_upper).await;
+            // REVIEW: Check Rust guides. We should early-out if empty to avoid tons of indentation
             if !retractions.is_empty() {
-                debug!(
-                    count = retractions.len(),
-                    "polled retractions from source"
-                );
+                debug!(count = retractions.len(), "polled retractions from source");
                 // Deduplicate against existing buffer by OrderedKey.
                 let existing: std::collections::BTreeSet<_> = self
                     .buffered_retractions
@@ -312,7 +310,11 @@ impl PersistAcceptor {
     /// This is the **production policy**: open-loop, flush immediately when
     /// there are pending proposals, drain commands after each flush.
     pub async fn run(mut self, mut write: WriteHandle<OrderedKey, Proposal, u64, i64>) {
-        info!("persist acceptor starting");
+        info!(
+            shard_id = %self.log_shard_id,
+            epoch = self.epoch,
+            "acceptor starting"
+        );
         loop {
             if self.has_pending() || !self.buffered_retractions.is_empty() {
                 if let Err(e) = self.flush(&mut write).await {
@@ -323,11 +325,7 @@ impl PersistAcceptor {
 
                 // Poll for retractions every Nth flush.
                 if self.flush_count % self.retraction_poll_interval == 0 {
-                    let upper = write
-                        .upper()
-                        .as_option()
-                        .copied()
-                        .unwrap_or(u64::MAX);
+                    let upper = write.upper().as_option().copied().unwrap_or(u64::MAX);
                     self.poll_retractions(upper).await;
                 }
 
@@ -419,7 +417,7 @@ async fn flush_inner(
             Some(u) => *u,
             None => {
                 // Upper is the empty antichain — the shard has been sealed.
-                warn!("log shard sealed");
+                warn!(log_shard = log_shard_id, "log shard sealed");
                 for reply in replies {
                     let _ = reply.send(Err(AcceptorError::Sealed));
                 }
@@ -503,7 +501,10 @@ async fn flush_inner(
             Ok(Err(upper_mismatch)) => {
                 // Check if the shard was sealed by someone else.
                 if upper_mismatch.current.as_option().is_none() {
-                    warn!("log shard sealed (detected on upper mismatch)");
+                    warn!(
+                        log_shard = log_shard_id,
+                        "log shard sealed (upper mismatch)"
+                    );
                     for reply in replies {
                         let _ = reply.send(Err(AcceptorError::Sealed));
                     }
@@ -581,7 +582,10 @@ async fn write_setup_batches(
     // Skip if another acceptor already wrote (upper ≥ 2).
     let current_upper = write.upper().as_option().copied().unwrap_or(u64::MAX);
     if current_upper >= 2 {
-        info!("bulk snapshot already written (upper={}), skipping", current_upper);
+        info!(
+            "bulk snapshot already written (upper={}), skipping",
+            current_upper
+        );
     } else if predecessors.is_empty() {
         // No predecessors: empty advance through batch_id=1.
         info!("no predecessors, advancing upper through batch_id=1 (empty)");
@@ -694,7 +698,10 @@ async fn write_setup_batches(
 
     let current_upper = write.upper().as_option().copied().unwrap_or(u64::MAX);
     if current_upper >= 3 {
-        info!("delta snapshot already written (upper={}), skipping", current_upper);
+        info!(
+            "delta snapshot already written (upper={}), skipping",
+            current_upper
+        );
     } else if predecessors.is_empty() {
         // No predecessors: empty advance through batch_id=2.
         info!("no predecessors, advancing upper through batch_id=2 (empty)");
@@ -811,7 +818,13 @@ async fn write_setup_batches(
         }
     }
 
-    info!("setup batches complete, acceptor ready for regular traffic");
+    let shard = write.shard_id();
+    info!(
+        %shard,
+        range_lo = range.lo,
+        range_hi = range.hi_exclusive,
+        "setup batches complete, acceptor ready for regular traffic"
+    );
 }
 
 // ---------------------------------------------------------------------------
