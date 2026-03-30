@@ -153,6 +153,14 @@ pub struct PersistAcceptor {
     log_shard_id: String,
     /// Partition map epoch this acceptor was created under.
     epoch: u64,
+    /// Source of retraction entries from the serving layer / learners.
+    retraction_source: Option<Box<dyn crate::RetractionSource>>,
+    /// Buffered retractions waiting to be included in the next flush.
+    buffered_retractions: Vec<(OrderedKey, Proposal)>,
+    /// Flush counter for periodic retraction polling.
+    flush_count: u64,
+    /// Poll for retractions every N flushes.
+    retraction_poll_interval: u64,
 }
 
 impl PersistAcceptor {
@@ -179,9 +187,18 @@ impl PersistAcceptor {
             metrics,
             log_shard_id: log_shard_id.to_string(),
             epoch,
+            retraction_source: None,
+            buffered_retractions: Vec::new(),
+            flush_count: 0,
+            retraction_poll_interval: 100,
         };
         let handle = PersistAcceptorHandle::new(tx);
         (acceptor, write, handle)
+    }
+
+    /// Attach a retraction source for polling retractions from learners.
+    pub fn set_retraction_source(&mut self, source: Box<dyn crate::RetractionSource>) {
+        self.retraction_source = Some(source);
     }
 
     /// Returns true if there are pending proposals or flush barriers.
@@ -232,7 +249,40 @@ impl PersistAcceptor {
         write: &mut WriteHandle<OrderedKey, Proposal, u64, i64>,
     ) -> Result<(), String> {
         let pending = std::mem::take(&mut self.pending);
-        flush_inner(write, pending, &self.metrics, &self.log_shard_id, self.epoch).await
+        let retractions = std::mem::take(&mut self.buffered_retractions);
+        flush_inner(
+            write,
+            pending,
+            &retractions,
+            &self.metrics,
+            &self.log_shard_id,
+            self.epoch,
+        )
+        .await
+    }
+
+    /// Poll the retraction source and buffer results for the next flush.
+    async fn poll_retractions(&mut self, current_upper: u64) {
+        if let Some(ref source) = self.retraction_source {
+            let retractions = source.get_retractions(current_upper).await;
+            if !retractions.is_empty() {
+                debug!(
+                    count = retractions.len(),
+                    "polled retractions from source"
+                );
+                // Deduplicate against existing buffer by OrderedKey.
+                let existing: std::collections::BTreeSet<_> = self
+                    .buffered_retractions
+                    .iter()
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for (key, proposal) in retractions {
+                    if !existing.contains(&key) {
+                        self.buffered_retractions.push((key, proposal));
+                    }
+                }
+            }
+        }
     }
 
     /// Runs the acceptor loop until the channel closes or a fatal error occurs.
@@ -242,11 +292,23 @@ impl PersistAcceptor {
     pub async fn run(mut self, mut write: WriteHandle<OrderedKey, Proposal, u64, i64>) {
         info!("persist acceptor starting");
         loop {
-            if self.has_pending() {
+            if self.has_pending() || !self.buffered_retractions.is_empty() {
                 if let Err(e) = self.flush(&mut write).await {
                     error!("acceptor shutting down: {}", e);
                     break;
                 }
+                self.flush_count += 1;
+
+                // Poll for retractions every Nth flush.
+                if self.flush_count % self.retraction_poll_interval == 0 {
+                    let upper = write
+                        .upper()
+                        .as_option()
+                        .copied()
+                        .unwrap_or(u64::MAX);
+                    self.poll_retractions(upper).await;
+                }
+
                 self.drain_ready_commands();
                 continue;
             }
@@ -277,6 +339,7 @@ impl PersistAcceptor {
 async fn flush_inner(
     write: &mut WriteHandle<OrderedKey, Proposal, u64, i64>,
     pending: Vec<PendingItem>,
+    retractions: &[(OrderedKey, Proposal)],
     metrics: &AcceptorMetrics,
     log_shard_id: &str,
     epoch: u64,
@@ -306,9 +369,9 @@ async fn flush_inner(
         }
     }
 
-    // If there are only barriers and no proposals, resolve them immediately —
-    // no compare_and_append needed.
-    if proposals.is_empty() {
+    // If there are only barriers and no proposals or retractions, resolve
+    // them immediately — no compare_and_append needed.
+    if proposals.is_empty() && retractions.is_empty() {
         for barrier in barriers {
             let _ = barrier.send(());
         }
@@ -357,7 +420,7 @@ async fn flush_inner(
         // Build updates at the current batch_number. Each proposal gets an
         // OrderedKey with (batch_id, position, shard) for stable ordering
         // through compaction. Proposal clone is O(1) via Bytes refcounting.
-        let updates: Vec<_> = proposals
+        let mut updates: Vec<_> = proposals
             .iter()
             .enumerate()
             .map(|(position, p)| {
@@ -370,6 +433,11 @@ async fn flush_inner(
                 ((key, p.clone()), batch_number, 1i64)
             })
             .collect();
+
+        // Include buffered retractions as -1 diffs in the same batch.
+        for (key, proposal) in retractions {
+            updates.push(((key.clone(), proposal.clone()), batch_number, -1i64));
+        }
 
         let new_upper = Antichain::from_elem(batch_number + 1);
 
