@@ -4248,19 +4248,6 @@ dependencies = [
 
 [[package]]
 name = "hyper-tls"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6183ddfa99b85da61a140bea0efc93fdf56ceaa041b37d553518030827f9905"
-dependencies = [
- "bytes",
- "hyper 0.14.32",
- "native-tls",
- "tokio",
- "tokio-native-tls",
-]
-
-[[package]]
-name = "hyper-tls"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
@@ -4498,7 +4485,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.1",
+ "hashbrown 0.15.3",
  "serde",
  "serde_core",
 ]
@@ -5546,7 +5533,7 @@ dependencies = [
  "governor",
  "hex",
  "http 1.4.0",
- "hyper-tls 0.5.0",
+ "hyper-tls",
  "imbl",
  "ipnet",
  "itertools 0.14.0",
@@ -5775,7 +5762,7 @@ dependencies = [
  "bytesize",
  "futures",
  "http 1.4.0",
- "hyper-tls 0.5.0",
+ "hyper-tls",
  "mz-ore",
  "pin-project",
  "thiserror 2.0.18",
@@ -6339,7 +6326,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "humantime",
- "hyper-tls 0.5.0",
+ "hyper-tls",
  "launchdarkly-server-sdk",
  "mz-build-info",
  "mz-dyncfg",
@@ -6390,7 +6377,7 @@ dependencies = [
  "humantime",
  "hyper 1.8.1",
  "hyper-openssl",
- "hyper-tls 0.6.0",
+ "hyper-tls",
  "hyper-util",
  "include_dir",
  "insta",
@@ -7140,7 +7127,7 @@ dependencies = [
  "futures",
  "hibitset",
  "http 1.4.0",
- "hyper-tls 0.6.0",
+ "hyper-tls",
  "hyper-util",
  "itertools 0.14.0",
  "lgalloc",
@@ -10540,7 +10527,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.8.1",
  "hyper-rustls",
- "hyper-tls 0.6.0",
+ "hyper-tls",
  "hyper-util",
  "js-sys",
  "log",
