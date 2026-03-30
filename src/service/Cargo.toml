@@ -32,7 +32,7 @@ sysinfo = "0.29.11"
 tokio = "1.49.0"
 tokio-stream = "0.1.18"
 tracing = "0.1.44"
-sentry-tracing = "0.46.1"
+sentry-tracing = "0.47.0"
 
 [dev-dependencies]
 mz-ore = { path = "../ore", features = ["turmoil"] }
