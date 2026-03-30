@@ -78,6 +78,32 @@ message ProtoAwaitResultRequest {
   uint32 position = 2;
 }
 
+// --- Metashard durable state ---
+
+message ProtoMetashardState {
+  uint64 epoch = 1;
+  repeated ProtoRangeAssignment ranges = 2;
+  repeated ProtoLogShardPredecessor predecessors = 3;
+  optional ProtoReconfigurationIntent intent = 4;
+}
+
+message ProtoRangeAssignment {
+  uint32 lo = 1;          // inclusive lower bound (u8)
+  uint32 hi_exclusive = 2; // exclusive upper bound (u16, max 0x100)
+  string log_shard = 3;   // ShardId
+}
+
+message ProtoLogShardPredecessor {
+  string shard = 1;       // ShardId of the shard that has predecessors
+  repeated string predecessors = 2; // ShardIds of predecessor shards
+}
+
+message ProtoReconfigurationIntent {
+  string status = 1;      // "Preparing", "Sealed", "Committed"
+  uint64 epoch = 2;       // target epoch
+  repeated ProtoRangeAssignment new_ranges = 3; // target partition map
+}
+
 // --- Retraction messages ---
 
 message ProtoGetRetractionsRequest {
