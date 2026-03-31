@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+/// REVIEW: This file is only used by `examples` as far as I can tell. move to that directory?
+
 //! Helper for constructing a [`PersistClient`] with in-process pubsub and
 //! optional latency injection.
 //!

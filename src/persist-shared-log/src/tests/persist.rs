@@ -503,6 +503,8 @@ async fn test_persist_ordering_through_compaction() {
         read.downgrade_since(&timely::progress::Antichain::from_elem(100))
             .await;
 
+        /// REVIEW: Just giving time isn't enough to force a compaction. Typically there need to be enough writes
+        /// to trigger a maintenance task, and then finishing. We need to rewrite this test to really force a compaction or delete it to avoid false promises
         // Give compaction a chance to run.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         drop(read);
@@ -573,12 +575,18 @@ async fn test_persist_retraction_rejected_cas() {
         // Commit another valid entry.
         assert!(h.cas("s0", Some(1), 2, b"second").await);
 
+        /// REVIEW: added some inner comments with the getretractions path, but it is not valid to use u64::MAX here
         // Verify the learner has pending retractions for the rejected proposals.
         let retractions = h.learner_handle.get_retractions(u64::MAX).await.unwrap();
-        assert_eq!(retractions.len(), 2, "expected 2 rejected CAS pending retractions");
+        assert_eq!(
+            retractions.len(),
+            2,
+            "expected 2 rejected CAS pending retractions"
+        );
     }
     // Everything dropped.
 
+    /// REVIEW: This test is incorrect. The retractions haven't been applied to the state!!!
     // Phase 2: re-open with a fresh learner. It replays the shard which now
     // contains both +1 and -1 diffs. Verify state is correct.
     {
@@ -641,7 +649,8 @@ async fn test_persist_retraction_truncate() {
         // = 3 total
         let retractions = h.learner_handle.get_retractions(u64::MAX).await.unwrap();
         assert_eq!(
-            retractions.len(), 3,
+            retractions.len(),
+            3,
             "expected 3 pending retractions (2 truncated entries + truncate op)"
         );
 
@@ -651,6 +660,7 @@ async fn test_persist_retraction_truncate() {
         assert_eq!(scan.data[0].seqno, 3);
     }
 
+    /// REVIEW: As in the other test, the retractions have not been applied yet!!!
     // Phase 2: fresh learner replays shard with retractions.
     {
         let h = PersistTestHarness::new_with_client(&client, shard_id).await;

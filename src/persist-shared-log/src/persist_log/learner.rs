@@ -200,7 +200,10 @@ impl StateMachine {
         trunc: &mz_persist::generated::consensus_service::ProtoTruncateProposal,
         ordered_key: OrderedKey,
         proposal: Proposal,
-    ) -> (Result<ProtoTruncateResponse, String>, Vec<(OrderedKey, Proposal)>) {
+    ) -> (
+        Result<ProtoTruncateResponse, String>,
+        Vec<(OrderedKey, Proposal)>,
+    ) {
         let shard = match self.shards.get(&trunc.key) {
             Some(s) if !s.entries.is_empty() => s,
             _ => {
@@ -215,7 +218,10 @@ impl StateMachine {
 
         if trunc.seqno > head_seqno {
             return (
-                Err(format!("upper bound too high for truncate: {}", trunc.seqno)),
+                Err(format!(
+                    "upper bound too high for truncate: {}",
+                    trunc.seqno
+                )),
                 vec![(ordered_key, proposal)],
             );
         }
@@ -343,6 +349,7 @@ pub enum PersistLearnerCommand {
         reply: oneshot::Sender<Result<ProtoTruncateResponse, String>>,
         received_at: tokio::time::Instant,
     },
+    /// REVIEW: we need to be more specific about what evaluating `through_upper` means. Added a comment on the actual execution method about this
     /// Return a snapshot of pending retractions for proposals evaluated through
     /// `through_upper`. The learner retains the entries — they're only removed
     /// when the -1 diffs arrive via subscription.
@@ -960,12 +967,16 @@ impl<E: EventSource> PersistLearner<E> {
                 self.log_shard.pending_retractions.remove(&key);
 
                 // Clean up the result for this retracted proposal.
-                self.log_shard.results.get_mut(&key.batch_id).map(|results| {
-                    if let Some(slot) = results.get_mut(usize::cast_from(key.position)) {
-                        *slot =
-                            ProposalResult::Cas(ProtoCompareAndSetResponse { committed: false });
-                    }
-                });
+                self.log_shard
+                    .results
+                    .get_mut(&key.batch_id)
+                    .map(|results| {
+                        if let Some(slot) = results.get_mut(usize::cast_from(key.position)) {
+                            *slot = ProposalResult::Cas(ProtoCompareAndSetResponse {
+                                committed: false,
+                            });
+                        }
+                    });
             }
         }
 
@@ -1057,7 +1068,8 @@ impl<E: EventSource> PersistLearner<E> {
                         return;
                     }
                 }
-                self.log_shard.result_waiters
+                self.log_shard
+                    .result_waiters
                     .entry(batch_number)
                     .or_default()
                     .push(ResultWaiter::Cas {
@@ -1086,7 +1098,8 @@ impl<E: EventSource> PersistLearner<E> {
                         return;
                     }
                 }
-                self.log_shard.result_waiters
+                self.log_shard
+                    .result_waiters
                     .entry(batch_number)
                     .or_default()
                     .push(ResultWaiter::Truncate {
@@ -1105,6 +1118,9 @@ impl<E: EventSource> PersistLearner<E> {
                     .as_option()
                     .copied()
                     .unwrap_or(u64::MAX);
+                /// REVIEW: I think we're misusing the word upper here.
+                /// 1. It is incorrect to allow `through_upper` to be greater than the upper of the shard (we don't yet know that value!!!)
+                /// 2. We're not actually asking for the upper, we're just trying to get it at a specific frontier. We could just call the variable `frontier` perhaps?
                 let effective_upper = through_upper.min(frontier);
                 let retractions: Vec<_> = self
                     .log_shard
@@ -1121,8 +1137,6 @@ impl<E: EventSource> PersistLearner<E> {
     // -----------------------------------------------------------------------
     // Learner retractions
     // -----------------------------------------------------------------------
-
-
 
     // -----------------------------------------------------------------------
     // Bus-stand read linearization
@@ -1288,5 +1302,4 @@ impl PersistLearner<ChannelEventSource> {
 
         (handle, task)
     }
-
 }

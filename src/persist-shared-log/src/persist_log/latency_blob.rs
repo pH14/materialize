@@ -7,6 +7,9 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+/// Review: this is used only in test and examples. I'd prefer if this directory were only focused
+/// on the acceptor / learner / metashard. Can we move this file somewhere else?
+
 //! A [`Blob`] wrapper that injects artificial latency, enabling benchmarking
 //! under realistic storage latency profiles (S3 Express, S3 Standard, etc.)
 //! without touching real object storage.
