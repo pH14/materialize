@@ -112,6 +112,53 @@ Client shards (Materialize environment)
                  └─ External Consensus (object storage, OLTP database, ...)
 ```
 
+## Write Scaling: Multiple Log Shards + Metashard
+
+A single log shard tops out around 100K proposals/s. To reach 1M+ ops/sec,
+client shards are range-partitioned across multiple independent log shards,
+each with its own acceptor. A _metashard_ actor maintains the partition map
+(which key ranges map to which log shards) and coordinates reconfigurations.
+
+```
+Client (persist Consensus trait)
+  └─ Serving Layer (routes by partition key)
+       ├─ Metashard (partition map, reconfiguration coordinator)
+       ├─ Acceptor pool (one per log shard)
+       └─ Learner pool (one per log shard)
+```
+
+### Metashard
+
+The metashard is a coordinator actor that:
+- Maintains a range-based partition map: `[lo, hi_exclusive) → log_shard`
+- Coordinates reconfigurations (split/merge): spawns new actors, seals old
+  shards, swaps routing
+- Persists its state (partition map + reconfiguration intents) to its own
+  persist shard for crash recovery
+
+### Reconfiguration
+
+When the partition map changes (e.g., split 1 shard into 2), the metashard
+orchestrates a protocol that moves client shard state from old log shards to
+new ones without losing committed writes:
+
+1. New acceptors are spawned with a list of predecessor shards. Each writes
+   two setup batches into its shard before accepting regular traffic:
+   - **batch_id=1** (bulk snapshot): blind copy of predecessor state at
+     CriticalSince
+   - **batch_id=2** (delta): events between the snapshot point and the seal
+2. The metashard seals old shards after observing the snapshot is written.
+3. After the delta is written, routing switches to the new shards.
+4. CriticalSince holds are released; old shards can be finalized.
+
+The learner is uninvolved in reconfiguration — it subscribes to its shard
+and processes all events (snapshot, delta, regular traffic) with the same
+CaS evaluation logic. The acceptor is the single writer and owns the
+responsibility of making new shards independently complete.
+
+See [05_horizontal_sharding.md](05_horizontal_sharding.md) for the full
+specification.
+
 ## Decoupling
 
 The key structural decision is to push client shard consensus resolution

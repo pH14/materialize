@@ -156,10 +156,12 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Open-loop mode: clients fire as fast as possible with no inter-op sleep.
-    /// Use to find the saturation point (max throughput before latency degrades).
+    /// Saturate mode: clients fire as fast as possible with no inter-op sleep.
+    /// Each client still waits for its current op to complete before issuing the
+    /// next (closed-loop), but removes the rate-limiting sleep between ops.
+    /// Use to find the system's maximum throughput.
     #[arg(long)]
-    open_loop: bool,
+    saturate: bool,
 
     /// Number of log shards (horizontal write scaling). Client shards are
     /// range-partitioned across log shards. Each log shard gets its own
@@ -197,7 +199,7 @@ struct WorkloadConfig {
     #[serde(skip)]
     json: bool,
     #[serde(skip)]
-    open_loop: bool,
+    saturate: bool,
 }
 
 impl Default for WorkloadConfig {
@@ -221,7 +223,7 @@ impl Default for WorkloadConfig {
             duration: 60,
             warmup: 10,
             json: false,
-            open_loop: false,
+            saturate: false,
         }
     }
 }
@@ -275,7 +277,7 @@ impl WorkloadConfig {
             grpc_connections,
         );
         cfg.json = cli.json;
-        cfg.open_loop = cli.open_loop;
+        cfg.saturate = cli.saturate;
 
         cfg
     }
@@ -285,7 +287,7 @@ impl WorkloadConfig {
         assert_eq!(total, 100, "operation mix must sum to 100, got {}", total);
         assert!(self.num_shards > 0, "num_shards must be > 0");
         assert!(self.writers_per_shard > 0, "writers_per_shard must be > 0");
-        if !self.open_loop {
+        if !self.saturate {
             assert!(
                 self.write_rate_per_second > 0.0,
                 "write_rate_per_second must be > 0"
@@ -523,7 +525,7 @@ struct ClientConfig {
     scan_limit: u64,
     truncate_to: u64,
     seed: u64,
-    open_loop: bool,
+    saturate: bool,
 }
 
 async fn client_task(
@@ -620,8 +622,8 @@ async fn client_task(
 
         // Sleep for remaining interval so we target start-to-start timing,
         // not end-to-start. If the op took longer than the interval, skip sleep.
-        // In open-loop mode, skip sleep entirely — fire as fast as possible.
-        if !cfg.open_loop {
+        // In saturate mode, skip sleep entirely — fire as fast as possible.
+        if !cfg.saturate {
             let elapsed = start.elapsed();
             if let Some(remaining) = sleep_dur.checked_sub(elapsed) {
                 tokio::time::sleep(remaining).await;
@@ -1324,7 +1326,7 @@ async fn main() {
             scan_limit: cfg.scan_limit,
             truncate_to: cfg.truncate_to,
             seed: u64::cast_from(seed),
-            open_loop: cfg.open_loop,
+            saturate: cfg.saturate,
         };
         client_handles.push(mz_ore::task::spawn(|| "specsheet-client", async move {
             client_task(t, client_cfg, stop, warmup_end).await

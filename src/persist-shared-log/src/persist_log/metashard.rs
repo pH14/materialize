@@ -142,6 +142,7 @@ impl MetashardState {
 /// Commands dispatched to the metashard actor.
 pub enum MetashardCommand {
     /// Look up which log shard owns a client shard.
+    /// REVIEW: I don't think this one is necessary? `PartitionMap` could have a method to lookup a specific client shard
     Lookup {
         client_shard: String,
         reply: oneshot::Sender<Result<ShardId, MetashardError>>,
@@ -397,16 +398,16 @@ impl PersistMetashardActor {
                                 plan,
                                 status,
                             });
-                            info!(epoch = intent_proto.epoch, "recovered pending reconfiguration intent");
+                            info!(
+                                epoch = intent_proto.epoch,
+                                "recovered pending reconfiguration intent"
+                            );
                         }
                     }
 
                     // Restore partition map.
-                    let persisted_ranges: Vec<RangeAssignment> = proto
-                        .ranges
-                        .iter()
-                        .filter_map(|r| parse_range(r))
-                        .collect();
+                    let persisted_ranges: Vec<RangeAssignment> =
+                        proto.ranges.iter().filter_map(|r| parse_range(r)).collect();
                     if !persisted_ranges.is_empty() {
                         let map = PartitionMap {
                             epoch: proto.epoch,
@@ -452,47 +453,48 @@ impl PersistMetashardActor {
 
         let write = &mut self.metashard_write;
 
-        let proto = ProtoMetashardState {
-            epoch: self.state.epoch,
-            ranges: self
-                .state
-                .partition_map
-                .ranges
-                .iter()
-                .map(|r| ProtoRangeAssignment {
-                    lo: u32::from(r.lo),
-                    hi_exclusive: u32::from(r.hi_exclusive),
-                    log_shard: r.log_shard.to_string(),
-                })
-                .collect(),
-            predecessors: self
-                .state
-                .log_shards
-                .iter()
-                .filter(|(_, info)| !info.predecessors.is_empty())
-                .map(|(shard_id, info)| ProtoLogShardPredecessor {
-                    shard: shard_id.to_string(),
-                    predecessors: info.predecessors.iter().map(|p| p.to_string()).collect(),
-                })
-                .collect(),
-            intent: self.state.pending_intent.as_ref().map(|intent| {
-                ProtoReconfigurationIntent {
-                    status: format!("{:?}", intent.status),
-                    epoch: intent.epoch,
-                    new_ranges: intent
-                        .plan
-                        .new_partition_map
-                        .ranges
-                        .iter()
-                        .map(|r| ProtoRangeAssignment {
-                            lo: u32::from(r.lo),
-                            hi_exclusive: u32::from(r.hi_exclusive),
-                            log_shard: r.log_shard.to_string(),
-                        })
-                        .collect(),
-                }
-            }),
-        };
+        let proto =
+            ProtoMetashardState {
+                epoch: self.state.epoch,
+                ranges: self
+                    .state
+                    .partition_map
+                    .ranges
+                    .iter()
+                    .map(|r| ProtoRangeAssignment {
+                        lo: u32::from(r.lo),
+                        hi_exclusive: u32::from(r.hi_exclusive),
+                        log_shard: r.log_shard.to_string(),
+                    })
+                    .collect(),
+                predecessors: self
+                    .state
+                    .log_shards
+                    .iter()
+                    .filter(|(_, info)| !info.predecessors.is_empty())
+                    .map(|(shard_id, info)| ProtoLogShardPredecessor {
+                        shard: shard_id.to_string(),
+                        predecessors: info.predecessors.iter().map(|p| p.to_string()).collect(),
+                    })
+                    .collect(),
+                intent: self.state.pending_intent.as_ref().map(|intent| {
+                    ProtoReconfigurationIntent {
+                        status: format!("{:?}", intent.status),
+                        epoch: intent.epoch,
+                        new_ranges: intent
+                            .plan
+                            .new_partition_map
+                            .ranges
+                            .iter()
+                            .map(|r| ProtoRangeAssignment {
+                                lo: u32::from(r.lo),
+                                hi_exclusive: u32::from(r.hi_exclusive),
+                                log_shard: r.log_shard.to_string(),
+                            })
+                            .collect(),
+                    }
+                }),
+            };
 
         let data = Bytes::from(proto.encode_to_vec());
 

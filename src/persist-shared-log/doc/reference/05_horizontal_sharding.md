@@ -34,10 +34,10 @@ Client (persist Consensus trait)
 ```
 
 **Four actor roles:**
-1. **Acceptor** — one per log shard, unchanged except for a new `Sealed` error variant
-2. **Learner** — partitioned by range. 1..N replicas per log shard for fault tolerance. Each replica subscribes to the log shards in its range, materializes those client shards' state. All replicas for the same range produce identical state (C1). On reconfiguration, learners carry forward state and transition subscriptions.
-3. **Metashard Actor** — new role. Maintains the range-based partition map, coordinates reconfigurations (including pre-hydration), manages acceptor/learner lifecycle (spawn, teardown).
-4. **Serving Layer** — new role. Routes client requests to the correct acceptor/learner based on the cached partition map.
+1. **Acceptor** — one per log shard. Owns predecessor state writing during reconfiguration: writes batch_id=1 (bulk snapshot) and batch_id=2 (delta) before entering its normal flush loop. Detects seal via `Sealed` error variant.
+2. **Learner** — partitioned by range. 1..N replicas per log shard for fault tolerance. Each replica subscribes to its own log shard only and processes all events (snapshot, delta, regular traffic) with standard CaS semantics. No predecessor shard awareness. All replicas produce identical state (C1).
+3. **Metashard Actor** — maintains the range-based partition map, coordinates reconfigurations (CriticalSince holds, sealing, frontier watching, routing swaps), manages acceptor/learner lifecycle.
+4. **Serving Layer** — routes client requests to the correct acceptor/learner based on the cached partition map. Retries on `Sealed`/`Shutdown` during reconfiguration.
 
 ---
 
