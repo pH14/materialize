@@ -51,6 +51,7 @@ use crate::persist_log::acceptor::PersistAcceptor;
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig};
 use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
 use crate::sharded_service::ShardedService;
+use crate::factory::InProcessActorFactory;
 use crate::{AcceptorConfig, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 /// Port for consensus and blob turmoil servers.
@@ -156,7 +157,7 @@ fn sim_cluster_smoke() {
             shard_ids[0],
             acceptor_metrics,
             0,
-            None,
+            Box::new(crate::NoOpRetractionSource),
             vec![],
             crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
         )
@@ -179,11 +180,12 @@ fn sim_cluster_smoke() {
         let routing_handle = service.routing_handle();
 
         let metashard_state = MetashardState::single(shard_ids[0]);
+        let factory = InProcessActorFactory::new(client.clone());
         let (_ms_handle, _ms_task) = PersistMetashardActor::spawn(
             metashard_state,
             256,
             client,
-            registry,
+            factory,
             routing_handle,
             ms_shard,
         )
@@ -274,7 +276,7 @@ fn sim_cluster_crash_restart() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc_handle, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
                 vec![],
                 crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
@@ -292,7 +294,7 @@ fn sim_cluster_crash_restart() {
             let routing_handle = service.routing_handle();
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client, registry, routing_handle, ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -333,7 +335,7 @@ fn sim_cluster_crash_restart() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc_handle, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
                 vec![],
                 crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
@@ -351,7 +353,7 @@ fn sim_cluster_crash_restart() {
             let routing_handle = service.routing_handle();
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client, registry, routing_handle, ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -425,7 +427,7 @@ fn sim_cluster_persist_partition() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
                 vec![],
                 crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
@@ -442,7 +444,7 @@ fn sim_cluster_persist_partition() {
             let routing_handle = service.routing_handle();
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client, registry, routing_handle, ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -482,7 +484,7 @@ fn sim_cluster_persist_partition() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
                 vec![],
                 crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
@@ -499,7 +501,7 @@ fn sim_cluster_persist_partition() {
             let routing_handle = service.routing_handle();
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client, registry, routing_handle, ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -625,7 +627,7 @@ fn sim_cluster_split_with_writes() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
                 vec![],
                 crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
@@ -642,7 +644,7 @@ fn sim_cluster_split_with_writes() {
             let routing_handle = service.routing_handle();
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client, registry, routing_handle, ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, ms_shard,
             ).await;
 
             let key_lo = "s10000000-0000-0000-0000-000000000000"; // 0x10 → [0x00, 0x80)
@@ -751,7 +753,7 @@ fn sim_cluster_reconfig_with_buggify() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
                 vec![],
                 crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
@@ -768,7 +770,7 @@ fn sim_cluster_reconfig_with_buggify() {
             let routing_handle = service.routing_handle();
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client, registry, routing_handle, ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -861,7 +863,7 @@ fn sim_cluster_split_during_persist_partition() {
             let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
             let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, None,
+                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
                 vec![],
                 crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
             ).await;
@@ -878,7 +880,7 @@ fn sim_cluster_split_during_persist_partition() {
             let routing_handle = service.routing_handle();
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client, registry, routing_handle, ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";

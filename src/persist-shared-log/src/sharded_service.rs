@@ -43,7 +43,7 @@ use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, Reconfi
 
 /// Implements [`RetractionSource`] by fanning out to learner replicas and
 /// returning the first response. All replicas are deterministic, so any
-/// response is correct given the same `through_upper`.
+/// response is correct given the same `frontier`.
 pub struct ShardedRetractionSource {
     learners: Vec<crate::persist_log::learner::PersistLearnerHandle>,
 }
@@ -58,12 +58,12 @@ impl ShardedRetractionSource {
 impl crate::RetractionSource for ShardedRetractionSource {
     async fn get_retractions(
         &self,
-        through_upper: u64,
+        frontier: u64,
     ) -> Vec<(OrderedKey, Proposal)> {
         // Try each learner replica in order. All replicas are deterministic,
         // so any response is correct. The first success is returned.
         for learner in &self.learners {
-            match learner.get_retractions(through_upper).await {
+            match learner.get_retractions(frontier).await {
                 Ok(retractions) => return retractions,
                 Err(_) => continue, // Try next replica.
             }

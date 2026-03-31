@@ -171,7 +171,7 @@ pub struct PersistAcceptor {
     /// Partition map epoch this acceptor was created under.
     epoch: u64,
     /// Source of retraction entries from the serving layer / learners.
-    retraction_source: Option<Box<dyn crate::RetractionSource>>,
+    retraction_source: Box<dyn crate::RetractionSource>,
     /// Buffered retractions waiting to be included in the next flush.
     buffered_retractions: Vec<(OrderedKey, Proposal)>,
     /// Flush counter for periodic retraction polling.
@@ -204,7 +204,7 @@ impl PersistAcceptor {
             metrics,
             log_shard_id: log_shard_id.to_string(),
             epoch,
-            retraction_source: None,
+            retraction_source: Box::new(crate::NoOpRetractionSource),
             buffered_retractions: Vec::new(),
             flush_count: 0,
             retraction_poll_interval: 100,
@@ -215,7 +215,7 @@ impl PersistAcceptor {
 
     /// Attach a retraction source for polling retractions from learners.
     pub fn set_retraction_source(&mut self, source: Box<dyn crate::RetractionSource>) {
-        self.retraction_source = Some(source);
+        self.retraction_source = source;
     }
 
     /// Returns true if there are pending proposals or flush barriers.
@@ -243,7 +243,7 @@ impl PersistAcceptor {
                 self.pending.push(PendingItem::FlushBarrier(reply));
             }
             PersistAcceptorCommand::SetRetractionSource { source } => {
-                self.retraction_source = Some(source);
+                self.retraction_source = source;
             }
         }
     }
@@ -283,24 +283,20 @@ impl PersistAcceptor {
 
     /// Poll the retraction source and buffer results for the next flush.
     async fn poll_retractions(&mut self, current_upper: u64) {
-        // REVIEW: simplify by requiring a retraction source. If it doesn't make sense
-        // (e.g. some tests, maybe?), just provide a no-op retraction source that does nothing
-        if let Some(ref source) = self.retraction_source {
-            let retractions = source.get_retractions(current_upper).await;
-            // REVIEW: Check Rust guides. We should early-out if empty to avoid tons of indentation
-            if !retractions.is_empty() {
-                debug!(count = retractions.len(), "polled retractions from source");
-                // Deduplicate against existing buffer by OrderedKey.
-                let existing: std::collections::BTreeSet<_> = self
-                    .buffered_retractions
-                    .iter()
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for (key, proposal) in retractions {
-                    if !existing.contains(&key) {
-                        self.buffered_retractions.push((key, proposal));
-                    }
-                }
+        let retractions = self.retraction_source.get_retractions(current_upper).await;
+        if retractions.is_empty() {
+            return;
+        }
+        debug!(count = retractions.len(), "polled retractions from source");
+        // Deduplicate against existing buffer by OrderedKey.
+        let existing: std::collections::BTreeSet<_> = self
+            .buffered_retractions
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        for (key, proposal) in retractions {
+            if !existing.contains(&key) {
+                self.buffered_retractions.push((key, proposal));
             }
         }
     }
@@ -844,7 +840,7 @@ impl PersistAcceptor {
         shard_id: ShardId,
         metrics: AcceptorMetrics,
         epoch: u64,
-        retraction_source: Option<Box<dyn crate::RetractionSource>>,
+        retraction_source: Box<dyn crate::RetractionSource>,
         predecessors: Vec<PredecessorSpec>,
         range: crate::RangeAssignment,
     ) -> (PersistAcceptorHandle, mz_ore::task::JoinHandle<()>) {
@@ -859,9 +855,7 @@ impl PersistAcceptor {
             .expect("failed to open persist shard for acceptor");
 
         let (mut acceptor, mut write, handle) = Self::new(config, write, metrics, shard_id, epoch);
-        if let Some(source) = retraction_source {
-            acceptor.set_retraction_source(source);
-        }
+        acceptor.set_retraction_source(retraction_source);
         let client = client.clone();
         let task = mz_ore::task::spawn(|| "persist-acceptor", async move {
             write_setup_batches(&mut write, &client, &predecessors, &range).await;

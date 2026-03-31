@@ -25,6 +25,7 @@ use mz_persist_shared_log::metrics::{AcceptorMetrics, LearnerMetrics};
 use mz_persist_shared_log::persist_log::acceptor::PersistAcceptor;
 use mz_persist_shared_log::persist_log::learner::{PersistLearner, PersistLearnerConfig};
 use mz_persist_shared_log::persist_log::metashard::{MetashardState, PersistMetashardActor};
+use mz_persist_shared_log::factory::InProcessActorFactory;
 use mz_persist_shared_log::sharded_service::{RoutingState, ShardedService};
 use mz_persist_shared_log::{AcceptorConfig, PartitionMap, RangeAssignment};
 
@@ -205,11 +206,13 @@ async fn run(args: Args) {
     // but doesn't use it during construction.
     let empty_routing = Arc::new(RwLock::new(RoutingState::empty()));
 
+    let factory = InProcessActorFactory::new(persist_client.clone());
+
     let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
         bootstrap_state,
         256,
         persist_client.clone(),
-        metrics_registry.clone(),
+        factory,
         Arc::clone(&empty_routing),
         metashard_shard_id,
     )
@@ -245,7 +248,7 @@ async fn run(args: Args) {
             shard_id,
             acceptor_metrics,
             epoch,
-            None, // Retraction source wired after learners are spawned.
+            Box::new(mz_persist_shared_log::NoOpRetractionSource), // Wired to real source after learners spawn.
             vec![],
             range.clone(),
         )

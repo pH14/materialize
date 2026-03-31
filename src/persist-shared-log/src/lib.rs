@@ -35,10 +35,14 @@ use mz_persist::generated::consensus_service::{
 };
 use mz_persist_client::ShardId;
 
+pub mod factory;
+
 pub mod fault;
 pub mod metrics;
 pub mod persist_log;
 pub mod service;
+pub mod rpc;
+
 pub mod sharded_service;
 
 #[cfg(test)]
@@ -322,15 +326,37 @@ pub trait Metashard: Clone + std::fmt::Debug + Send + Sync + 'static {
 /// acceptor and retraction writer — the acceptor is the single writer.
 #[async_trait::async_trait]
 pub trait RetractionSource: Send + Sync + 'static {
-    /// Return pending retractions for proposals evaluated through `through_upper`.
+    /// Return pending retractions for proposals with `batch_id < frontier`.
+    ///
+    /// `frontier` must be ≤ the caller's known upper — passing a value beyond
+    /// what the learner has observed is semantically invalid (we don't know the
+    /// retraction set at times we haven't seen). The learner caps the frontier
+    /// to its listen frontier as a safety check, but callers should not rely on
+    /// this.
     ///
     /// Returns a read-only snapshot — the learner retains entries in
     /// `pending_retractions` until it sees the -1 diffs arrive via the
     /// subscription (confirming the acceptor flushed them).
     async fn get_retractions(
         &self,
-        through_upper: u64,
+        frontier: u64,
     ) -> Vec<(persist_log::OrderedKey, persist_log::Proposal)>;
+}
+
+/// A no-op retraction source that always returns an empty list.
+///
+/// Used when the acceptor doesn't need retraction polling (e.g. tests that
+/// don't exercise the retraction pipeline).
+pub struct NoOpRetractionSource;
+
+#[async_trait::async_trait]
+impl RetractionSource for NoOpRetractionSource {
+    async fn get_retractions(
+        &self,
+        _frontier: u64,
+    ) -> Vec<(persist_log::OrderedKey, persist_log::Proposal)> {
+        Vec::new()
+    }
 }
 
 /// A plan for a reconfiguration operation.

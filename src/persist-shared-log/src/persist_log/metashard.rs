@@ -27,17 +27,16 @@ use tracing::{debug, info, warn};
 use bytes::Bytes;
 use prost::Message;
 
-use mz_ore::metrics::MetricsRegistry;
 use mz_persist_client::critical::{CriticalReaderId, Opaque, SinceHandle};
 use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
-use crate::metrics::{AcceptorMetrics, LearnerMetrics};
-use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
-use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::factory::ActorFactory;
 use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::sharded_service::RoutingState;
-use crate::{AcceptorConfig, MetashardError, PartitionMap, RangeAssignment, ReconfigurationPlan};
+use crate::{
+    MetashardError, PartitionMap, RangeAssignment, ReconfigurationPlan,
+};
 
 // ---------------------------------------------------------------------------
 // Metashard state
@@ -139,7 +138,7 @@ impl MetashardState {
 /// Commands dispatched to the metashard actor.
 pub enum MetashardCommand {
     /// Look up which log shard owns a client shard.
-    /// REVIEW: I don't think this one is necessary? `PartitionMap` could have a method to lookup a specific client shard
+    // TODO: Consider removing — callers can use `PartitionMap::route` directly.
     Lookup {
         client_shard: String,
         reply: oneshot::Sender<Result<ShardId, MetashardError>>,
@@ -229,16 +228,15 @@ impl crate::Metashard for PersistMetashardHandle {
 /// Maintains an in-memory [`MetashardState`] and serves commands from the
 /// handle. On reconfiguration, orchestrates: validate → spawn new actors →
 /// seal old shards → update partition map → swap routing state.
-pub struct PersistMetashardActor {
+pub struct PersistMetashardActor<F: ActorFactory> {
     state: MetashardState,
     rx: mpsc::Receiver<MetashardCommand>,
-    /// PersistClient for creating new log shard persist shards and spawning actors.
+    /// PersistClient for metashard's own durable state and sealing operations.
     persist_client: PersistClient,
-    /// Metrics registry for spawning new acceptors and learners.
-    #[allow(dead_code)]
-    metrics_registry: MetricsRegistry,
+    /// Factory for creating new acceptors and learners during reconfiguration.
+    factory: F,
     /// Handle to the ShardedService's routing state, for atomic swaps during reconfiguration.
-    routing: Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>>,
+    routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
     /// Whether a reconfiguration is currently in progress.
     reconfiguring: bool,
     /// Persist shard for durable metashard state. The partition map and
@@ -250,15 +248,15 @@ pub struct PersistMetashardActor {
     metashard_write: mz_persist_client::write::WriteHandle<OrderedKey, Proposal, u64, i64>,
 }
 
-impl PersistMetashardActor {
+impl<F: ActorFactory> PersistMetashardActor<F> {
     /// Create a new metashard actor. Opens the durable state persist shard
     /// eagerly and recovers any persisted state (partition map, pending intents).
     pub async fn new(
         mut state: MetashardState,
         queue_depth: usize,
         persist_client: PersistClient,
-        metrics_registry: MetricsRegistry,
-        routing: Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>>,
+        factory: F,
+        routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
         metashard_shard_id: ShardId,
     ) -> (Self, PersistMetashardHandle) {
         let (tx, rx) = mpsc::channel(queue_depth);
@@ -380,7 +378,7 @@ impl PersistMetashardActor {
                         let intent_ranges: Vec<RangeAssignment> = intent_proto
                             .new_ranges
                             .iter()
-                            .filter_map(|r| parse_range(r))
+                            .filter_map(parse_range)
                             .collect();
                         if !intent_ranges.is_empty() {
                             let plan = ReconfigurationPlan {
@@ -404,7 +402,7 @@ impl PersistMetashardActor {
 
                     // Restore partition map.
                     let persisted_ranges: Vec<RangeAssignment> =
-                        proto.ranges.iter().filter_map(|r| parse_range(r)).collect();
+                        proto.ranges.iter().filter_map(parse_range).collect();
                     if !persisted_ranges.is_empty() {
                         let map = PartitionMap {
                             epoch: proto.epoch,
@@ -431,7 +429,7 @@ impl PersistMetashardActor {
             state,
             rx,
             persist_client,
-            metrics_registry,
+            factory,
             routing,
             reconfiguring: false,
             metashard_shard_id,
@@ -535,10 +533,6 @@ impl PersistMetashardActor {
 
         for range in &map.ranges {
             let shard_id = range.log_shard;
-            let shard_registry = MetricsRegistry::new();
-            let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
-            let learner_metrics = LearnerMetrics::register(&shard_registry);
-
             // Walk the full transitive predecessor chain so that multi-hop
             // carried-forward state (L1→L2→L4) is reconstructed on recovery.
             let predecessors = self.transitive_predecessors(shard_id);
@@ -562,17 +556,11 @@ impl PersistMetashardActor {
                 pred_specs.push((pred_shard, read.since().clone()));
             }
 
-            let (acceptor_handle, _task) = PersistAcceptor::spawn(
-                AcceptorConfig::default(),
-                &self.persist_client,
-                shard_id,
-                acceptor_metrics,
-                self.state.epoch,
-                None,
-                pred_specs,
-                range.clone(),
-            )
-            .await;
+            let acceptor_handle = self
+                .factory
+                .create_acceptor(shard_id, self.state.epoch, pred_specs, range.clone())
+                .await
+                .expect("failed to create acceptor during rebuild");
 
             if !predecessors.is_empty() {
                 info!(
@@ -581,27 +569,25 @@ impl PersistMetashardActor {
                     "spawning recovered learner with predecessor replay"
                 );
             }
-            let (learner_handle, _task) = PersistLearner::spawn(
-                PersistLearnerConfig::default(),
-                &self.persist_client,
-                shard_id,
-                learner_metrics,
-            )
-            .await;
+            let learner_handle = self
+                .factory
+                .create_learner(shard_id)
+                .await
+                .expect("failed to create learner during rebuild");
 
             info!(%shard_id, "spawned recovered actor");
             acceptors.insert(shard_id, acceptor_handle);
             learners.insert(shard_id, learner_handle);
         }
 
-        /// REVIEW: This naming is very confusing, we should make it clear it's a lock. Can we pull this into its own scope so the drop is implicit, perhaps? A bit more Rust-y
-        let mut routing = self.routing.write().await;
-        *routing = RoutingState {
-            partition_map: map.clone(),
-            acceptors,
-            learners,
-        };
-        drop(routing);
+        {
+            let mut routing_guard = self.routing.write().await;
+            *routing_guard = RoutingState {
+                partition_map: map.clone(),
+                acceptors,
+                learners,
+            };
+        }
         info!(
             epoch = self.state.epoch,
             num_shards = map.ranges.len(),
@@ -616,9 +602,7 @@ impl PersistMetashardActor {
     }
 
     /// Get the routing handle for external updates.
-    pub fn routing_handle(
-        &self,
-    ) -> &Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>> {
+    pub fn routing_handle(&self) -> &Arc<RwLock<RoutingState<F::A, F::L>>> {
         &self.routing
     }
 
@@ -786,10 +770,10 @@ impl PersistMetashardActor {
 
         // Build a map from predecessor shard → CriticalSince frontier for the
         // acceptor's setup batches. The acceptor subscribes at this since.
-        let predecessor_sinces: BTreeMap<ShardId, Antichain<u64>> = critical_holds
+        let predecessor_sinces: BTreeMap<ShardId, Antichain<u64>> = retiring
             .iter()
-            .zip(retiring.iter())
-            .map(|(handle, &shard_id)| (shard_id, handle.since().clone()))
+            .enumerate()
+            .map(|(i, &shard_id)| (shard_id, critical_holds[i].since().clone()))
             .collect();
 
         // NOTE: We intentionally do NOT write snapshot CaS rows to new shards
@@ -829,38 +813,28 @@ impl PersistMetashardActor {
                 .filter(|s| retiring.contains(s))
                 .collect();
 
-            let shard_registry = MetricsRegistry::new();
-            let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
-            let learner_metrics = LearnerMetrics::register(&shard_registry);
+            let pred_specs: Vec<_> = predecessors
+                .iter()
+                .map(|s| {
+                    let since = predecessor_sinces
+                        .get(s)
+                        .cloned()
+                        .unwrap_or_else(|| Antichain::from_elem(0));
+                    (*s, since)
+                })
+                .collect();
 
-            let (acceptor_handle, _task) = PersistAcceptor::spawn(
-                AcceptorConfig::default(),
-                &self.persist_client,
-                shard_id,
-                acceptor_metrics,
-                new_epoch,
-                None,
-                predecessors
-                    .iter()
-                    .map(|s| {
-                        let since = predecessor_sinces
-                            .get(s)
-                            .cloned()
-                            .unwrap_or_else(|| Antichain::from_elem(0));
-                        (*s, since)
-                    })
-                    .collect(),
-                new_range.clone(),
-            )
-            .await;
+            let acceptor_handle = self
+                .factory
+                .create_acceptor(shard_id, new_epoch, pred_specs, new_range.clone())
+                .await
+                .map_err(MetashardError::Command)?;
 
-            let (learner_handle, _task) = PersistLearner::spawn(
-                PersistLearnerConfig::default(),
-                &self.persist_client,
-                shard_id,
-                learner_metrics,
-            )
-            .await;
+            let learner_handle = self
+                .factory
+                .create_learner(shard_id)
+                .await
+                .map_err(MetashardError::Command)?;
 
             info!(
                 %shard_id,
@@ -916,48 +890,49 @@ impl PersistMetashardActor {
         crate::fault::maybe_fail("after_seal").map_err(MetashardError::Command)?;
 
         // Phase 4: Build new routing state and swap atomically.
-        let mut routing = self.routing.write().await;
+        let new_partition_map = {
+            let mut routing_guard = self.routing.write().await;
 
-        // Carry forward acceptors/learners for shards that remain.
-        let mut all_acceptors = BTreeMap::new();
-        let mut all_learners = BTreeMap::new();
+            // Carry forward acceptors/learners for shards that remain.
+            let mut all_acceptors = BTreeMap::new();
+            let mut all_learners = BTreeMap::new();
 
-        for range in &new_map.ranges {
-            if let Some(a) = routing.acceptors.get(&range.log_shard) {
-                all_acceptors.insert(range.log_shard, a.clone());
-            } else if let Some(a) = new_acceptors.remove(&range.log_shard) {
-                all_acceptors.insert(range.log_shard, a);
-            } else {
-                return Err(MetashardError::Command(format!(
-                    "no acceptor for log shard {} in new partition map",
-                    range.log_shard
-                )));
+            for range in &new_map.ranges {
+                if let Some(a) = routing_guard.acceptors.get(&range.log_shard) {
+                    all_acceptors.insert(range.log_shard, a.clone());
+                } else if let Some(a) = new_acceptors.remove(&range.log_shard) {
+                    all_acceptors.insert(range.log_shard, a);
+                } else {
+                    return Err(MetashardError::Command(format!(
+                        "no acceptor for log shard {} in new partition map",
+                        range.log_shard
+                    )));
+                }
+
+                if let Some(l) = routing_guard.learners.get(&range.log_shard) {
+                    all_learners.insert(range.log_shard, l.clone());
+                } else if let Some(l) = new_learners.remove(&range.log_shard) {
+                    all_learners.insert(range.log_shard, l);
+                } else {
+                    return Err(MetashardError::Command(format!(
+                        "no learner for log shard {} in new partition map",
+                        range.log_shard
+                    )));
+                }
             }
 
-            if let Some(l) = routing.learners.get(&range.log_shard) {
-                all_learners.insert(range.log_shard, l.clone());
-            } else if let Some(l) = new_learners.remove(&range.log_shard) {
-                all_learners.insert(range.log_shard, l);
-            } else {
-                return Err(MetashardError::Command(format!(
-                    "no learner for log shard {} in new partition map",
-                    range.log_shard
-                )));
-            }
-        }
+            let new_partition_map = PartitionMap {
+                epoch: new_epoch,
+                ranges: new_map.ranges.clone(),
+            };
 
-        // Update routing state and metashard state atomically.
-        let new_partition_map = PartitionMap {
-            epoch: new_epoch,
-            ranges: new_map.ranges.clone(),
+            *routing_guard = RoutingState {
+                partition_map: new_partition_map.clone(),
+                acceptors: all_acceptors,
+                learners: all_learners,
+            };
+            new_partition_map
         };
-
-        *routing = RoutingState {
-            partition_map: new_partition_map.clone(),
-            acceptors: all_acceptors,
-            learners: all_learners,
-        };
-        drop(routing);
 
         // Track new log shards in metashard state.
         for range in &new_map.ranges {
@@ -1030,6 +1005,9 @@ impl PersistMetashardActor {
                 }
             }
         }
+
+        // TODO: Retract durable state for fully-finalized prior epochs so the
+        // metashard shard doesn't grow unboundedly.
 
         info!(new_epoch, "reconfiguration complete");
         Ok(new_epoch)
@@ -1125,15 +1103,15 @@ impl PersistMetashardActor {
         state: MetashardState,
         queue_depth: usize,
         persist_client: PersistClient,
-        metrics_registry: MetricsRegistry,
-        routing: Arc<RwLock<RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>>,
+        factory: F,
+        routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
         metashard_shard_id: ShardId,
     ) -> (PersistMetashardHandle, mz_ore::task::JoinHandle<()>) {
         let (actor, handle) = Self::new(
             state,
             queue_depth,
             persist_client,
-            metrics_registry,
+            factory,
             routing,
             metashard_shard_id,
         )
@@ -1146,6 +1124,7 @@ impl PersistMetashardActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::factory::ActorFactory;
     use crate::Metashard;
 
     fn test_shard(suffix: &str) -> ShardId {
@@ -1360,33 +1339,24 @@ mod tests {
         let dummy_shard = test_shard("ddd");
         let dummy_map = PartitionMap::single(dummy_shard);
 
-        let shard_registry = MetricsRegistry::new();
-        let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
-        let learner_metrics = LearnerMetrics::register(&shard_registry);
-
-        let (acc_handle, _acc_task) = PersistAcceptor::spawn(
-            crate::AcceptorConfig::default(),
-            &client,
-            dummy_shard,
-            acceptor_metrics,
-            0,
-            None,
-            vec![],
-            crate::RangeAssignment {
-                lo: 0x00,
-                hi_exclusive: 0x100,
-                log_shard: dummy_shard,
-            },
-        )
-        .await;
-
-        let (lrn_handle, _lrn_task) = PersistLearner::spawn(
-            PersistLearnerConfig::default(),
-            &client,
-            dummy_shard,
-            learner_metrics,
-        )
-        .await;
+        let factory = crate::factory::InProcessActorFactory::new(client.clone());
+        let acc_handle = factory
+            .create_acceptor(
+                dummy_shard,
+                0,
+                vec![],
+                crate::RangeAssignment {
+                    lo: 0x00,
+                    hi_exclusive: 0x100,
+                    log_shard: dummy_shard,
+                },
+            )
+            .await
+            .expect("spawn dummy acceptor");
+        let lrn_handle = factory
+            .create_learner(dummy_shard)
+            .await
+            .expect("spawn dummy learner");
 
         let mut dummy_acceptors = BTreeMap::new();
         let mut dummy_learners = BTreeMap::new();
@@ -1397,13 +1367,12 @@ mod tests {
             dummy_acceptors,
             dummy_learners,
         )));
-        let registry = MetricsRegistry::new();
 
         let (mut actor, _handle) = PersistMetashardActor::new(
             state.clone(),
             64,
             client.clone(),
-            registry,
+            factory,
             Arc::clone(&routing),
             metashard_shard,
         )
@@ -1416,13 +1385,13 @@ mod tests {
 
         // --- Recover from the same shard ---
         let bootstrap = MetashardState::single(test_shard("eee"));
-        let registry2 = MetricsRegistry::new();
+        let factory2 = crate::factory::InProcessActorFactory::new(client.clone());
 
         let (recovered_actor, _handle2) = PersistMetashardActor::new(
             bootstrap,
             64,
             client.clone(),
-            registry2,
+            factory2,
             Arc::clone(&routing),
             metashard_shard,
         )

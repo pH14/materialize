@@ -146,6 +146,15 @@ pub(crate) struct LogShardState<E: EventSource> {
     /// Proposals eligible for retraction, accumulated during apply.
     /// Drained by the periodic retraction sweep.
     pub(crate) pending_retractions: BTreeMap<OrderedKey, Proposal>,
+    /// Clients waiting for retractions at a specific frontier.
+    /// Woken when listen_frontier advances past the requested frontier.
+    pub(crate) retraction_waiters: Vec<RetractionWaiter>,
+}
+
+/// A pending get_retractions request waiting for the listen frontier to advance.
+pub(crate) struct RetractionWaiter {
+    frontier: u64,
+    reply: oneshot::Sender<Vec<(OrderedKey, Proposal)>>,
 }
 
 impl StateMachine {
@@ -349,12 +358,13 @@ pub enum PersistLearnerCommand {
         reply: oneshot::Sender<Result<ProtoTruncateResponse, String>>,
         received_at: tokio::time::Instant,
     },
-    /// REVIEW: we need to be more specific about what evaluating `through_upper` means. Added a comment on the actual execution method about this
-    /// Return a snapshot of pending retractions for proposals evaluated through
-    /// `through_upper`. The learner retains the entries — they're only removed
-    /// when the -1 diffs arrive via subscription.
+    /// Return a snapshot of pending retractions for proposals with
+    /// `batch_id < frontier`. The frontier is capped to the learner's current
+    /// listen frontier so we never return retractions for batches the learner
+    /// hasn't processed yet. The learner retains the entries — they're only
+    /// removed when the -1 diffs arrive via subscription.
     GetRetractions {
-        through_upper: u64,
+        frontier: u64,
         reply: oneshot::Sender<Vec<(OrderedKey, Proposal)>>,
     },
 }
@@ -479,17 +489,17 @@ impl PersistLearnerHandle {
             .map_err(LearnerError::Command)
     }
 
-    /// Return a snapshot of pending retractions for proposals evaluated
-    /// through `through_upper`. Non-destructive — entries stay in the learner
-    /// until confirmed via subscription.
+    /// Return a snapshot of pending retractions with `batch_id < frontier`.
+    /// Non-destructive — entries stay in the learner until confirmed via
+    /// subscription.
     pub async fn get_retractions(
         &self,
-        through_upper: u64,
+        frontier: u64,
     ) -> Result<Vec<(OrderedKey, Proposal)>, LearnerError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(PersistLearnerCommand::GetRetractions {
-                through_upper,
+                frontier,
                 reply: reply_tx,
             })
             .await
@@ -702,6 +712,7 @@ impl<E: EventSource> PersistLearner<E> {
             results: BTreeMap::new(),
             result_waiters: BTreeMap::new(),
             pending_retractions: BTreeMap::new(),
+            retraction_waiters: Vec::new(),
         };
 
         let learner = PersistLearner {
@@ -864,6 +875,7 @@ impl<E: EventSource> PersistLearner<E> {
                 }
                 ListenEvent::Progress(frontier) => {
                     self.log_shard.listen_frontier = frontier;
+                    self.wake_retraction_waiters();
                 }
             }
         }
@@ -1109,27 +1121,33 @@ impl<E: EventSource> PersistLearner<E> {
                     });
             }
             PersistLearnerCommand::GetRetractions {
-                through_upper,
+                frontier,
                 reply,
             } => {
-                let frontier = self
+                let listen_frontier = self
                     .log_shard
                     .listen_frontier
                     .as_option()
                     .copied()
-                    .unwrap_or(u64::MAX);
-                /// REVIEW: I think we're misusing the word upper here.
-                /// 1. It is incorrect to allow `through_upper` to be greater than the upper of the shard (we don't yet know that value!!!)
-                /// 2. We're not actually asking for the upper, we're just trying to get it at a specific frontier. We could just call the variable `frontier` perhaps?
-                let effective_upper = through_upper.min(frontier);
-                let retractions: Vec<_> = self
-                    .log_shard
-                    .pending_retractions
-                    .iter()
-                    .filter(|(key, _)| key.batch_id < effective_upper)
-                    .map(|(key, proposal)| (key.clone(), proposal.clone()))
-                    .collect();
-                let _ = reply.send(retractions);
+                    .unwrap_or(0);
+                if listen_frontier >= frontier {
+                    // We've processed all updates through the requested
+                    // frontier — return the exact retraction set.
+                    let retractions: Vec<_> = self
+                        .log_shard
+                        .pending_retractions
+                        .iter()
+                        .filter(|(key, _)| key.batch_id < frontier)
+                        .map(|(key, proposal)| (key.clone(), proposal.clone()))
+                        .collect();
+                    let _ = reply.send(retractions);
+                } else {
+                    // Haven't caught up yet — park the request until the
+                    // listen frontier advances past the requested frontier.
+                    self.log_shard
+                        .retraction_waiters
+                        .push(RetractionWaiter { frontier, reply });
+                }
             }
         }
     }
@@ -1252,6 +1270,35 @@ impl<E: EventSource> PersistLearner<E> {
                 }
             }
         }
+    }
+
+    /// Wake retraction waiters whose requested frontier is now ≤ the listen
+    /// frontier. Called after the listen frontier advances.
+    fn wake_retraction_waiters(&mut self) {
+        let listen_frontier = self
+            .log_shard
+            .listen_frontier
+            .as_option()
+            .copied()
+            .unwrap_or(0);
+
+        // Drain waiters whose frontier has been reached.
+        let mut remaining = Vec::new();
+        for waiter in self.log_shard.retraction_waiters.drain(..) {
+            if listen_frontier >= waiter.frontier {
+                let retractions: Vec<_> = self
+                    .log_shard
+                    .pending_retractions
+                    .iter()
+                    .filter(|(key, _)| key.batch_id < waiter.frontier)
+                    .map(|(key, proposal)| (key.clone(), proposal.clone()))
+                    .collect();
+                let _ = waiter.reply.send(retractions);
+            } else {
+                remaining.push(waiter);
+            }
+        }
+        self.log_shard.retraction_waiters = remaining;
     }
 }
 

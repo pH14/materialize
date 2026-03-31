@@ -258,6 +258,7 @@ fn test_metrics() -> (AcceptorMetrics, LearnerMetrics) {
 }
 
 /// Open persist handles and spawn acceptor + learner tasks.
+/// Returns (acceptor_handle, learner_handle, acceptor_task, learner_task, shard_upper).
 async fn spawn_persist_pair(
     client: &PersistClient,
     shard_id: ShardId,
@@ -266,6 +267,7 @@ async fn spawn_persist_pair(
     PersistLearnerHandle,
     mz_ore::task::AbortOnDropHandle<()>,
     mz_ore::task::AbortOnDropHandle<()>,
+    u64,
 ) {
     let key_schema = Arc::new(OrderedKeySchema);
     let val_schema = Arc::new(ProposalSchema);
@@ -299,6 +301,8 @@ async fn spawn_persist_pair(
         write.advance_upper(&Antichain::from_elem(1)).await;
     }
 
+    let shard_upper = write.upper().as_option().copied().unwrap_or(1);
+
     let since = read.since().clone();
     let subscribe = read.subscribe(since).await.expect("subscribe");
 
@@ -318,7 +322,7 @@ async fn spawn_persist_pair(
     let learner_task =
         mz_ore::task::spawn(|| "persist-sim-learner", learner.run(upper_handle)).abort_on_drop();
 
-    (acceptor_handle, learner_handle, acceptor_task, learner_task)
+    (acceptor_handle, learner_handle, acceptor_task, learner_task, shard_upper)
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +344,9 @@ struct PersistSimulator {
     trace: SimTrace,
     seed: u64,
     thread: SimThread,
+    /// Upper frontier after the most recent acceptor batch, used as the
+    /// frontier argument for `get_retractions`.
+    last_upper: u64,
 }
 
 impl PersistSimulator {
@@ -347,7 +354,7 @@ impl PersistSimulator {
         let client = new_persist_client_for_sim().await;
         let shard_id = ShardId::new();
 
-        let (acceptor_handle, learner_handle, acceptor_task, learner_task) =
+        let (acceptor_handle, learner_handle, acceptor_task, learner_task, shard_upper) =
             spawn_persist_pair(&client, shard_id).await;
 
         let oracle = SharedLogOracle::new();
@@ -364,6 +371,7 @@ impl PersistSimulator {
             trace: SimTrace::new(seed),
             seed,
             thread: SimThread::Client(0),
+            last_upper: shard_upper,
         }
     }
 
@@ -422,7 +430,7 @@ impl PersistSimulator {
     }
 
     /// Execute an operation against the real acceptor + learner.
-    async fn execute_real(&self, op: &SharedLogOp) -> SharedLogObservation {
+    async fn execute_real(&mut self, op: &SharedLogOp) -> SharedLogObservation {
         match op {
             SharedLogOp::Cas {
                 shard,
@@ -443,6 +451,7 @@ impl PersistSimulator {
                     .await
                     .unwrap();
 
+                self.last_upper = receipt.batch_number + 1;
                 let result = self
                     .learner_handle
                     .await_cas_result(receipt.batch_number, receipt.position)
@@ -475,6 +484,7 @@ impl PersistSimulator {
                     .await
                     .unwrap();
 
+                self.last_upper = receipt.batch_number + 1;
                 match self
                     .learner_handle
                     .await_truncate_result(receipt.batch_number, receipt.position)
@@ -505,13 +515,14 @@ impl PersistSimulator {
         ));
 
         // Re-open against the same shard — the learner replays history from Listen.
-        let (acceptor_handle, learner_handle, acceptor_task, learner_task) =
+        let (acceptor_handle, learner_handle, acceptor_task, learner_task, shard_upper) =
             spawn_persist_pair(&self.client, self.shard_id).await;
 
         self.acceptor_handle = acceptor_handle;
         self.learner_handle = learner_handle;
         self._acceptor_task = acceptor_task;
         self._learner_task = learner_task;
+        self.last_upper = shard_upper;
 
         // Crash is a happens-before barrier: create a fresh checker from the
         // oracle's current state.
@@ -580,7 +591,7 @@ impl PersistSimulator {
 
         let retractions = self
             .learner_handle
-            .get_retractions(u64::MAX)
+            .get_retractions(self.last_upper)
             .await
             .unwrap();
 

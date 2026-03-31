@@ -41,6 +41,8 @@ use tokio::sync::Mutex;
 
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
+
+use crate::factory::InProcessActorFactory;
 use mz_persist::generated::consensus_service::{
     ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
 };
@@ -500,7 +502,6 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
 #[mz_ore::test(tokio::test)]
 async fn sharded_sim_linearizability_across_reconfig() {
     let client = new_client().await;
-    let registry = MetricsRegistry::new();
 
     let shard_old = ShardId::new();
     let (acc, lrn) = spawn_shard(&client, shard_old).await;
@@ -519,7 +520,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
         metashard_state,
         256,
         client.clone(),
-        registry,
+        InProcessActorFactory::new(client.clone()),
         routing_handle,
         ShardId::new(),
     )

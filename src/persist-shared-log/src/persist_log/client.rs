@@ -7,10 +7,11 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-/// REVIEW: This file is only used by `examples` as far as I can tell. move to that directory?
-
 //! Helper for constructing a [`PersistClient`] with in-process pubsub and
 //! optional latency injection.
+//!
+//! This module is only used by examples and benchmarks — production deployments
+//! construct their own `PersistClient` from real storage backends.
 //!
 //! In production persist, writers notify listeners about new batches via a
 //! pubsub service. Without pubsub, the listener must poll, adding latency

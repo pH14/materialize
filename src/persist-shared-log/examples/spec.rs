@@ -1248,7 +1248,7 @@ async fn main() {
             shard_id,
             shard_acceptor_metrics,
             0,
-            None,
+            Box::new(mz_persist_shared_log::NoOpRetractionSource),
             vec![],
             range.clone(),
         )

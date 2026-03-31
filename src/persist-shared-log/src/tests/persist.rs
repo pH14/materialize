@@ -128,6 +128,18 @@ impl PersistTestHarness {
 
     /// Submit a CAS proposal and return whether it was committed.
     async fn cas(&self, key: &str, expected: Option<u64>, new_seqno: u64, data: &[u8]) -> bool {
+        self.cas_with_upper(key, expected, new_seqno, data).await.0
+    }
+
+    /// Submit a CAS proposal and return (committed, upper after this batch).
+    /// The upper can be used as the `frontier` argument to `get_retractions`.
+    async fn cas_with_upper(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+        new_seqno: u64,
+        data: &[u8],
+    ) -> (bool, u64) {
         let receipt = self
             .acceptor_handle
             .append(ProtoLogProposal {
@@ -147,7 +159,8 @@ impl PersistTestHarness {
             .await
             .unwrap();
 
-        result.committed
+        // The upper after this batch is batch_number + 1.
+        (result.committed, receipt.batch_number + 1)
     }
 }
 
@@ -503,9 +516,9 @@ async fn test_persist_ordering_through_compaction() {
         read.downgrade_since(&timely::progress::Antichain::from_elem(100))
             .await;
 
-        /// REVIEW: Just giving time isn't enough to force a compaction. Typically there need to be enough writes
-        /// to trigger a maintenance task, and then finishing. We need to rewrite this test to really force a compaction or delete it to avoid false promises
-        // Give compaction a chance to run.
+        // TODO: Sleeping doesn't reliably trigger compaction — we'd need enough
+        // writes to trigger a maintenance task and then wait for it to complete.
+        // Rewrite this to force compaction deterministically or delete the phase.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         drop(read);
     }
@@ -573,11 +586,11 @@ async fn test_persist_retraction_rejected_cas() {
         assert!(!h.cas("s0", None, 3, b"also-rejected").await);
 
         // Commit another valid entry.
-        assert!(h.cas("s0", Some(1), 2, b"second").await);
+        let (committed, upper) = h.cas_with_upper("s0", Some(1), 2, b"second").await;
+        assert!(committed);
 
-        /// REVIEW: added some inner comments with the getretractions path, but it is not valid to use u64::MAX here
         // Verify the learner has pending retractions for the rejected proposals.
-        let retractions = h.learner_handle.get_retractions(u64::MAX).await.unwrap();
+        let retractions = h.learner_handle.get_retractions(upper).await.unwrap();
         assert_eq!(
             retractions.len(),
             2,
@@ -586,9 +599,11 @@ async fn test_persist_retraction_rejected_cas() {
     }
     // Everything dropped.
 
-    /// REVIEW: This test is incorrect. The retractions haven't been applied to the state!!!
-    // Phase 2: re-open with a fresh learner. It replays the shard which now
-    // contains both +1 and -1 diffs. Verify state is correct.
+    // Phase 2: re-open with a fresh learner. The shard still contains the +1
+    // entries for rejected CAS proposals (retractions were never flushed by
+    // the acceptor — no retraction source was wired in Phase 1). The learner
+    // re-evaluates CAS proposals during replay, so rejected CASes don't
+    // affect materialized state regardless.
     {
         let h = PersistTestHarness::new_with_client(&client, shard_id).await;
 
@@ -642,12 +657,13 @@ async fn test_persist_retraction_truncate() {
             .await
             .unwrap();
         assert_eq!(result.deleted, Some(2));
+        let upper = receipt.batch_number + 1;
 
         // Verify pending retractions include:
         // - 2 truncated CAS entries (seqno 1, 2)
         // - 1 truncate proposal itself
         // = 3 total
-        let retractions = h.learner_handle.get_retractions(u64::MAX).await.unwrap();
+        let retractions = h.learner_handle.get_retractions(upper).await.unwrap();
         assert_eq!(
             retractions.len(),
             3,
@@ -660,8 +676,8 @@ async fn test_persist_retraction_truncate() {
         assert_eq!(scan.data[0].seqno, 3);
     }
 
-    /// REVIEW: As in the other test, the retractions have not been applied yet!!!
-    // Phase 2: fresh learner replays shard with retractions.
+    // Phase 2: fresh learner replays the shard. As above, retractions were
+    // never flushed — the learner re-evaluates truncate proposals on replay.
     {
         let h = PersistTestHarness::new_with_client(&client, shard_id).await;
 
