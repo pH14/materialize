@@ -1164,11 +1164,14 @@ async fn main() {
     }
 
     // --- Metrics ---
-    let registry = MetricsRegistry::new();
-    let acceptor_metrics = AcceptorMetrics::register(&registry);
-    let learner_metrics = LearnerMetrics::register(&registry);
-    let acceptor_metrics_for_report = acceptor_metrics.clone();
-    let learner_metrics_for_report = learner_metrics.clone();
+    // For multi-shard, each shard gets its own metrics. We use shard 0's
+    // metrics for the server-side report (flush stats, etc.). Client-side
+    // latencies are aggregated across all clients regardless.
+    let report_registry = MetricsRegistry::new();
+    let report_acceptor_metrics = AcceptorMetrics::register(&report_registry);
+    let report_learner_metrics = LearnerMetrics::register(&report_registry);
+    let acceptor_metrics_for_report = report_acceptor_metrics.clone();
+    let learner_metrics_for_report = report_learner_metrics.clone();
 
     let queue_depth = cfg
         .queue_depth
@@ -1228,10 +1231,13 @@ async fn main() {
 
     for (i, range) in partition_map.ranges.iter().enumerate() {
         let shard_id = range.log_shard;
-        // Each shard gets its own metrics registry to avoid double-registration.
-        let shard_registry = MetricsRegistry::new();
-        let shard_acceptor_metrics = AcceptorMetrics::register(&shard_registry);
-        let shard_learner_metrics = LearnerMetrics::register(&shard_registry);
+        // Shard 0 uses the report metrics; others get their own.
+        let (shard_acceptor_metrics, shard_learner_metrics) = if i == 0 {
+            (report_acceptor_metrics.clone(), report_learner_metrics.clone())
+        } else {
+            let r = MetricsRegistry::new();
+            (AcceptorMetrics::register(&r), LearnerMetrics::register(&r))
+        };
 
         let acceptor_config = AcceptorConfig { queue_depth };
         let (acceptor_handle, acceptor_task) = PersistAcceptor::spawn(
