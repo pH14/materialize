@@ -16,6 +16,46 @@ from most abstract to most concrete:
 Each layer catches a different class of bugs. Together, they provide high
 confidence that the system is correct, performant, and resilient.
 
+## Architectural Choices for Testability
+
+The shared log uses an actor-based architecture specifically to make the
+system easier to test deterministically. Each component (acceptor, learner,
+metashard) is a passive state machine driven by a command channel:
+
+- **Acceptor**: receives `Append` and `Flush` commands, produces
+  `compare_and_append` writes. No timers, no autonomous behavior — the
+  flush policy is in the run loop, but the mechanism (buffering + flushing)
+  is exposed directly for tests to drive step-by-step.
+- **Learner**: receives commands and events from its persist subscribe.
+  Deterministic evaluation: same events in the same order always produce the
+  same state (C1).
+- **Metashard**: receives commands via its handle. Reconfiguration is a
+  deterministic state machine (phase transitions driven by external events).
+
+This decomposition has several testing benefits:
+
+1. **Controlled state transitions**: Tests can drive each actor one command
+   at a time, inspecting intermediate state. No need to coordinate timers
+   or background threads.
+2. **Deterministic replay**: Given the same persist shard contents (same
+   events in the same order), any actor produces identical output. This is
+   what makes DST work — seed the RNG, control the schedule, get
+   reproducible traces.
+3. **Independent unit testing**: Each actor can be tested in isolation with
+   a mock persist backend. Integration tests compose real actors with
+   in-memory persist.
+4. **Fault injection at actor boundaries**: BUGGIFY points sit at phase
+   transitions in the metashard's reconfiguration protocol. Because each
+   phase is an explicit state, injecting faults between phases is natural.
+5. **Stateright modeling**: The actor decomposition maps directly to the
+   Stateright model's actions and state. `WriteBulkSnapshot`,
+   `WriteDeltaSnapshot`, `Seal`, `SwapRouting` are both protocol phases in
+   the code and actions in the model.
+
+The alternative — a monolithic service with interleaved concerns — would
+make deterministic simulation much harder because internal state transitions
+would be implicit in control flow rather than explicit in command handling.
+
 ## Layer 1: Semi-Formal Methods (Stateright)
 
 ### Purpose
@@ -34,12 +74,15 @@ invariant. Properties: PM1+PM2 (valid map), PM3 (monotonic epoch), RC1
 (seal-before-reassign). Bounded to 4 reconfigurations, 8 shards.
 
 **Protocol model** (`stateright_reconfig.rs`, `ProtocolModel`): verifies the
-full seal→replay→commit reconfiguration lifecycle, including crash recovery.
+full reconfiguration lifecycle with acceptor-owned predecessor state, including
+crash recovery. The protocol phases are: `WriteBulkSnapshot` (before seal) →
+`Seal` → `WriteDeltaSnapshot` (after seal) → `SwapRouting` → `PersistCommit`.
 Models both split and merge scenarios with client writes interleaved with
 protocol phases, and crash/recovery at every intermediate phase. Properties:
-PM1+PM2, RC1, RC2 (no committed write lost after reconfig), seal-before-commit,
-reconfiguration liveness, reachability of carried-forward state. Bounded to
-2 client shards, seqno cap 2, max 2 crashes.
+PM1+PM2, RC1, RC2 (no committed write lost after reconfig), snapshots-before-seal,
+seal-before-delta, reconfiguration liveness, reachability of carried-forward
+state, no double retraction. Bounded to 2 client shards, seqno cap 2, max 2
+crashes.
 
 ### What Is Not Modeled (Planned)
 

@@ -284,7 +284,7 @@ impl PersistAcceptor {
     /// Poll the retraction source and buffer results for the next flush.
     async fn poll_retractions(&mut self, current_upper: u64) {
         // REVIEW: simplify by requiring a retraction source. If it doesn't make sense
-        /// (e.g. some tests, maybe?), just provide a no-op retraction source that does nothing
+        // (e.g. some tests, maybe?), just provide a no-op retraction source that does nothing
         if let Some(ref source) = self.retraction_source {
             let retractions = source.get_retractions(current_upper).await;
             // REVIEW: Check Rust guides. We should early-out if empty to avoid tons of indentation

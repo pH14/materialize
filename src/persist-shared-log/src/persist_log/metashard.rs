@@ -22,15 +22,12 @@ use std::sync::Arc;
 
 use timely::progress::Antichain;
 use tokio::sync::{RwLock, mpsc, oneshot};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use bytes::Bytes;
 use prost::Message;
 
 use mz_ore::metrics::MetricsRegistry;
-use mz_persist::generated::consensus_service::{
-    ProtoCasProposal, ProtoLogProposal, proto_log_proposal,
-};
 use mz_persist_client::critical::{CriticalReaderId, Opaque, SinceHandle};
 use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
@@ -597,6 +594,7 @@ impl PersistMetashardActor {
             learners.insert(shard_id, learner_handle);
         }
 
+        /// REVIEW: This naming is very confusing, we should make it clear it's a lock. Can we pull this into its own scope so the drop is implicit, perhaps? A bit more Rust-y
         let mut routing = self.routing.write().await;
         *routing = RoutingState {
             partition_map: map.clone(),

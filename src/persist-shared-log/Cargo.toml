@@ -46,7 +46,7 @@ prost = { version = "0.14.3", features = ["no-recursion-limit"] }
 tokio = { version = "1.49.0", default-features = false, features = ["macros", "sync", "rt", "time", "net", "tracing"] }
 tokio-stream = "0.1"
 tonic = "0.14.2"
-timely = "0.27.0"
+timely = "0.28.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }

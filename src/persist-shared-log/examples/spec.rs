@@ -1182,7 +1182,7 @@ async fn main() {
 
     // --- Backend setup ---
     use mz_persist_shared_log::persist_log::client::{self, PersistClientConfig};
-    use mz_persist_shared_log::{PartitionMap, RangeAssignment, partition_key};
+    use mz_persist_shared_log::{PartitionMap, RangeAssignment};
 
     let num_log_shards = cli_num_log_shards;
     let persist_client_config = PersistClientConfig {
