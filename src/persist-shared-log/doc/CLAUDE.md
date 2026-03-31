@@ -5,4 +5,4 @@ The `reference/` directory contains the architectural design docs for the persis
 - `02_invariants.md` — safety, liveness, and performance properties
 - `03_testing.md` — verification strategy (Stateright, DST, stress testing)
 - `04_virtual_log.md` — virtual log and write scaling (Delos-style)
-- `05_horizontal_sharding.md` — full spec for horizontal write sharding: metashard, range partitioning, reconfiguration protocol, CriticalSince, snapshot/delta, learner chain replay
+- `05_horizontal_sharding.md` — full spec for horizontal write sharding: metashard, range partitioning, reconfiguration protocol (acceptor-owned predecessor state: batch_id=1 bulk snapshot, batch_id=2 delta), CriticalSince, multi-acceptor coordination, chain replay fallback

@@ -160,6 +160,12 @@ struct Cli {
     /// Use to find the saturation point (max throughput before latency degrades).
     #[arg(long)]
     open_loop: bool,
+
+    /// Number of log shards (horizontal write scaling). Client shards are
+    /// range-partitioned across log shards. Each log shard gets its own
+    /// acceptor + learner, so throughput scales linearly.
+    #[arg(long, default_value = "1")]
+    num_log_shards: usize,
 }
 
 /// Workload configuration. Deserializable directly from YAML with defaults
@@ -1137,6 +1143,7 @@ fn print_json(
 async fn main() {
     let cli = Cli::parse();
     let json = cli.json;
+    let cli_num_log_shards = cli.num_log_shards;
     let cfg = WorkloadConfig::from_cli(cli);
     cfg.validate();
 
@@ -1145,9 +1152,10 @@ async fn main() {
         * cfg.write_rate_per_second;
     if !json {
         eprintln!(
-            "specsheet: {} shards, {} writers/shard, {} values, {} target writes/s, {}s run + {}s warmup",
+            "specsheet: {} client shards × {} writers/shard across {} log shards, {} values, {} target writes/s, {}s run + {}s warmup",
             cfg.num_shards,
             cfg.writers_per_shard,
+            cli_num_log_shards,
             format_bytes(i64::try_from(cfg.value_size).expect("value_size fits in i64")),
             format_count(u64::cast_lossy(target_writes_per_sec)),
             cfg.duration,
@@ -1169,45 +1177,104 @@ async fn main() {
 
     // --- Backend setup ---
     use mz_persist_shared_log::persist_log::client::{self, PersistClientConfig};
+    use mz_persist_shared_log::{PartitionMap, RangeAssignment, partition_key};
 
+    let num_log_shards = cli_num_log_shards;
     let persist_client_config = PersistClientConfig {
         latency_profile: cfg.latency_profile(),
     };
     let persist_client = client::new_persist_client(persist_client_config);
-    let shard_id = ShardId::new();
 
-    let acceptor_config = AcceptorConfig { queue_depth };
-    let (acceptor_handle, _acceptor_task) = PersistAcceptor::spawn(
-        acceptor_config,
-        &persist_client,
-        shard_id,
-        acceptor_metrics.clone(),
-        0,
-        None,
-        vec![],
-        mz_persist_shared_log::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_id },
-    )
-    .await;
-
-    let learner_config = PersistLearnerConfig {
-        queue_depth,
-        ..Default::default()
+    // Build partition map: evenly divide [0x00, 0x100) across N log shards.
+    let mut shard_ids: Vec<ShardId> = Vec::with_capacity(num_log_shards);
+    let mut partition_ranges: Vec<RangeAssignment> = Vec::with_capacity(num_log_shards);
+    let range_size = 256 / num_log_shards;
+    for i in 0..num_log_shards {
+        let shard_id = ShardId::new();
+        let lo = u8::try_from(i * range_size).expect("range start fits u8");
+        let hi_exclusive = if i == num_log_shards - 1 {
+            0x100u16
+        } else {
+            u16::try_from((i + 1) * range_size).expect("range end fits u16")
+        };
+        shard_ids.push(shard_id);
+        partition_ranges.push(RangeAssignment {
+            lo,
+            hi_exclusive,
+            log_shard: shard_id,
+        });
+    }
+    let partition_map = PartitionMap {
+        epoch: 0,
+        ranges: partition_ranges,
     };
-    let (learner_handle, _learner_task) = PersistLearner::spawn(
-        learner_config,
-        &persist_client,
-        shard_id,
-        learner_metrics.clone(),
-    )
-    .await;
+    partition_map.validate().expect("invalid partition map");
 
-    let transports = vec![Transport::Direct {
-        acceptor: acceptor_handle.clone(),
-        learner: learner_handle.clone(),
-    }];
+    if !json {
+        eprintln!(
+            "specsheet: {} log shards, partition map: {}",
+            num_log_shards,
+            partition_map.ranges.iter().map(|r| format!(
+                "[0x{:02x},0x{:03x})→{}", r.lo, r.hi_exclusive,
+                &r.log_shard.to_string()[1..9]
+            )).collect::<Vec<_>>().join(", ")
+        );
+    }
 
-    drop(acceptor_handle);
-    drop(learner_handle);
+    // Spawn one acceptor + learner per log shard.
+    let mut shard_transports: std::collections::BTreeMap<ShardId, Transport> =
+        std::collections::BTreeMap::new();
+    let mut _tasks: Vec<mz_ore::task::JoinHandle<()>> = Vec::new();
+
+    for (i, range) in partition_map.ranges.iter().enumerate() {
+        let shard_id = range.log_shard;
+        // Each shard gets its own metrics registry to avoid double-registration.
+        let shard_registry = MetricsRegistry::new();
+        let shard_acceptor_metrics = AcceptorMetrics::register(&shard_registry);
+        let shard_learner_metrics = LearnerMetrics::register(&shard_registry);
+
+        let acceptor_config = AcceptorConfig { queue_depth };
+        let (acceptor_handle, acceptor_task) = PersistAcceptor::spawn(
+            acceptor_config,
+            &persist_client,
+            shard_id,
+            shard_acceptor_metrics,
+            0,
+            None,
+            vec![],
+            range.clone(),
+        )
+        .await;
+
+        let learner_config = PersistLearnerConfig {
+            queue_depth,
+            ..Default::default()
+        };
+        let (learner_handle, learner_task) = PersistLearner::spawn(
+            learner_config,
+            &persist_client,
+            shard_id,
+            shard_learner_metrics,
+        )
+        .await;
+
+        shard_transports.insert(
+            shard_id,
+            Transport::Direct {
+                acceptor: acceptor_handle,
+                learner: learner_handle,
+            },
+        );
+        _tasks.push(acceptor_task);
+        _tasks.push(learner_task);
+
+        if !json {
+            eprintln!(
+                "  log shard {}: [0x{:02x}, 0x{:03x}) → {}",
+                i, range.lo, range.hi_exclusive, shard_id
+            );
+        }
+    }
 
     // --- Timing ---
     let warmup_dur = Duration::from_secs(cfg.warmup);
@@ -1230,11 +1297,19 @@ async fn main() {
         .flat_map(|s| (0..cfg.writers_per_shard).map(move |w| (s, w)))
         .enumerate()
     {
-        // Round-robin clients across the transport pool (gRPC connection pool).
-        let t = transports[seed % transports.len()].clone();
+        // Route this client to the correct log shard based on its key.
+        // Key format: s{hex}{hex}... — the first two hex chars after 's' are the
+        // partition key. Spread clients evenly across the key space.
+        let pk = u8::try_from((u64::cast_from(shard_idx) * 256) / cfg.num_shards).unwrap_or(0);
+        let shard_key = format!("s{:02x}{:06x}-0000-0000-0000-{:012x}", pk, shard_idx, shard_idx);
+        let log_shard = partition_map.route(&shard_key);
+        let t = shard_transports
+            .get(&log_shard)
+            .expect("partition map routes to known shard")
+            .clone();
         let stop = Arc::clone(&stop);
         let client_cfg = ClientConfig {
-            shard_key: format!("shard-{:06}", shard_idx),
+            shard_key,
             value_size: cfg.value_size,
             op_rate,
             cas_pct: cfg.cas_pct,
@@ -1251,9 +1326,8 @@ async fn main() {
     }
 
     // Drop transports so the service shuts down when client tasks finish
-    // (they hold the remaining clones). Backend-specific handles were already
-    // dropped inside the match arms above.
-    drop(transports);
+    // (they hold the remaining clones).
+    drop(shard_transports);
 
     // --- Wait for duration ---
     tokio::time::sleep(total_dur).await;
@@ -1281,8 +1355,9 @@ async fn main() {
     }
 
     // Wait for backend actors to finish.
-    let _ = _learner_task.await;
-    let _ = _acceptor_task.await;
+    for t in _tasks {
+        let _ = t.await;
+    }
 
     let measurement_elapsed = Duration::from_secs(cfg.duration);
 

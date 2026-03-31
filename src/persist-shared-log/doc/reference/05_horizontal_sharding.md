@@ -238,62 +238,61 @@ The metashard actor subscribes to its own persist shard. When it writes a reconf
 
 Reconfiguration moves client shards from one log shard to another. The metashard actor coordinates the full lifecycle.
 
-### 4.1 Step-by-step protocol (with pre-hydration)
+### 4.1 Step-by-step protocol (acceptor-owned predecessor state)
 
 ```
 reconfigure(plan: ReconfigurationPlan):
 
-  Phase 0: Intent
+  Phase 0: Intent + CriticalSince
     1. Validate: plan.expected_epoch == current epoch
     2. Write ReconfigurationIntent to metashard:
        { plan, status: Preparing }
     3. Intent is durable. On crash, restart resumes from here.
-
-  Phase 1: Prepare infrastructure
-    4. Create new log shard persist shards
-    5. Spawn new acceptors for new log shards (NOT routing traffic yet)
-    6. Spawn new learners for new log shards
-
-  Phase 2: Pre-hydrate + snapshot
-    7. New learners subscribe to OLD log shards (read-only) for ranges they're gaining
-    8. New learners build up state, catch up to old log shard upper U
-    9. Acquire CriticalSince on old log shards at frontier U
+    4. Acquire CriticalSince on retiring log shards.
        Deterministic reader ID: "reconfig-epoch{N}-range{lo:02x}"
-       Durable hold preventing compaction past U.
-   10. Write snapshot to new log shards at T=0 via compare_and_append
-       (CaS proposals establishing initial state — the BIG write, non-blocking)
-   11. Continue pre-hydrating from old shards (catching up from U onward)
-   12. Update intent: status = Hydrated
+       Durable hold preventing compaction.
 
-  Phase 3: Seal
-   13. New learners signal "ready" (caught up)
-   14. Seal old log shards: advance upper to Antichain::new() (idempotent)
-   15. New learners drain remaining events from sealed shards (small window)
-   16. Update intent: status = Sealed
+  Phase 1: Spawn actors
+    5. Create new log shard persist shards.
+    6. Spawn new acceptors with predecessor list + range assignment.
+       Each acceptor writes two setup batches before entering its
+       normal flush loop (see Section 6 for details):
+         batch_id=1: bulk snapshot (predecessor entries at CriticalSince)
+         batch_id=2: delta snapshot (predecessor entries between snapshot and seal)
+       Without predecessors, both are empty writes advancing upper.
+    7. Spawn new learners (no predecessor awareness — they subscribe to
+       their shard and process events from batch_id=1 onward).
 
-  Phase 3.5: Write delta (on critical path, tiny)
-   17. Write delta to new log shards at T=1: proposals between U and seal point
-       ~100-1000 proposals. Milliseconds. CriticalSince guarantees diffs exist.
+  Phase 2: Bulk snapshot + seal
+    8. Metashard subscribes to each new shard's frontier.
+    9. When all new shard frontiers ≥ 2: bulk snapshots done.
+   10. Seal old log shards: advance upper to Antichain::new() (idempotent).
+   11. Update intent: status = Sealed.
+
+  Phase 3: Delta snapshot
+   12. Acceptors detect predecessor seal via subscribe (frontier = []).
+   13. Acceptors write delta to new shards at batch_id=2: proposals
+       between CriticalSince and seal. ~100-1000 proposals, milliseconds.
+   14. Metashard watches new shard frontiers ≥ 3: delta done.
 
   Phase 4: Commit
-   18. Write new partition map to metashard
-   19. Update log shard entries: old → Sealed, new → Active + has_snapshot = true
-   20. Update intent: status = Committed
-   21. Push ReconfigurationDelta to all subscribers
-   22. Serving layer switches routing
-   23. FIRST proposals in new shards arrive NOW (after snapshot is already durable)
+   15. Write new partition map to metashard.
+   16. Update log shard entries: old → Sealed, new → Active + has_snapshot = true.
+   17. Update intent: status = Committed.
+   18. Swap routing to new shards.
+   19. FIRST regular proposals in new shards arrive NOW (at batch_id=3+).
 
   Phase 5: Finalize (background, not blocking)
-   24. Release CriticalSince on old shards: downgrade to empty antichain []
-   25. Old shards → Finalized (new shards contain snapshot + delta)
-   26. Advance old shard `since` to [], allowing persist to compact
-   27. Tear down old acceptors (already sealed, no-op)
-   28. Old learners drain result waiters, then shut down
+   20. Release CriticalSince on old shards: downgrade to empty antichain [].
+   21. Old shards → Finalized (new shards contain snapshot + delta).
+   22. Advance old shard `since` to [], allowing persist to compact.
+   23. Tear down old acceptors (already sealed, no-op).
+   24. Old learners drain result waiters, then shut down.
 ```
 
-### 4.2 Key property: pre-hydration eliminates cold-start
+### 4.2 Key property: acceptor setup before seal minimizes downtime
 
-By Phase 3, the new learners already have the full state from the old log shards. When the seal lands, they drain the small remaining window of events and are immediately ready to serve traffic. The unavailability window shrinks to just the seal + metashard write (tens of milliseconds).
+The acceptor's bulk snapshot (batch_id=1) is written while the predecessor shard is still live, keeping the large data copy off the critical path. The learner subscribes to the new shard and processes these entries as they arrive, building state automatically. By the time the seal lands, the learner already has the predecessor's state — only the small delta (batch_id=2) remains. The unavailability window is just the seal + delta write + routing swap (tens of milliseconds).
 
 ### 4.3 Ordering invariant: seal before partition map update
 
@@ -390,13 +389,33 @@ message ProtoAppendResponse {
 
 ## 6. Acceptor Changes
 
-Minimal changes to the existing `PersistAcceptor`:
+### 6.1 Sealed detection
 
-1. **New error variant `AcceptorError::Sealed`**: Detected when `compare_and_append` returns `UpperMismatch` with `current = []` (empty antichain). Instead of retrying, the acceptor returns `Sealed`.
+**New error variant `AcceptorError::Sealed`**: Detected when `compare_and_append` returns `UpperMismatch` with `current = []` (empty antichain). Instead of retrying, the acceptor returns `Sealed`.
 
-2. **Log shard identity in receipt**: The acceptor stores its `log_shard_id: ShardId` (passed at construction) and includes it in `ProtoAppendResponse`.
+### 6.2 Receipt identity
 
-The acceptor's flush logic, batching, and retry behavior are unchanged.
+**Log shard identity in receipt**: The acceptor stores its `log_shard_id: ShardId` (passed at construction) and includes it in `ProtoAppendResponse`.
+
+### 6.3 Predecessor state writing (setup batches)
+
+The acceptor is responsible for writing predecessor state into its shard. Every acceptor writes two setup batches before entering its normal flush loop:
+
+| batch_id | Name | With predecessors | Without predecessors |
+|----------|------|--------------------|----------------------|
+| 1 | Bulk snapshot | Predecessor entries at CriticalSince (blind copy) | Empty (advance upper) |
+| 2 | Delta snapshot | Predecessor entries between CriticalSince and seal | Empty (advance upper) |
+| 3+ | Regular traffic | Normal proposals from clients | Normal proposals |
+
+Same codepath every time — the learner sees the same event structure regardless.
+
+**Bulk snapshot (batch_id=1):** The acceptor subscribes to each predecessor shard at its CriticalSince `since`. For each event with diff=+1 (live data), it filters by the acceptor's range assignment, re-keys the `OrderedKey` to `(batch_id=1, position, shard)`, and writes all entries via `compare_and_append`. The `Proposal` bytes are opaque — the acceptor doesn't decode them.
+
+**Delta snapshot (batch_id=2):** After the bulk snapshot, the acceptor continues reading from the predecessor subscribe. When the predecessor's frontier hits `[]` (sealed by the metashard), the delta is complete. Events between the snapshot point and the seal are re-keyed to `(batch_id=2, position, shard)` and written. Only +1 diffs are copied — predecessor retractions (-1 diffs) are discarded because the new shard's learner generates its own.
+
+**Multi-acceptor coordination:** All competing acceptors for the same shard independently build identical batches (deterministic from same predecessor at same CriticalSince). `compare_and_append` CAS on upper resolves races — first writer wins, losers detect `UpperMismatch`, check upper, and skip.
+
+**Idempotency on crash recovery:** The acceptor checks the shard's upper to determine which phase to resume: upper < 2 → write bulk snapshot; upper < 3 → write delta; upper ≥ 3 → skip to regular traffic.
 
 ---
 
@@ -441,39 +460,44 @@ struct LogShardState {
 
 `StateMachine` stays global — `shards: BTreeMap<String, ShardState>` accumulates state regardless of which log shard the proposals came from. `pending_retractions` moves from `StateMachine` to `LogShardState` (retractions go to the log shard that sourced them).
 
-### 7.3 Pre-hydration (before seal)
+### 7.3 Learner hydration (from its own shard)
 
-During Phase 2 of reconfiguration, new learners subscribe to OLD log shards to build state:
-
-```
-1. Metashard actor tells new learner: "pre-hydrate ranges [0x80, 0xFF] from L1"
-2. New learner subscribes to L1 (read-only)
-3. For each event from L1: if partition_key(client_shard) is in [0x80, 0xFF],
-   apply to StateMachine. Otherwise, skip.
-4. When listen_frontier catches up to L1's upper: signal "ready"
-```
-
-This happens while L1 is still active and serving traffic. The pre-hydration is invisible to clients.
-
-### 7.4 Transition sequence (after seal)
+The learner subscribes only to its own shard. It never reads predecessor shards directly — the acceptor handles that (Section 6.3). The learner processes events as they arrive:
 
 ```
-1. L1 is sealed. New learner drains remaining events from L1.
+1. Learner subscribes to L2 at since=0.
+2. Acceptor writes bulk snapshot at batch_id=1 → learner sees CaS
+   proposals establishing initial state from predecessors. Applies them
+   with normal CaS semantics (expected=None chain builds up state).
+3. Acceptor writes delta at batch_id=2 → learner sees proposals from
+   the predecessor's tail (between snapshot and seal). Applies them
+   against the snapshot state.
+4. Acceptor enters normal flush loop at batch_id=3+ → learner sees
+   regular client traffic.
+```
+
+The learner doesn't know or care about reconfiguration. It just processes events from its shard in timestamp order.
+
+### 7.4 Transition sequence
+
+```
+1. Old shard L1 is sealed. Old learner drains remaining L1 events.
    Listen frontier for L1 reaches [].
 
 2. All pending result waiters for L1 are resolved.
 
-3. Metashard commits new partition map.
+3. Metashard commits new partition map, swaps routing.
 
-4. New learner starts processing events from L2 (its new log shard).
-   Proposals for [0x80, 0xFF] client shards arrive on L2.
-   Evaluated against StateMachine state carried from L1.
+4. New learner is already processing events from L2 (its shard).
+   By now it has processed batch_id=1 (snapshot) and batch_id=2 (delta),
+   so it has the full state from L1. Regular proposals (batch_id=3+)
+   are evaluated against this carried-forward state.
 
-5. L1's LogShardState is dropped from the learner.
+5. L1's actors are torn down.
 
-Note: The snapshot (capturing L1's state) was already written to L2 at T=0
-during Phase 2, and the delta at T=1 during Phase 3.5, before any regular
-proposals landed in L2.
+Note: The snapshot (batch_id=1) and delta (batch_id=2) were written by the
+new acceptor before regular traffic started. The learner processed them
+automatically via its subscribe.
 ```
 
 ### 7.5 Ordering across reconfiguration
@@ -670,61 +694,69 @@ pub trait Learner: Clone + Debug + Send + Sync + 'static {
 
 All open questions have been resolved:
 
-### Snapshot: pre-loaded into L2's persist shard + CriticalSince
+### Snapshot: acceptor-written into L2's persist shard + CriticalSince
 
-The snapshot is written as entries directly into L2's persist shard during pre-hydration (Phase 2), keeping it off the critical path. A CriticalSince hold on L1 protects the diffs between the snapshot point and the seal, ensuring crash safety.
+The snapshot is written by the **new acceptor** as entries directly into L2's persist shard at batch_id=1, keeping the large data copy off the critical path. The acceptor blindly copies persist entries from predecessor shards (re-keying OrderedKeys, preserving Proposal bytes untouched). A CriticalSince hold on L1 protects the diffs between the snapshot point and the seal, ensuring crash safety.
+
+**Why the acceptor, not the learner?** The acceptor is the single writer to the shard. Having the acceptor write the snapshot preserves this invariant and keeps the learner purely read-only — it subscribes to one shard and processes events. No cross-shard awareness, no write handles, no special reconfiguration logic in the learner.
 
 **Why not an out-of-band blob?** Keeping the snapshot in L2's persist shard means L2 is self-contained — persist compaction manages the snapshot data naturally alongside regular proposals. No external blob lifecycle management.
 
 **Why not write the snapshot after the seal?** That would put a large write (40-400MB) on the critical path between seal and commit, inflating the unavailability window to seconds.
 
-**The approach: big write during pre-hydration, tiny delta on the critical path.**
+**The approach: big write before seal, tiny delta after seal.**
 
 ```
-Phase 2b: Snapshot write (during pre-hydration, non-blocking)
-  1. Learner catches up to L1's upper U
-  2. Acquire CriticalSince on L1 at frontier U
+Phase 1: Acceptor spawned with predecessors
+  1. Acquire CriticalSince on L1.
      Reader ID: deterministic, e.g. "reconfig-epoch{N}-range{lo:02x}"
-     Durable across crashes. Prevents L1's since from advancing past U.
-  3. Write snapshot to L2 at T=0 via compare_and_append:
-     For each client shard in the range, write a CaS proposal
-     (expected_seqno=None → succeeds in empty shard, establishing initial state).
-     This is the BIG write, but it happens during pre-hydration.
-     Old acceptor/learner still serving traffic normally.
-  4. Continue pre-hydrating from L1 (catching up from U onward)
+     Durable across crashes. Prevents L1's since from advancing.
+  2. Acceptor subscribes to L1 at CriticalSince since.
+  3. Reads snapshot events (consolidated state at since).
+     Filters by range. Re-keys OrderedKeys to (batch_id=1, position, shard).
+  4. compare_and_append all entries at batch_id=1.
+     This is the BIG write, but it happens while L1 still serves traffic.
+  5. Meanwhile, new learner subscribes to L2 and processes batch_id=1
+     entries automatically (CaS chain builds state).
 
-Phase 3.5: Delta write (on critical path, tiny)
-  5. After seal + drain: write delta to L2 at T=1
-     Only the proposals between U (snapshot point) and S (seal point).
+Phase 2: Metashard seals L1 (after observing L2's upper ≥ 2)
+
+Phase 3: Delta write (on critical path, tiny)
+  6. Acceptor's predecessor subscribe detects L1 frontier = [] (sealed).
+  7. Acceptor writes delta to L2 at batch_id=2:
+     Only +1 diffs between CriticalSince and seal.
      ~100-1000 proposals. Milliseconds to write.
-     CriticalSince on L1 guarantees these diffs still exist.
+
+Phase 4: Metashard swaps routing (after observing L2's upper ≥ 3)
 
 Phase 5: Release CriticalSince (background)
-  6. Downgrade CriticalSince on L1 to empty antichain []
-  7. L1's since can advance freely → compaction proceeds → finalization
+  8. Downgrade CriticalSince on L1 to empty antichain []
+  9. L1's since can advance freely → compaction proceeds → finalization
 ```
 
 **Fresh learner replaying L2:**
 ```
-T=0: Snapshot entries (CaS proposals establishing initial state from L1)
-T=1: Delta entries (L1 tail between snapshot and seal)
-T=2+: Regular proposals (new traffic)
+batch_id=1: Snapshot entries (blind copy of predecessor state at CriticalSince)
+batch_id=2: Delta entries (predecessor tail between snapshot and seal)
+batch_id=3+: Regular proposals (new traffic)
 ```
-All just CaS proposals — the learner's existing replay logic handles them naturally.
+All just proposals in the persist shard — the learner's existing event processing handles them naturally with CaS semantics.
 
-**Crash safety via CriticalSince:**
+**Crash safety via CriticalSince + idempotent writes:**
 
 | Crash point | Recovery |
 |-------------|----------|
-| Before CriticalSince acquired | No snapshot written. Restart pre-hydration from scratch. |
-| After CriticalSince, before snapshot | Hold preserves L1 at U. Restart, write snapshot. |
-| After snapshot, before delta | Hold preserves L1 at U. Replay L1 from U→S, write delta. |
-| After delta written | L2 complete. Release CriticalSince, proceed to commit. |
+| Before CriticalSince acquired | No snapshot written. Restart from intent. |
+| After CriticalSince, before snapshot | Hold preserves L1. Acceptor checks upper < 2, writes snapshot. |
+| After snapshot, before delta | Hold preserves L1. Acceptor checks upper < 3, writes delta. |
+| After delta written | L2 complete (upper ≥ 3). Release CriticalSince, proceed to commit. |
 | After commit | Release CriticalSince in background. |
 
-The deterministic reader ID (derived from epoch + range) means the handle is always recoverable after crash.
+The deterministic reader ID (derived from epoch + range) means the CriticalSince handle is always recoverable after crash. The acceptor's setup batches are idempotent — it checks the shard's upper to determine which phase to resume from.
 
-**CriticalSince lifecycle:** The hold is acquired at the snapshot point and released after the delta is confirmed written. Duration: minutes at most. The held-back data is small (timestamps ≥ U, which is close to L1's upper).
+**CriticalSince lifecycle:** The hold is acquired before spawning actors and released after the delta is confirmed written. Duration: minutes at most.
+
+**Multi-acceptor coordination:** All competing acceptors deterministically compute the same batches from the same predecessor at the same CriticalSince. `compare_and_append` CAS on upper resolves races — first writer wins, losers skip.
 
 **Chain replay fallback:** If L2 has no snapshot (e.g., snapshot write failed), fresh learners fall back to replaying the full chain of sealed predecessors. The metashard's predecessor links provide the chain. Correctness is always guaranteed; the snapshot is an optimization.
 
@@ -771,9 +803,10 @@ One reconfiguration at a time. The intent mechanism enforces this: `reconfigure(
 - **Partition maps**: Same map for acceptors and learners, with N replicas per range
 - **Lifecycle**: Metashard actor manages acceptor/learner spawn/teardown
 - **Shard count changes**: External CLI tells metashard actor to reconfigure
-- **ReconfigurationIntent**: Required — enables pre-hydration and crash recovery
-- **Pre-hydration**: New learners hydrate from old shards BEFORE seal
-- **Snapshot format**: Pre-loaded into L2's persist shard at T=0 during pre-hydration. L2 is self-contained. CriticalSince on L1 protects diffs for crash safety. Delta (U→S) written at T=1 on the critical path (tiny, milliseconds).
+- **ReconfigurationIntent**: Required — enables crash recovery
+- **Predecessor state**: Acceptor writes bulk snapshot at batch_id=1 (before seal) and delta at batch_id=2 (after seal). Same codepath with or without predecessors (empty writes when none). Learner is read-only — subscribes to its shard and processes events.
+- **Snapshot format**: Blind copy of predecessor persist entries into L2's persist shard. L2 is self-contained. CriticalSince on L1 protects diffs for crash safety. Proposals are opaque bytes; only OrderedKeys are re-keyed.
+- **Multi-acceptor coordination**: Deterministic batches, CAS on upper resolves races.
 - **Log shard finalization**: Safe after CriticalSince released and new shard contains snapshot + delta. Chain replay is the always-correct fallback.
 - **Actor identity**: Immutable (range, log_shard, epoch), net-new on reconfiguration
 - **Concurrent reconfigs**: Not allowed — one at a time via intent lock
