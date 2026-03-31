@@ -20,7 +20,7 @@ name = "mz-persist-shared-log"
 bench = false
 
 [[example]]
-name = "specsheet"
+name = "spec"
 
 [dependencies]
 anyhow = "1.0.101"
