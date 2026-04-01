@@ -117,6 +117,7 @@ async fn open_persist_client_with_local_pubsub(
     metrics_registry: &MetricsRegistry,
 ) -> PersistClient {
     let persist_config = new_persist_config();
+    persist_config.apply_from(&mz_dyncfg::ConfigUpdates::default());
     let pubsub_server = PersistGrpcPubSubServer::new(&persist_config, metrics_registry);
     let cache = mz_persist_client::cache::PersistClientCache::new(
         persist_config,
@@ -142,6 +143,7 @@ async fn open_persist_client_hosting_pubsub(
     metrics_registry: &MetricsRegistry,
 ) -> (PersistClient, PersistGrpcPubSubServer) {
     let persist_config = new_persist_config();
+    persist_config.apply_from(&mz_dyncfg::ConfigUpdates::default());
     let pubsub_server = PersistGrpcPubSubServer::new(&persist_config, metrics_registry);
     let same_process_conn = pubsub_server.new_same_process_connection();
     let cache = mz_persist_client::cache::PersistClientCache::new(
@@ -168,6 +170,11 @@ async fn open_persist_client_with_remote_pubsub(
     metrics_registry: &MetricsRegistry,
 ) -> PersistClient {
     let persist_config = new_persist_config();
+    // Signal that dyncfgs are "synced" so the pubsub client connects
+    // immediately. Without this, GrpcPubSubClient blocks on
+    // configs_synced_once() waiting for an upstream config source that
+    // doesn't exist in standalone mode.
+    persist_config.apply_from(&mz_dyncfg::ConfigUpdates::default());
     let pubsub_url = pubsub_url.to_string();
     let caller_id = caller_id.to_string();
     let cache = mz_persist_client::cache::PersistClientCache::new(
