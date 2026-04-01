@@ -194,6 +194,13 @@ impl ActorFactory for InProcessActorFactory {
         self.maybe_wire_retractions(shard_id).await;
         Ok(handle)
     }
+
+    async fn stop_shard(&self, shard_id: ShardId) {
+        // Dropping the cached handles closes the command channels, which
+        // shuts down the actor tasks.
+        self.acceptors.lock().unwrap().remove(&shard_id);
+        self.learners.lock().unwrap().remove(&shard_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
