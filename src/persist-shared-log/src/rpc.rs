@@ -88,6 +88,13 @@ pub struct GrpcAcceptorHandle {
 }
 
 impl GrpcAcceptorHandle {
+    /// Create a handle from an existing tonic channel.
+    pub fn from_channel(channel: tonic::transport::Channel) -> Self {
+        GrpcAcceptorHandle {
+            client: ConsensusAcceptorClient::new(channel),
+        }
+    }
+
     /// Connect to a remote acceptor at the given address.
     pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
         let client = ConsensusAcceptorClient::connect(addr).await?;
@@ -164,6 +171,13 @@ pub struct GrpcLearnerHandle {
 }
 
 impl GrpcLearnerHandle {
+    /// Create a handle from an existing tonic channel.
+    pub fn from_channel(channel: tonic::transport::Channel) -> Self {
+        GrpcLearnerHandle {
+            client: ConsensusLearnerClient::new(channel),
+        }
+    }
+
     /// Connect to a remote learner at the given address.
     pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
         let client = ConsensusLearnerClient::connect(addr).await?;

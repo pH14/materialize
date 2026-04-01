@@ -41,8 +41,9 @@ cargo run -p mz-persist-shared-log -- monolith \
 
 ### Distributed mode (separate processes)
 
-Each actor runs as a separate process. They find each other via Unix domain
-sockets under a shared `--run-dir` directory.
+The metashard automatically spawns acceptor and learner child processes when
+the partition map is created. You only need to start the metashard and the
+router.
 
 ```bash
 export RUN_DIR=/tmp/shared-log
@@ -51,7 +52,7 @@ export PERSIST_BLOB_URL=file:///tmp/persist/blob
 export PERSIST_CONSENSUS_URL='postgres://phemberger@localhost:5432/consensus'
 ```
 
-**Terminal 1 -- Metashard:**
+**Terminal 1 -- Metashard** (spawns acceptor + learner automatically):
 
 ```bash
 cargo run -p mz-persist-shared-log -- metashard \
@@ -61,43 +62,7 @@ cargo run -p mz-persist-shared-log -- metashard \
   --consensus-url $PERSIST_CONSENSUS_URL
 ```
 
-**Terminal 2 -- Discover shard IDs:**
-
-```bash
-grpcurl -plaintext \
-  -proto src/persist/src/consensus_service.proto \
-  unix:///$RUN_DIR/metashard-$METASHARD_ID/grpc.sock \
-  mz_persist.gen.consensus_service.ConsensusMetashard/GetPartitionMap
-```
-
-This returns the partition map with the log shard IDs the metashard generated.
-Note the `log_shard` value for the next steps (e.g.
-`s11111111-1111-1111-1111-111111111111`).
-
-**Terminal 3 -- Acceptor** (using the shard ID from step 2):
-
-```bash
-export PERSIST_SHARD_ID=<shard-id-from-step-2>
-
-cargo run -p mz-persist-shared-log -- acceptor \
-  --run-dir $RUN_DIR \
-  --shard-id $PERSIST_SHARD_ID \
-  --blob-url $PERSIST_BLOB_URL \
-  --consensus-url $PERSIST_CONSENSUS_URL
-```
-
-**Terminal 4 -- Learner** (same shard ID):
-
-```bash
-cargo run -p mz-persist-shared-log -- learner \
-  --run-dir $RUN_DIR \
-  --shard-id $PERSIST_SHARD_ID \
-  --replica-id 0 \
-  --blob-url $PERSIST_BLOB_URL \
-  --consensus-url $PERSIST_CONSENSUS_URL
-```
-
-**Terminal 5 -- Router:**
+**Terminal 2 -- Router:**
 
 ```bash
 cargo run -p mz-persist-shared-log -- router \
@@ -111,14 +76,23 @@ cargo run -p mz-persist-shared-log -- router \
 The router listens on TCP `:6890` for client requests and connects to actors
 via Unix sockets under `$RUN_DIR`.
 
-**Terminal 6 -- Test a write:**
+**Test a write:**
 
 ```bash
-grpcurl -plaintext -d '{
-  "key": "test-key",
-  "new": {"seqno": 1, "data": "aGVsbG8="}
-}' localhost:6890 \
+grpcurl -plaintext \
+  -proto src/persist/src/consensus_service.proto \
+  -d '{"key":"test-key","new":{"seqno":1,"data":"aGVsbG8="}}' \
+  localhost:6890 \
   mz_persist.gen.consensus_service.PersistSharedLog/CompareAndSet
+```
+
+**Inspect the partition map:**
+
+```bash
+grpcurl -plaintext \
+  -proto src/persist/src/consensus_service.proto \
+  unix:///$RUN_DIR/metashard-$METASHARD_ID/grpc.sock \
+  mz_persist.gen.consensus_service.ConsensusMetashard/GetPartitionMap
 ```
 
 ### Socket path layout

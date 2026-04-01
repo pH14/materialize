@@ -737,7 +737,17 @@ async fn run_metashard(args: MetashardArgs) {
         }
     };
 
-    let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
+    // Use ProcessActorFactory to spawn acceptors/learners as child processes.
+    // The metashard creates actors at startup and during reconfiguration.
+    let binary = std::env::current_exe().expect("resolve current binary path");
+    let factory = Arc::new(
+        mz_persist_shared_log::process_factory::ProcessActorFactory::new(
+            binary,
+            args.run_dir.clone(),
+            args.storage.blob_url.clone(),
+            args.storage.consensus_url.clone(),
+        ),
+    );
 
     let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
         bootstrap_state,

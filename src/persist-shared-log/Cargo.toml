@@ -44,7 +44,7 @@ mz-persist-client = { path = "../persist-client" }
 mz-persist-types = { path = "../persist-types" }
 prometheus = { version = "0.14.0", default-features = false }
 prost = { version = "0.14.3", features = ["no-recursion-limit"] }
-tokio = { version = "1.49.0", default-features = false, features = ["macros", "sync", "rt", "time", "net", "tracing"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "sync", "rt", "time", "net", "tracing", "process"] }
 tokio-stream = "0.1"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 tonic = "0.14.2"

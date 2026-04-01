@@ -41,6 +41,7 @@ pub mod factory;
 pub mod fault;
 pub mod metrics;
 pub mod persist_log;
+pub mod process_factory;
 pub mod rpc;
 pub mod uds;
 

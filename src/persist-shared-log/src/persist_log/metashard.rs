@@ -939,6 +939,27 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             }
         }
 
+        // Create actors for all shards in the partition map. The factory is
+        // idempotent — if actors were already created during crash recovery
+        // reconfiguration above, this returns cached handles.
+        for range in self.state.partition_map.ranges.clone() {
+            let shard_id = range.log_shard;
+            if let Err(e) = self
+                .factory
+                .create_acceptor(shard_id, self.state.epoch, vec![], range)
+                .await
+            {
+                tracing::error!(%shard_id, "failed to create acceptor at startup: {e}");
+            }
+            if let Err(e) = self.factory.create_learner(shard_id).await {
+                tracing::error!(%shard_id, "failed to create learner at startup: {e}");
+            }
+        }
+        info!(
+            num_shards = self.state.partition_map.ranges.len(),
+            "created actors for all shards in partition map"
+        );
+
         loop {
             match self.rx.recv().await {
                 Some(MetashardCommand::Reconfigure { plan, reply }) => {
