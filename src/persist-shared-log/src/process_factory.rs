@@ -53,6 +53,9 @@ pub struct ProcessActorFactory {
     acceptors: Mutex<BTreeMap<ShardId, GrpcAcceptorHandle>>,
     /// Cached learner handles (keyed by shard ID).
     learners: Mutex<BTreeMap<ShardId, GrpcLearnerHandle>>,
+    /// Supervisor task handles for each shard (acceptor + learner).
+    /// Dropping these aborts the supervisor, which kills the child process.
+    supervisors: Mutex<BTreeMap<ShardId, Vec<mz_ore::task::AbortOnDropHandle<()>>>>,
 }
 
 impl ProcessActorFactory {
@@ -70,6 +73,7 @@ impl ProcessActorFactory {
             connect_timeout: Duration::from_secs(30),
             acceptors: Mutex::new(BTreeMap::new()),
             learners: Mutex::new(BTreeMap::new()),
+            supervisors: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -93,12 +97,13 @@ impl ProcessActorFactory {
     }
 
     /// Spawn a supervisor task that runs a child process in a restart loop.
+    /// Returns the task handle so it can be aborted to stop the child.
     fn spawn_supervisor(
         binary: PathBuf,
         args: Vec<String>,
         socket_path: PathBuf,
         label: String,
-    ) {
+    ) -> mz_ore::task::JoinHandle<()> {
         let pid_file = Self::pid_file(&socket_path);
         let task_name = format!("supervisor-{label}");
         mz_ore::task::spawn(|| task_name, async move {
@@ -140,7 +145,7 @@ impl ProcessActorFactory {
 
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        });
+        })
     }
 }
 
@@ -190,12 +195,18 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
             args.push(format!("{pred_shard}@{since_val}"));
         }
 
-        Self::spawn_supervisor(
+        let supervisor = Self::spawn_supervisor(
             self.binary.clone(),
             args,
             socket_path.clone(),
             format!("acceptor-{shard_id}"),
         );
+        self.supervisors
+            .lock()
+            .unwrap()
+            .entry(shard_id)
+            .or_default()
+            .push(supervisor.abort_on_drop());
 
         // Wait for the child to start listening on the Unix socket.
         let socket_str = socket_path.to_string_lossy().to_string();
@@ -233,12 +244,18 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
             "0.0.0.0:0".to_string(),
         ];
 
-        Self::spawn_supervisor(
+        let supervisor = Self::spawn_supervisor(
             self.binary.clone(),
             args,
             socket_path.clone(),
             format!("learner-{shard_id}-0"),
         );
+        self.supervisors
+            .lock()
+            .unwrap()
+            .entry(shard_id)
+            .or_default()
+            .push(supervisor.abort_on_drop());
 
         // Wait for the child to start listening on the Unix socket.
         let socket_str = socket_path.to_string_lossy().to_string();
@@ -250,5 +267,23 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
             .insert(shard_id, handle.clone());
         info!(%shard_id, "learner process ready");
         Ok(handle)
+    }
+
+    async fn stop_shard(&self, shard_id: ShardId) {
+        // Drop supervisor handles — AbortOnDropHandle aborts the task on drop,
+        // which kills the child processes.
+        self.supervisors.lock().unwrap().remove(&shard_id);
+        self.acceptors.lock().unwrap().remove(&shard_id);
+        self.learners.lock().unwrap().remove(&shard_id);
+
+        // Clean up socket files and PID files.
+        let acceptor_dir = self.run_dir.join(format!("acceptor-{shard_id}"));
+        let learner_dir = self.run_dir.join(format!("learner-{shard_id}-0"));
+        let pubsub_dir = self.run_dir.join(format!("pubsub-{shard_id}"));
+        for dir in [&acceptor_dir, &learner_dir, &pubsub_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        info!(%shard_id, "stopped shard processes");
     }
 }

@@ -60,6 +60,12 @@ pub trait ActorFactory: Send + Sync + 'static {
 
     /// Create (or return an existing) learner for the given shard.
     async fn create_learner(&self, shard_id: ShardId) -> Result<Self::L, String>;
+
+    /// Stop the acceptor and learner for a retired shard.
+    ///
+    /// Called after reconfiguration when a shard is sealed and no longer needed.
+    /// The default implementation is a no-op (actors just keep running).
+    async fn stop_shard(&self, _shard_id: ShardId) {}
 }
 
 /// Blanket impl: `Arc<F>` delegates to `F`.
@@ -80,6 +86,10 @@ impl<F: ActorFactory> ActorFactory for std::sync::Arc<F> {
 
     async fn create_learner(&self, shard_id: ShardId) -> Result<Self::L, String> {
         (**self).create_learner(shard_id).await
+    }
+
+    async fn stop_shard(&self, shard_id: ShardId) {
+        (**self).stop_shard(shard_id).await
     }
 }
 

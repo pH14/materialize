@@ -883,6 +883,11 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             }
         }
 
+        // Stop retired shard processes (if the factory supports it).
+        for &shard_id in &retiring {
+            self.factory.stop_shard(shard_id).await;
+        }
+
         // TODO: Retract durable state for fully-finalized prior epochs so the
         // metashard shard doesn't grow unboundedly.
 
