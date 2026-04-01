@@ -81,7 +81,7 @@ fn status_to_learner_error(status: tonic::Status) -> LearnerError {
 ///
 /// Implements the `Acceptor` trait so it can be used interchangeably with
 /// the in-process `PersistAcceptorHandle` in `ShardedService` and
-/// `RoutingState`.
+/// `RoutingSnapshot`.
 #[derive(Debug, Clone)]
 pub struct GrpcAcceptorHandle {
     client: ConsensusAcceptorClient<tonic::transport::Channel>,

@@ -116,8 +116,6 @@ impl<A: Acceptor, L: Learner> RoutingSnapshot<A, L> {
     }
 }
 
-/// Backward-compat alias.
-pub type RoutingState<A, L> = RoutingSnapshot<A, L>;
 
 // ---------------------------------------------------------------------------
 // ShardedService

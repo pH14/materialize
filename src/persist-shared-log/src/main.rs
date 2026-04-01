@@ -56,11 +56,11 @@ struct Args {
     #[arg(long, default_value = "1")]
     num_log_shards: usize,
 
-    /// Shard ID for the metashard persist shard (durable state). If provided,
-    /// the metashard actor persists its partition map and reconfiguration
-    /// intents to this shard, enabling crash recovery.
+    /// Shard ID for the metashard persist shard (durable state). Required for
+    /// crash recovery — the metashard persists its partition map and
+    /// reconfiguration intents to this shard.
     #[arg(long, env = "METASHARD_ID")]
-    metashard_id: Option<String>,
+    metashard_id: String,
 }
 
 fn main() {
@@ -165,14 +165,7 @@ async fn run(args: Args) {
     };
 
     // --- Step 1: Create metashard (source of truth) ---
-    let metashard_shard_id = match &args.metashard_id {
-        Some(id) => id.parse().expect("invalid --metashard-id"),
-        None => {
-            let id = ShardId::new();
-            info!(%id, "generated metashard shard ID");
-            id
-        }
-    };
+    let metashard_shard_id: ShardId = args.metashard_id.parse().expect("invalid --metashard-id");
 
     // Build a bootstrap partition map from CLI args. PersistMetashardActor::new
     // will override this if it recovers a committed map from durable state.
@@ -215,10 +208,14 @@ async fn run(args: Args) {
         epoch,
         num_ranges = partition_map.ranges.len(),
         "active partition map: {:?}",
-        partition_map.ranges.iter().map(|r| format!(
-            "[0x{:02x}, 0x{:03x}) -> {}",
-            r.lo, r.hi_exclusive, r.log_shard
-        )).collect::<Vec<_>>()
+        partition_map
+            .ranges
+            .iter()
+            .map(|r| format!(
+                "[0x{:02x}, 0x{:03x}) -> {}",
+                r.lo, r.hi_exclusive, r.log_shard
+            ))
+            .collect::<Vec<_>>()
     );
 
     // --- Step 3: Start metashard actor ---
@@ -227,7 +224,14 @@ async fn run(args: Args) {
     // --- Step 4: Build ShardedService ---
     // The routing task subscribes to the metashard persist shard via the
     // directory and uses the factory to create actor handles.
-    let service = ShardedService::new(PartitionMap { epoch: 0, ranges: vec![] }, BTreeMap::new(), BTreeMap::new());
+    let service = ShardedService::new(
+        PartitionMap {
+            epoch: 0,
+            ranges: vec![],
+        },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
     mz_persist_shared_log::sharded_service::spawn_routing_task(
         &persist_client,
         &directory,
