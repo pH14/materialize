@@ -78,3 +78,48 @@ impl ServiceDirectory for InProcessDirectory {
         vec![shard_id]
     }
 }
+
+// ---------------------------------------------------------------------------
+// ProcessDirectory
+// ---------------------------------------------------------------------------
+
+/// Multi-process directory where addresses are Unix domain socket paths.
+///
+/// Each actor gets a deterministic socket path derived from its shard ID
+/// under a shared run directory. Used by `ProcessOrchestrator`-style
+/// deployments where each actor runs as a separate OS process.
+pub struct ProcessDirectory {
+    run_dir: std::path::PathBuf,
+    metashard_shard_id: ShardId,
+}
+
+impl ProcessDirectory {
+    pub fn new(run_dir: std::path::PathBuf, metashard_shard_id: ShardId) -> Self {
+        ProcessDirectory { run_dir, metashard_shard_id }
+    }
+
+    fn socket_path(&self, role: &str, shard_id: ShardId) -> String {
+        self.run_dir
+            .join(format!("{role}-{shard_id}"))
+            .join("grpc.sock")
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+impl ServiceDirectory for ProcessDirectory {
+    type Addr = String;
+
+    fn metashard_addr(&self) -> String {
+        self.socket_path("metashard", self.metashard_shard_id)
+    }
+
+    fn acceptor_addr(&self, shard_id: ShardId) -> String {
+        self.socket_path("acceptor", shard_id)
+    }
+
+    fn learner_addrs(&self, shard_id: ShardId) -> Vec<String> {
+        // Single learner replica per shard for now.
+        vec![self.socket_path("learner", shard_id)]
+    }
+}
