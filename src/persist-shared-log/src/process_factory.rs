@@ -153,7 +153,7 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
         &self,
         shard_id: ShardId,
         epoch: u64,
-        _predecessors: Vec<(ShardId, Antichain<u64>)>,
+        predecessors: Vec<(ShardId, Antichain<u64>)>,
         range: RangeAssignment,
     ) -> Result<GrpcAcceptorHandle, String> {
         // Return cached handle if already running.
@@ -162,7 +162,7 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
         }
 
         let socket_path = self.acceptor_socket(shard_id);
-        let args = vec![
+        let mut args = vec![
             "acceptor".to_string(),
             "--run-dir".to_string(),
             self.run_dir.to_string_lossy().to_string(),
@@ -182,6 +182,13 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
             "--metrics-listen-addr".to_string(),
             "0.0.0.0:0".to_string(),
         ];
+
+        // Pass predecessor specs so the acceptor snapshots data from old shards.
+        for (pred_shard, since) in &predecessors {
+            let since_val = since.elements().first().copied().unwrap_or(0);
+            args.push("--predecessor".to_string());
+            args.push(format!("{pred_shard}@{since_val}"));
+        }
 
         Self::spawn_supervisor(
             self.binary.clone(),

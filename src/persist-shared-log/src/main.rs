@@ -321,6 +321,28 @@ struct AcceptorArgs {
     /// High byte of the key range (exclusive). E.g., 256 for the full range.
     #[arg(long, default_value = "256")]
     range_hi: u16,
+
+    /// Predecessor shard specs for reconfiguration snapshot. Each entry is
+    /// `SHARD_ID@SINCE` where SINCE is the u64 since frontier.
+    ///
+    /// The acceptor snapshots data from these predecessor shards during its
+    /// setup phase, filtering to the key range owned by this shard.
+    #[arg(long = "predecessor", value_parser = parse_predecessor)]
+    predecessors: Vec<(String, u64)>,
+}
+
+/// Parse `SHARD_ID@SINCE` into (shard_id_string, since_u64).
+fn parse_predecessor(s: &str) -> Result<(String, u64), String> {
+    let (shard_str, since_str) = s
+        .split_once('@')
+        .ok_or_else(|| format!("expected SHARD_ID@SINCE, got: {s}"))?;
+    let _: ShardId = shard_str
+        .parse()
+        .map_err(|e| format!("invalid shard ID '{shard_str}': {e}"))?;
+    let since: u64 = since_str
+        .parse()
+        .map_err(|e| format!("invalid since '{since_str}': {e}"))?;
+    Ok((shard_str.to_string(), since))
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +686,15 @@ async fn run_acceptor(args: AcceptorArgs) {
     let acceptor_metrics =
         mz_persist_shared_log::metrics::AcceptorMetrics::register(&shard_registry);
 
+    let predecessors: Vec<_> = args
+        .predecessors
+        .iter()
+        .map(|(shard_str, since)| {
+            let pred_shard: ShardId = shard_str.parse().expect("predecessor shard ID validated at parse time");
+            (pred_shard, timely::progress::Antichain::from_elem(*since))
+        })
+        .collect();
+
     let (handle, _task) = mz_persist_shared_log::persist_log::acceptor::PersistAcceptor::spawn(
         AcceptorConfig::default(),
         &persist_client,
@@ -671,7 +702,7 @@ async fn run_acceptor(args: AcceptorArgs) {
         acceptor_metrics,
         args.epoch,
         Box::new(mz_persist_shared_log::NoOpRetractionSource),
-        vec![],
+        predecessors,
         range,
     )
     .await;
