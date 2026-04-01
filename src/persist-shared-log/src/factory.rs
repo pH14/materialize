@@ -27,6 +27,7 @@ use mz_persist_client::{PersistClient, ShardId};
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::sharded_service::ShardedRetractionSource;
 use crate::{Acceptor, AcceptorConfig, Learner, RangeAssignment};
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,10 @@ use crate::{Acceptor, AcceptorConfig, Learner, RangeAssignment};
 ///
 /// Implementations must be idempotent: calling `create_acceptor` twice for the
 /// same shard returns a handle to the same actor (not a duplicate).
+///
+/// The factory is responsible for wiring retraction sources: after creating
+/// both the acceptor and learner for a shard, it connects the acceptor's
+/// retraction polling to the learner.
 #[async_trait::async_trait]
 pub trait ActorFactory: Send + Sync + 'static {
     type A: Acceptor;
@@ -55,6 +60,27 @@ pub trait ActorFactory: Send + Sync + 'static {
     async fn create_learner(&self, shard_id: ShardId) -> Result<Self::L, String>;
 }
 
+/// Blanket impl: `Arc<F>` delegates to `F`.
+#[async_trait::async_trait]
+impl<F: ActorFactory> ActorFactory for std::sync::Arc<F> {
+    type A = F::A;
+    type L = F::L;
+
+    async fn create_acceptor(
+        &self,
+        shard_id: ShardId,
+        epoch: u64,
+        predecessors: Vec<(ShardId, Antichain<u64>)>,
+        range: RangeAssignment,
+    ) -> Result<Self::A, String> {
+        (**self).create_acceptor(shard_id, epoch, predecessors, range).await
+    }
+
+    async fn create_learner(&self, shard_id: ShardId) -> Result<Self::L, String> {
+        (**self).create_learner(shard_id).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InProcessActorFactory
 // ---------------------------------------------------------------------------
@@ -62,9 +88,8 @@ pub trait ActorFactory: Send + Sync + 'static {
 /// Factory that spawns actors as in-process tokio tasks and caches handles.
 ///
 /// Repeated calls for the same shard return a clone of the existing handle.
-/// This allows both the metashard (which spawns actors during reconfiguration)
-/// and the ShardedService (which needs handles for routing) to share the same
-/// factory without spawning duplicate actors.
+/// After both acceptor and learner are created for a shard, the factory wires
+/// the acceptor's retraction source to query the learner directly.
 pub struct InProcessActorFactory {
     persist_client: PersistClient,
     acceptors: Mutex<BTreeMap<ShardId, PersistAcceptorHandle>>,
@@ -78,6 +103,22 @@ impl InProcessActorFactory {
             acceptors: Mutex::new(BTreeMap::new()),
             learners: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Wire the acceptor's retraction source to query the learner for the
+    /// given shard, if both exist in the cache.
+    async fn maybe_wire_retractions(&self, shard_id: ShardId) {
+        let (acceptor, learner) = {
+            let acceptors = self.acceptors.lock().unwrap();
+            let learners = self.learners.lock().unwrap();
+            match (acceptors.get(&shard_id), learners.get(&shard_id)) {
+                (Some(a), Some(l)) => (a.clone(), l.clone()),
+                _ => return,
+            }
+        };
+        let source: Box<dyn crate::RetractionSource> =
+            Box::new(ShardedRetractionSource::new(vec![learner]));
+        let _ = acceptor.set_retraction_source(source).await;
     }
 }
 
@@ -114,6 +155,8 @@ impl ActorFactory for InProcessActorFactory {
         .await;
 
         self.acceptors.lock().unwrap().insert(shard_id, handle.clone());
+        // Wire retractions if the learner was already created.
+        self.maybe_wire_retractions(shard_id).await;
         Ok(handle)
     }
 
@@ -135,6 +178,8 @@ impl ActorFactory for InProcessActorFactory {
         .await;
 
         self.learners.lock().unwrap().insert(shard_id, handle.clone());
+        // Wire retractions if the acceptor was already created.
+        self.maybe_wire_retractions(shard_id).await;
         Ok(handle)
     }
 }

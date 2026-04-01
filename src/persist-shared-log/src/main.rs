@@ -16,18 +16,14 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
-use tracing::{info, warn};
+use tracing::info;
 
-use mz_ore::metrics::MetricsRegistry;
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLogServer;
 use mz_persist_client::ShardId;
-use mz_persist_shared_log::metrics::{AcceptorMetrics, LearnerMetrics};
-use mz_persist_shared_log::persist_log::acceptor::PersistAcceptor;
-use mz_persist_shared_log::persist_log::learner::{PersistLearner, PersistLearnerConfig};
+use mz_persist_shared_log::factory::{ActorFactory, InProcessActorFactory};
 use mz_persist_shared_log::persist_log::metashard::{MetashardState, PersistMetashardActor};
-use mz_persist_shared_log::factory::InProcessActorFactory;
 use mz_persist_shared_log::sharded_service::{RoutingState, ShardedService};
-use mz_persist_shared_log::{AcceptorConfig, PartitionMap, RangeAssignment};
+use mz_persist_shared_log::{PartitionMap, RangeAssignment};
 
 /// CLI arguments for the persist shared log service.
 #[derive(Parser, Debug)]
@@ -206,13 +202,13 @@ async fn run(args: Args) {
     // but doesn't use it during construction.
     let empty_routing = Arc::new(RwLock::new(RoutingState::empty()));
 
-    let factory = InProcessActorFactory::new(persist_client.clone());
+    let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
 
     let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
         bootstrap_state,
         256,
         persist_client.clone(),
-        factory,
+        Arc::clone(&factory),
         Arc::clone(&empty_routing),
         metashard_shard_id,
     )
@@ -231,29 +227,21 @@ async fn run(args: Args) {
         )).collect::<Vec<_>>()
     );
 
-    // --- Step 3: Spawn acceptors first ---
-    // Acceptors must be spawned before learners because they write setup batches
-    // (batch_id=1 bulk snapshot, batch_id=2 delta snapshot) that advance upper
-    // past T=0. The learner's subscribe blocks until upper > 0.
+    // --- Step 3: Spawn acceptors and learners via factory ---
+    // The factory creates actors and caches handles. It auto-wires retraction
+    // sources: when both acceptor and learner exist for a shard, the acceptor
+    // queries the learner directly for retractions.
+    // Acceptors must be created before learners (setup batches advance upper
+    // past T=0, which the learner's subscribe needs).
     let mut acceptor_handles = BTreeMap::new();
+    let mut learner_handles = BTreeMap::new();
 
     for range in &partition_map.ranges {
         let shard_id = range.log_shard;
-        let shard_registry = MetricsRegistry::new();
-        let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
-
-        let (acceptor_handle, _) = PersistAcceptor::spawn(
-            AcceptorConfig::default(),
-            &persist_client,
-            shard_id,
-            acceptor_metrics,
-            epoch,
-            Box::new(mz_persist_shared_log::NoOpRetractionSource), // Wired to real source after learners spawn.
-            vec![],
-            range.clone(),
-        )
-        .await;
-
+        let acceptor_handle = factory
+            .create_acceptor(shard_id, epoch, vec![], range.clone())
+            .await
+            .expect("failed to create acceptor");
         info!(
             %shard_id,
             range = %format!("[0x{:02x}, 0x{:03x})", range.lo, range.hi_exclusive),
@@ -262,22 +250,12 @@ async fn run(args: Args) {
         acceptor_handles.insert(shard_id, acceptor_handle);
     }
 
-    // --- Step 3.5: Spawn learners, then wire retraction sources ---
-    let mut learner_handles = BTreeMap::new();
-
     for (i, range) in partition_map.ranges.iter().enumerate() {
         let shard_id = range.log_shard;
-        let shard_registry = MetricsRegistry::new();
-        let learner_metrics = LearnerMetrics::register(&shard_registry);
-
-        let (learner_handle, _) = PersistLearner::spawn(
-            PersistLearnerConfig::default(),
-            &persist_client,
-            shard_id,
-            learner_metrics,
-        )
-        .await;
-
+        let learner_handle = factory
+            .create_learner(shard_id)
+            .await
+            .expect("failed to create learner");
         info!(
             %shard_id,
             range = %format!("[0x{:02x}, 0x{:03x})", range.lo, range.hi_exclusive),
@@ -285,22 +263,6 @@ async fn run(args: Args) {
             "learner ready"
         );
         learner_handles.insert(shard_id, learner_handle);
-    }
-
-    // Wire retraction sources: learner handles feed retractions to acceptors.
-    for range in &partition_map.ranges {
-        let shard_id = range.log_shard;
-        if let Some(acceptor) = acceptor_handles.get(&shard_id) {
-            if let Some(learner) = learner_handles.get(&shard_id) {
-                let source: Box<dyn mz_persist_shared_log::RetractionSource> =
-                    Box::new(mz_persist_shared_log::sharded_service::ShardedRetractionSource::new(
-                        vec![learner.clone()],
-                    ));
-                if let Err(e) = acceptor.set_retraction_source(source).await {
-                    warn!(%shard_id, "failed to set retraction source: {}", e);
-                }
-            }
-        }
     }
 
     info!(num_shards = partition_map.ranges.len(), "all log shards ready");
