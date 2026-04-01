@@ -178,6 +178,9 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
             self.blob_url.clone(),
             "--consensus-url".to_string(),
             self.consensus_url.clone(),
+            // Bind metrics to a random port to avoid conflicts between children.
+            "--metrics-listen-addr".to_string(),
+            "0.0.0.0:0".to_string(),
         ];
 
         Self::spawn_supervisor(
@@ -218,6 +221,9 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
             self.blob_url.clone(),
             "--consensus-url".to_string(),
             self.consensus_url.clone(),
+            // Bind metrics to a random port to avoid conflicts between children.
+            "--metrics-listen-addr".to_string(),
+            "0.0.0.0:0".to_string(),
         ];
 
         Self::spawn_supervisor(
