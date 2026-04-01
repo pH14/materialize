@@ -50,6 +50,8 @@ service ConsensusLearner {
 service ConsensusMetashard {
   // Return the current partition map and metashard state.
   rpc GetPartitionMap(ProtoGetPartitionMapRequest) returns (ProtoGetPartitionMapResponse);
+  // Trigger a reconfiguration to a new number of shards.
+  rpc Reconfigure(ProtoReconfigureRequest) returns (ProtoReconfigureResponse);
 }
 
 // Combined service: maps 1:1 to the persist Consensus trait, plus
