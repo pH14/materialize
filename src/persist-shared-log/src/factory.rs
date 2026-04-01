@@ -10,10 +10,14 @@
 //! Actor factory: abstracts how acceptors and learners are created.
 //!
 //! The metashard uses this trait during reconfiguration to create new actors.
-//! In monolithic mode, actors are spawned as in-process tokio tasks. In
-//! multi-process mode, actors are spawned as separate OS processes and
-//! accessed via gRPC handles.
+//! The ShardedService uses it to obtain handles when the partition map changes.
+//!
+//! In monolithic mode, the factory spawns in-process tokio tasks and caches
+//! handles so repeated calls for the same shard return clones. In multi-process
+//! mode, the factory connects to already-running processes via gRPC.
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use timely::progress::Antichain;
 
@@ -31,20 +35,14 @@ use crate::{Acceptor, AcceptorConfig, Learner, RangeAssignment};
 
 /// Factory for creating acceptor and learner handles.
 ///
-/// In the monolithic binary, the factory spawns in-process tokio tasks and
-/// returns mpsc channel handles. In multi-process mode, the factory spawns
-/// OS processes (or connects to already-running processes) and returns gRPC
-/// client handles.
-///
-/// The associated types `A` and `L` must satisfy the `Acceptor` and `Learner`
-/// trait bounds so that `RoutingState<F::A, F::L>` and `ShardedService<F::A,
-/// F::L>` work generically.
+/// Implementations must be idempotent: calling `create_acceptor` twice for the
+/// same shard returns a handle to the same actor (not a duplicate).
 #[async_trait::async_trait]
 pub trait ActorFactory: Send + Sync + 'static {
     type A: Acceptor;
     type L: Learner;
 
-    /// Create an acceptor for the given shard.
+    /// Create (or return an existing) acceptor for the given shard.
     async fn create_acceptor(
         &self,
         shard_id: ShardId,
@@ -53,7 +51,7 @@ pub trait ActorFactory: Send + Sync + 'static {
         range: RangeAssignment,
     ) -> Result<Self::A, String>;
 
-    /// Create a learner for the given shard.
+    /// Create (or return an existing) learner for the given shard.
     async fn create_learner(&self, shard_id: ShardId) -> Result<Self::L, String>;
 }
 
@@ -61,18 +59,25 @@ pub trait ActorFactory: Send + Sync + 'static {
 // InProcessActorFactory
 // ---------------------------------------------------------------------------
 
-/// Factory that spawns actors as in-process tokio tasks.
+/// Factory that spawns actors as in-process tokio tasks and caches handles.
 ///
-/// This is the current behavior of the monolithic binary, extracted behind
-/// the `ActorFactory` trait so the metashard doesn't directly depend on
-/// concrete actor types.
+/// Repeated calls for the same shard return a clone of the existing handle.
+/// This allows both the metashard (which spawns actors during reconfiguration)
+/// and the ShardedService (which needs handles for routing) to share the same
+/// factory without spawning duplicate actors.
 pub struct InProcessActorFactory {
     persist_client: PersistClient,
+    acceptors: Mutex<BTreeMap<ShardId, PersistAcceptorHandle>>,
+    learners: Mutex<BTreeMap<ShardId, PersistLearnerHandle>>,
 }
 
 impl InProcessActorFactory {
     pub fn new(persist_client: PersistClient) -> Self {
-        InProcessActorFactory { persist_client }
+        InProcessActorFactory {
+            persist_client,
+            acceptors: Mutex::new(BTreeMap::new()),
+            learners: Mutex::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -88,6 +93,11 @@ impl ActorFactory for InProcessActorFactory {
         predecessors: Vec<(ShardId, Antichain<u64>)>,
         range: RangeAssignment,
     ) -> Result<PersistAcceptorHandle, String> {
+        // Return cached handle if actor already exists.
+        if let Some(handle) = self.acceptors.lock().unwrap().get(&shard_id) {
+            return Ok(handle.clone());
+        }
+
         let shard_registry = MetricsRegistry::new();
         let acceptor_metrics = AcceptorMetrics::register(&shard_registry);
 
@@ -97,15 +107,22 @@ impl ActorFactory for InProcessActorFactory {
             shard_id,
             acceptor_metrics,
             epoch,
-            Box::new(crate::NoOpRetractionSource), // Wired to real source separately.
+            Box::new(crate::NoOpRetractionSource),
             predecessors,
             range,
         )
         .await;
+
+        self.acceptors.lock().unwrap().insert(shard_id, handle.clone());
         Ok(handle)
     }
 
     async fn create_learner(&self, shard_id: ShardId) -> Result<PersistLearnerHandle, String> {
+        // Return cached handle if actor already exists.
+        if let Some(handle) = self.learners.lock().unwrap().get(&shard_id) {
+            return Ok(handle.clone());
+        }
+
         let shard_registry = MetricsRegistry::new();
         let learner_metrics = LearnerMetrics::register(&shard_registry);
 
@@ -116,6 +133,8 @@ impl ActorFactory for InProcessActorFactory {
             learner_metrics,
         )
         .await;
+
+        self.learners.lock().unwrap().insert(shard_id, handle.clone());
         Ok(handle)
     }
 }
