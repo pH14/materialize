@@ -1191,7 +1191,6 @@ async fn main() {
     let persist_client = client::new_persist_client(persist_client_config);
 
     // Build partition map: evenly divide [0x00, 0x100) across N log shards.
-    let mut shard_ids: Vec<ShardId> = Vec::with_capacity(num_log_shards);
     let mut partition_ranges: Vec<RangeAssignment> = Vec::with_capacity(num_log_shards);
     let range_size = 256 / num_log_shards;
     for i in 0..num_log_shards {
@@ -1202,7 +1201,6 @@ async fn main() {
         } else {
             u16::try_from((i + 1) * range_size).expect("range end fits u16")
         };
-        shard_ids.push(shard_id);
         partition_ranges.push(RangeAssignment {
             lo,
             hi_exclusive,

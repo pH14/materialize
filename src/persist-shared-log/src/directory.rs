@@ -39,6 +39,13 @@ pub trait ServiceDirectory: Send + Sync + 'static {
 
     /// Addresses of all learner replicas for the given log shard.
     fn learner_addrs(&self, shard_id: ShardId) -> Vec<Self::Addr>;
+
+    /// Address of the persist pubsub server for the given log shard.
+    ///
+    /// The pubsub server is co-located with the acceptor but served on a
+    /// separate port. Learners connect to this address so that writes from
+    /// the acceptor instantly notify the learner's `Subscribe`.
+    fn pubsub_addr(&self, shard_id: ShardId) -> Self::Addr;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +83,12 @@ impl ServiceDirectory for InProcessDirectory {
 
     fn learner_addrs(&self, shard_id: ShardId) -> Vec<ShardId> {
         vec![shard_id]
+    }
+
+    fn pubsub_addr(&self, shard_id: ShardId) -> ShardId {
+        // In-process: pubsub is implicit via the shared PersistClient.
+        // The address is never used to open a network connection.
+        shard_id
     }
 }
 
@@ -121,5 +134,9 @@ impl ServiceDirectory for ProcessDirectory {
     fn learner_addrs(&self, shard_id: ShardId) -> Vec<String> {
         // Single learner replica per shard for now.
         vec![self.socket_path("learner", shard_id)]
+    }
+
+    fn pubsub_addr(&self, shard_id: ShardId) -> String {
+        self.socket_path("pubsub", shard_id)
     }
 }
