@@ -39,7 +39,6 @@
 //! - Deterministic scheduling with seeded turmoil
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use mz_ore::metrics::MetricsRegistry;
@@ -178,7 +177,7 @@ fn sim_cluster_smoke() {
         learners.insert(shard_ids[0], lrn_handle);
 
         let service = ShardedService::new(partition_map, acceptors, learners);
-        let routing_handle = service.routing_handle();
+
 
         let metashard_state = MetashardState::single(shard_ids[0]);
         let factory = InProcessActorFactory::new(client.clone());
@@ -187,8 +186,6 @@ fn sim_cluster_smoke() {
             256,
             client,
             factory,
-            routing_handle,
-            Arc::new(tokio::sync::Notify::new()),
             ms_shard,
         )
         .await;
@@ -293,10 +290,10 @@ fn sim_cluster_crash_restart() {
             learners.insert(shard_ids[0], lrn_handle);
 
             let service = ShardedService::new(partition_map, acceptors, learners);
-            let routing_handle = service.routing_handle();
+
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, Arc::new(tokio::sync::Notify::new()), ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -352,10 +349,10 @@ fn sim_cluster_crash_restart() {
             learners.insert(shard_ids[0], lrn_handle);
 
             let service = ShardedService::new(partition_map, acceptors, learners);
-            let routing_handle = service.routing_handle();
+
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, Arc::new(tokio::sync::Notify::new()), ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -443,10 +440,10 @@ fn sim_cluster_persist_partition() {
             learners.insert(shard_ids[0], lrn);
 
             let service = ShardedService::new(partition_map, acceptors, learners);
-            let routing_handle = service.routing_handle();
+
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, Arc::new(tokio::sync::Notify::new()), ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -500,10 +497,10 @@ fn sim_cluster_persist_partition() {
             learners.insert(shard_ids[0], lrn);
 
             let service = ShardedService::new(partition_map, acceptors, learners);
-            let routing_handle = service.routing_handle();
+
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, Arc::new(tokio::sync::Notify::new()), ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -643,10 +640,10 @@ fn sim_cluster_split_with_writes() {
             learners.insert(shard_ids[0], lrn);
 
             let service = ShardedService::new(partition_map, acceptors, learners);
-            let routing_handle = service.routing_handle();
+
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, Arc::new(tokio::sync::Notify::new()), ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
             ).await;
 
             let key_lo = "s10000000-0000-0000-0000-000000000000"; // 0x10 → [0x00, 0x80)
@@ -769,10 +766,10 @@ fn sim_cluster_reconfig_with_buggify() {
             learners.insert(shard_ids[0], lrn);
 
             let service = ShardedService::new(partition_map, acceptors, learners);
-            let routing_handle = service.routing_handle();
+
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, Arc::new(tokio::sync::Notify::new()), ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
@@ -879,10 +876,10 @@ fn sim_cluster_split_during_persist_partition() {
             learners.insert(shard_ids[0], lrn);
 
             let service = ShardedService::new(partition_map, acceptors, learners);
-            let routing_handle = service.routing_handle();
+
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), routing_handle, Arc::new(tokio::sync::Notify::new()), ms_shard,
+                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
             ).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";

@@ -167,6 +167,21 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
         Arc::clone(&self.routing_notify)
     }
 
+    /// Wait until the routing has at least one range (i.e., is non-empty).
+    /// Used by tests to ensure the routing task has delivered the initial
+    /// partition map before making requests.
+    pub async fn wait_for_routing(&self) {
+        loop {
+            {
+                let routing = self.routing.read().await;
+                if !routing.partition_map.ranges.is_empty() {
+                    return;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     pub fn with_metashard(mut self, handle: PersistMetashardHandle) -> Self {
         self.metashard = Some(handle);
         self

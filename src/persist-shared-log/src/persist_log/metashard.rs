@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use timely::progress::Antichain;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use bytes::Bytes;
@@ -33,7 +33,6 @@ use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
 use crate::factory::ActorFactory;
 use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
-use crate::sharded_service::RoutingState;
 use crate::{
     MetashardError, PartitionMap, RangeAssignment, ReconfigurationPlan,
 };
@@ -235,11 +234,6 @@ pub struct PersistMetashardActor<F: ActorFactory> {
     persist_client: PersistClient,
     /// Factory for creating new acceptors and learners during reconfiguration.
     factory: F,
-    /// Handle to the ShardedService's routing state, for atomic swaps during reconfiguration.
-    routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
-    /// Notify handle — signaled after routing swaps so the ShardedService's
-    /// sealed-retry waiters wake up immediately.
-    routing_notify: Arc<tokio::sync::Notify>,
     /// Whether a reconfiguration is currently in progress.
     reconfiguring: bool,
     /// Persist shard for durable metashard state. The partition map and
@@ -259,8 +253,6 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         queue_depth: usize,
         persist_client: PersistClient,
         factory: F,
-        routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
-        routing_notify: Arc<tokio::sync::Notify>,
         metashard_shard_id: ShardId,
     ) -> (Self, PersistMetashardHandle) {
         let (tx, rx) = mpsc::channel(queue_depth);
@@ -434,8 +426,6 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             rx,
             persist_client,
             factory,
-            routing,
-            routing_notify,
             reconfiguring: false,
             metashard_shard_id,
             metashard_write,
@@ -525,91 +515,10 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         }
     }
 
-    /// Rebuild the routing state from the current metashard state.
-    ///
-    /// Spawns fresh acceptors and learners for every shard in the partition map
-    /// and swaps the routing state. Uses `spawn_with_predecessors` when
-    /// predecessor info is available, so recovered learners can replay sealed
-    /// predecessor shards and reconstruct carried-forward state.
-    async fn rebuild_routing_from_state(&self) {
-        let map = &self.state.partition_map;
-        let mut acceptors = BTreeMap::new();
-        let mut learners = BTreeMap::new();
-
-        for range in &map.ranges {
-            let shard_id = range.log_shard;
-            // Walk the full transitive predecessor chain so that multi-hop
-            // carried-forward state (L1→L2→L4) is reconstructed on recovery.
-            let predecessors = self.transitive_predecessors(shard_id);
-
-            // For each predecessor, read its current since (the compaction
-            // frontier). On recovery, CriticalSince holds may have been lost,
-            // so we use whatever since is available.
-            let mut pred_specs = Vec::new();
-            for &pred_shard in &predecessors {
-                let (_, read) = self
-                    .persist_client
-                    .open::<OrderedKey, Proposal, u64, i64>(
-                        pred_shard,
-                        Arc::new(OrderedKeySchema),
-                        Arc::new(ProposalSchema),
-                        Diagnostics::from_purpose("metashard-recovery-since-read"),
-                        false,
-                    )
-                    .await
-                    .expect("failed to open predecessor for since read");
-                pred_specs.push((pred_shard, read.since().clone()));
-            }
-
-            let acceptor_handle = self
-                .factory
-                .create_acceptor(shard_id, self.state.epoch, pred_specs, range.clone())
-                .await
-                .expect("failed to create acceptor during rebuild");
-
-            if !predecessors.is_empty() {
-                info!(
-                    %shard_id,
-                    predecessors = ?predecessors,
-                    "spawning recovered learner with predecessor replay"
-                );
-            }
-            let learner_handle = self
-                .factory
-                .create_learner(shard_id)
-                .await
-                .expect("failed to create learner during rebuild");
-
-            info!(%shard_id, "spawned recovered actor");
-            acceptors.insert(shard_id, acceptor_handle);
-            learners.insert(shard_id, learner_handle);
-        }
-
-        {
-            let mut routing_guard = self.routing.write().await;
-            *routing_guard = RoutingState {
-                partition_map: map.clone(),
-                acceptors: Arc::new(acceptors),
-                learners: Arc::new(learners),
-            };
-        }
-        self.routing_notify.notify_waiters();
-        info!(
-            epoch = self.state.epoch,
-            num_shards = map.ranges.len(),
-            "rebuilt routing from recovered metashard state"
-        );
-    }
-
     /// Access the actor's current state. Used by main.rs to read the
     /// (possibly recovered) partition map before spawning log shard actors.
     pub fn state(&self) -> &MetashardState {
         &self.state
-    }
-
-    /// Get the routing handle for external updates.
-    pub fn routing_handle(&self) -> &Arc<RwLock<RoutingState<F::A, F::L>>> {
-        &self.routing
     }
 
     /// Public wrapper for transitive predecessor lookup, used by main.rs
@@ -892,56 +801,16 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             intent.status = IntentStatus::Sealed;
         }
 
-        // BUGGIFY: crash after seal but before routing swap.
+        // BUGGIFY: crash after seal but before persist.
         crate::fault::maybe_fail("after_seal").map_err(MetashardError::Command)?;
 
-        // Phase 4: Build new routing state and swap atomically.
-        let new_partition_map = {
-            let mut routing_guard = self.routing.write().await;
-
-            // Carry forward acceptors/learners for shards that remain.
-            let mut all_acceptors = BTreeMap::new();
-            let mut all_learners = BTreeMap::new();
-
-            for range in &new_map.ranges {
-                if let Some(a) = routing_guard.acceptors.get(&range.log_shard) {
-                    all_acceptors.insert(range.log_shard, a.clone());
-                } else if let Some(a) = new_acceptors.remove(&range.log_shard) {
-                    all_acceptors.insert(range.log_shard, a);
-                } else {
-                    return Err(MetashardError::Command(format!(
-                        "no acceptor for log shard {} in new partition map",
-                        range.log_shard
-                    )));
-                }
-
-                if let Some(l) = routing_guard.learners.get(&range.log_shard) {
-                    all_learners.insert(range.log_shard, l.clone());
-                } else if let Some(l) = new_learners.remove(&range.log_shard) {
-                    all_learners.insert(range.log_shard, l);
-                } else {
-                    return Err(MetashardError::Command(format!(
-                        "no learner for log shard {} in new partition map",
-                        range.log_shard
-                    )));
-                }
-            }
-
-            let new_partition_map = PartitionMap {
-                epoch: new_epoch,
-                ranges: new_map.ranges.clone(),
-            };
-
-            *routing_guard = RoutingState {
-                partition_map: new_partition_map.clone(),
-                acceptors: Arc::new(all_acceptors),
-                learners: Arc::new(all_learners),
-            };
-            new_partition_map
+        // Phase 4: Build new partition map.
+        // The ShardedService discovers the new routing by subscribing to the
+        // metashard persist shard — no direct routing swap needed.
+        let new_partition_map = PartitionMap {
+            epoch: new_epoch,
+            ranges: new_map.ranges.clone(),
         };
-
-        // Wake any ShardedService sealed-retry waiters.
-        self.routing_notify.notify_waiters();
 
         // Track new log shards in metashard state.
         for range in &new_map.ranges {
@@ -1031,22 +900,6 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             "metashard actor starting"
         );
 
-        // If the recovered epoch differs from what the bootstrap routing was
-        // built with, rebuild routing from the recovered partition map. This
-        // handles the case where a reconfiguration committed in a previous run
-        // and the process restarted with stale CLI bootstrap arguments.
-        {
-            let routing_epoch = self.routing.read().await.partition_map.epoch;
-            if self.state.epoch != routing_epoch {
-                info!(
-                    recovered_epoch = self.state.epoch,
-                    bootstrap_epoch = routing_epoch,
-                    "recovered epoch differs from bootstrap — rebuilding routing"
-                );
-                self.rebuild_routing_from_state().await;
-            }
-        }
-
         // Persist the initial state so that subscribers (e.g., the routing task)
         // can discover the partition map.
         self.persist_state().await;
@@ -1117,8 +970,6 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         queue_depth: usize,
         persist_client: PersistClient,
         factory: F,
-        routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
-        routing_notify: Arc<tokio::sync::Notify>,
         metashard_shard_id: ShardId,
     ) -> (PersistMetashardHandle, mz_ore::task::JoinHandle<()>) {
         let (actor, handle) = Self::new(
@@ -1126,8 +977,6 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             queue_depth,
             persist_client,
             factory,
-            routing,
-            routing_notify,
             metashard_shard_id,
         )
         .await;
@@ -1139,7 +988,6 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::factory::ActorFactory;
     use crate::Metashard;
 
     fn test_shard(suffix: &str) -> ShardId {
@@ -1348,48 +1196,13 @@ mod tests {
         };
 
         // --- Persist the state ---
-        // We need a RoutingState but the round-trip test only exercises
-        // persist_state() / new(), not routing. Spawn a real acceptor+learner
-        // pair for a dummy shard so RoutingState::new passes its assertions.
-        let dummy_shard = test_shard("ddd");
-        let dummy_map = PartitionMap::single(dummy_shard);
-
         let factory = crate::factory::InProcessActorFactory::new(client.clone());
-        let acc_handle = factory
-            .create_acceptor(
-                dummy_shard,
-                0,
-                vec![],
-                crate::RangeAssignment {
-                    lo: 0x00,
-                    hi_exclusive: 0x100,
-                    log_shard: dummy_shard,
-                },
-            )
-            .await
-            .expect("spawn dummy acceptor");
-        let lrn_handle = factory
-            .create_learner(dummy_shard)
-            .await
-            .expect("spawn dummy learner");
-
-        let mut dummy_acceptors = BTreeMap::new();
-        let mut dummy_learners = BTreeMap::new();
-        dummy_acceptors.insert(dummy_shard, acc_handle);
-        dummy_learners.insert(dummy_shard, lrn_handle);
-        let routing = Arc::new(RwLock::new(RoutingState::new(
-            dummy_map,
-            dummy_acceptors,
-            dummy_learners,
-        )));
 
         let (mut actor, _handle) = PersistMetashardActor::new(
             state.clone(),
             64,
             client.clone(),
             factory,
-            Arc::clone(&routing),
-            Arc::new(tokio::sync::Notify::new()),
             metashard_shard,
         )
         .await;
@@ -1408,8 +1221,6 @@ mod tests {
             64,
             client.clone(),
             factory2,
-            Arc::clone(&routing),
-            Arc::new(tokio::sync::Notify::new()),
             metashard_shard,
         )
         .await;

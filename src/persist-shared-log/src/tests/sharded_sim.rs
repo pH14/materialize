@@ -513,7 +513,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
     learners.insert(shard_old, lrn);
 
     let service = Arc::new(ShardedService::new(partition_map, acceptors, learners));
-    let routing_handle = service.routing_handle();
+
 
     let metashard_state = MetashardState::single(shard_old);
     let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
@@ -521,8 +521,6 @@ async fn sharded_sim_linearizability_across_reconfig() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle,
-        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;

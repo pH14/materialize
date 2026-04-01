@@ -12,7 +12,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
 use mz_persist::generated::consensus_service::{
@@ -111,29 +110,47 @@ async fn spawn_shard(
     (acceptor_handle, learner_handle)
 }
 
-/// Spawn a metashard actor backed by an in-process factory. Returns the
-/// handle and a join-handle for the background task.
-async fn spawn_metashard(
+/// Spawn a metashard actor and routing task. The routing task subscribes to
+/// the metashard persist shard and updates the given ShardedService's routing.
+///
+/// Returns the metashard handle for triggering reconfigurations.
+async fn spawn_metashard_with_routing(
     client: &PersistClient,
     partition_map: PartitionMap,
-    routing_handle: Arc<RwLock<crate::sharded_service::RoutingState<PersistAcceptorHandle, PersistLearnerHandle>>>,
-) -> (crate::persist_log::metashard::PersistMetashardHandle, mz_ore::task::JoinHandle<()>) {
+    service: &ShardedService<PersistAcceptorHandle, PersistLearnerHandle>,
+) -> crate::persist_log::metashard::PersistMetashardHandle {
+    let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
+    let metashard_shard_id = ShardId::new();
     let metashard_state = MetashardState {
         epoch: partition_map.epoch,
         partition_map,
         log_shards: BTreeMap::new(),
         pending_intent: None,
     };
-    PersistMetashardActor::spawn(
+    let (_metashard_actor, metashard_handle) = PersistMetashardActor::new(
         metashard_state,
         256,
         client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        routing_handle,
-        Arc::new(tokio::sync::Notify::new()),
-        ShardId::new(),
+        std::sync::Arc::clone(&factory),
+        metashard_shard_id,
     )
-    .await
+    .await;
+    mz_ore::task::spawn(|| "test-metashard", _metashard_actor.run());
+
+    // Spawn routing task so the ShardedService picks up partition map changes.
+    crate::sharded_service::spawn_routing_task(
+        client,
+        metashard_shard_id,
+        factory,
+        service.routing_handle(),
+        service.routing_notify(),
+    )
+    .await;
+
+    // Wait for the routing task to deliver the initial partition map.
+    service.wait_for_routing().await;
+
+    metashard_handle
 }
 
 /// Build a ShardedService with 2 log shards: [0x00, 0x80) and [0x80, 0x100).
@@ -371,31 +388,16 @@ async fn test_sharded_truncate() {
 async fn test_reconfiguration_split() {
     let client = new_persist_client_for_test().await;
 
-    // Start with a single log shard.
     let shard_1 = ShardId::new();
-    let (acceptor_1, learner_1) = spawn_shard(&client, shard_1).await;
-
     let partition_map = PartitionMap::single(shard_1);
 
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_1, acceptor_1);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_1, learner_1);
-
-    let service = ShardedService::new(partition_map, acceptors, learners);
-    let routing_handle = service.routing_handle();
-
-    let metashard_state = MetashardState::single(shard_1);
-    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
-        metashard_state,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        routing_handle,
-        Arc::new(tokio::sync::Notify::new()),
-        ShardId::new(),
-    )
-    .await;
+    // Start with empty routing — the routing task will populate it from the metashard.
+    let service = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
     // --- Pre-reconfiguration: write data on the single shard ---
     let key_lo = "s10000000-0000-0000-0000-000000000000"; // partition key 0x10
@@ -523,7 +525,7 @@ async fn test_reconfiguration_state_carryforward() {
     learners.insert(shard_old, learner_old);
 
     let service = ShardedService::new(partition_map, acceptors, learners);
-    let routing_handle = service.routing_handle();
+
 
     let metashard_state = MetashardState::single(shard_old);
     let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
@@ -531,8 +533,6 @@ async fn test_reconfiguration_state_carryforward() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle,
-        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -626,7 +626,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
     learners.insert(shard_1, learner);
 
     let service = ShardedService::new(partition_map, acceptors, learners);
-    let routing_handle = service.routing_handle();
+
 
     let metashard_state = MetashardState::single(shard_1);
     let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
@@ -634,8 +634,6 @@ async fn test_multi_shard_workload_with_reconfiguration() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle,
-        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -866,7 +864,7 @@ async fn test_shard_ownership_invariant_after_split() {
     learners.insert(shard_old, learner);
 
     let service = ShardedService::new(partition_map, acceptors, learners);
-    let routing_handle = service.routing_handle();
+
 
     let metashard_state = MetashardState::single(shard_old);
     let (metashard_handle, _) = PersistMetashardActor::spawn(
@@ -874,8 +872,6 @@ async fn test_shard_ownership_invariant_after_split() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle,
-        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -1016,9 +1012,9 @@ async fn test_reconfiguration_merge() {
     learners.insert(shard_b, lrn_b);
 
     let service = ShardedService::new(partition_map.clone(), acceptors, learners);
-    let routing_handle = service.routing_handle();
 
-    let (metashard_handle, _) = spawn_metashard(&client, partition_map, routing_handle).await;
+
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
     // Write data to both shards.
     let key_lo = "s20000000-0000-0000-0000-000000000000"; // 0x20 → shard_a
@@ -1096,7 +1092,7 @@ async fn test_no_silent_loss_during_reconfiguration() {
     learners.insert(shard_old, lrn);
 
     let service = std::sync::Arc::new(ShardedService::new(partition_map, acceptors, learners));
-    let routing_handle = service.routing_handle();
+
 
     let metashard_state = MetashardState::single(shard_old);
     let (metashard_handle, _) = PersistMetashardActor::spawn(
@@ -1104,8 +1100,6 @@ async fn test_no_silent_loss_during_reconfiguration() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle,
-        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -1246,7 +1240,7 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     learners.insert(shard_old, lrn);
 
     let service1 = ShardedService::new(partition_map, acceptors, learners);
-    let routing_handle1 = service1.routing_handle();
+
 
     let metashard_state1 = MetashardState::single(shard_old);
     let (actor1, handle1) = PersistMetashardActor::new(
@@ -1254,8 +1248,6 @@ async fn test_restart_after_reconfiguration_preserves_state() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle1,
-        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1308,7 +1300,7 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     learners2.insert(bootstrap_shard, lrn2);
 
     let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
-    let routing_handle2 = service2.routing_handle();
+
 
     let metashard_state2 = MetashardState::single(bootstrap_shard);
     let (actor2, _handle2) = PersistMetashardActor::new(
@@ -1316,8 +1308,6 @@ async fn test_restart_after_reconfiguration_preserves_state() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle2,
-        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1383,7 +1373,7 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     learners.insert(shard_b, lrn_b);
 
     let service1 = ShardedService::new(partition_map.clone(), acceptors, learners);
-    let routing_handle1 = service1.routing_handle();
+
 
     let metashard_state1 = MetashardState {
         epoch: 0,
@@ -1396,8 +1386,6 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle1,
-        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1455,7 +1443,7 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     learners2.insert(bootstrap_shard, lrn2);
 
     let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
-    let routing_handle2 = service2.routing_handle();
+
 
     let metashard_state2 = MetashardState::single(bootstrap_shard);
     let (actor2, _handle2) = PersistMetashardActor::new(
@@ -1463,8 +1451,6 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle2,
-        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1519,7 +1505,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
     learners.insert(shard_old, lrn_old);
 
     let service1 = ShardedService::new(partition_map.clone(), acceptors, learners);
-    let routing_handle1 = service1.routing_handle();
+
 
     let metashard_state1 = MetashardState::single(shard_old);
     let (actor1, handle1) = PersistMetashardActor::new(
@@ -1527,8 +1513,6 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle1,
-        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1600,7 +1584,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
     learners2.insert(bootstrap_shard, lrn_boot);
 
     let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
-    let routing_handle2 = service2.routing_handle();
+
 
     // Create a new metashard actor with the same durable shard ID. The actor's
     // constructor reads the durable state and discovers the pending intent.
@@ -1610,8 +1594,6 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle2,
-        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1693,7 +1675,7 @@ async fn test_concurrent_linearizability_during_reconfig() {
         acceptors,
         learners,
     ));
-    let routing_handle = service.routing_handle();
+
 
     let metashard_state = MetashardState::single(shard_old);
     let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
@@ -1701,8 +1683,6 @@ async fn test_concurrent_linearizability_during_reconfig() {
         256,
         client.clone(),
         InProcessActorFactory::new(client.clone()),
-        routing_handle,
-        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -1935,7 +1915,7 @@ async fn test_buggify_reconfiguration_recovery() {
         learners.insert(shard_old, lrn);
 
         let service = ShardedService::new(partition_map, acceptors, learners);
-        let routing_handle = service.routing_handle();
+    
 
         let metashard_state = MetashardState::single(shard_old);
         let (metashard_handle, _task) = PersistMetashardActor::spawn(
@@ -1943,8 +1923,6 @@ async fn test_buggify_reconfiguration_recovery() {
             256,
             client.clone(),
             InProcessActorFactory::new(client.clone()),
-            routing_handle,
-            Arc::new(tokio::sync::Notify::new()),
             ShardId::new(),
         )
         .await;
@@ -2063,7 +2041,7 @@ async fn test_buggify_post_commit_injection_points() {
         learners.insert(shard_old, lrn);
 
         let service = ShardedService::new(partition_map, acceptors, learners);
-        let routing_handle = service.routing_handle();
+    
 
         let metashard_state = MetashardState::single(shard_old);
         let (metashard_handle, _task) = PersistMetashardActor::spawn(
@@ -2071,8 +2049,6 @@ async fn test_buggify_post_commit_injection_points() {
             256,
             client.clone(),
             InProcessActorFactory::new(client.clone()),
-            routing_handle,
-            Arc::new(tokio::sync::Notify::new()),
             ShardId::new(),
         )
         .await;
@@ -2164,7 +2140,6 @@ async fn test_get_retractions_filtering() {
     learners.insert(shard_old, learner.clone());
 
     let service = ShardedService::new(partition_map, acceptors, learners);
-    let _routing = service.routing_handle();
 
     let key = "s20000000-0000-0000-0000-000000000000";
 
