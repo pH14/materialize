@@ -149,10 +149,9 @@ async fn spawn_metashard_with_routing_and_shard_id(
     mz_ore::task::spawn(|| "test-metashard", _metashard_actor.run());
 
     // Spawn routing task so the ShardedService picks up partition map changes.
-    let directory = crate::directory::InProcessDirectory::new(metashard_shard_id);
     crate::sharded_service::spawn_routing_task(
         client,
-        &directory,
+        metashard_shard_id,
         factory,
         service.routing_handle(),
         service.routing_notify(),

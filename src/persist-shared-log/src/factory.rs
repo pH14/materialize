@@ -24,9 +24,11 @@ use timely::progress::Antichain;
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist_client::{PersistClient, ShardId};
 
+use crate::directory::ServiceDirectory;
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::rpc::{GrpcAcceptorHandle, GrpcLearnerHandle};
 use crate::sharded_service::ShardedRetractionSource;
 use crate::{Acceptor, AcceptorConfig, Learner, RangeAssignment};
 
@@ -180,6 +182,73 @@ impl ActorFactory for InProcessActorFactory {
         self.learners.lock().unwrap().insert(shard_id, handle.clone());
         // Wire retractions if the acceptor was already created.
         self.maybe_wire_retractions(shard_id).await;
+        Ok(handle)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GrpcActorFactory
+// ---------------------------------------------------------------------------
+
+/// Factory that connects to remote acceptor and learner processes via gRPC.
+///
+/// Used by the standalone router (ShardedService) to create handles to actors
+/// running in separate processes. The `ServiceDirectory` resolves shard IDs to
+/// network addresses; this factory connects to those addresses with retry.
+///
+/// Handles are cached: repeated calls for the same shard return a clone of the
+/// existing connection rather than opening a new one.
+pub struct GrpcActorFactory<D: ServiceDirectory<Addr = String>> {
+    directory: D,
+    connect_timeout: std::time::Duration,
+    acceptors: Mutex<BTreeMap<ShardId, GrpcAcceptorHandle>>,
+    learners: Mutex<BTreeMap<ShardId, GrpcLearnerHandle>>,
+}
+
+impl<D: ServiceDirectory<Addr = String>> GrpcActorFactory<D> {
+    pub fn new(directory: D, connect_timeout: std::time::Duration) -> Self {
+        GrpcActorFactory {
+            directory,
+            connect_timeout,
+            acceptors: Mutex::new(BTreeMap::new()),
+            learners: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<D: ServiceDirectory<Addr = String>> ActorFactory for GrpcActorFactory<D> {
+    type A = GrpcAcceptorHandle;
+    type L = GrpcLearnerHandle;
+
+    async fn create_acceptor(
+        &self,
+        shard_id: ShardId,
+        _epoch: u64,
+        _predecessors: Vec<(ShardId, Antichain<u64>)>,
+        _range: RangeAssignment,
+    ) -> Result<GrpcAcceptorHandle, String> {
+        if let Some(handle) = self.acceptors.lock().unwrap().get(&shard_id) {
+            return Ok(handle.clone());
+        }
+
+        let addr = self.directory.acceptor_addr(shard_id);
+        let handle = GrpcAcceptorHandle::connect_with_retry(addr, self.connect_timeout).await?;
+        self.acceptors.lock().unwrap().insert(shard_id, handle.clone());
+        Ok(handle)
+    }
+
+    async fn create_learner(&self, shard_id: ShardId) -> Result<GrpcLearnerHandle, String> {
+        if let Some(handle) = self.learners.lock().unwrap().get(&shard_id) {
+            return Ok(handle.clone());
+        }
+
+        let addrs = self.directory.learner_addrs(shard_id);
+        let addr = addrs.into_iter().next().ok_or_else(|| {
+            format!("no learner address for shard {shard_id}")
+        })?;
+        let handle = GrpcLearnerHandle::connect_with_retry(addr, self.connect_timeout).await?;
+        self.learners.lock().unwrap().insert(shard_id, handle.clone());
         Ok(handle)
     }
 }

@@ -68,6 +68,19 @@ enum Commands {
     /// Connects to the acceptor's persist pubsub server so that Subscribe
     /// gets instant notifications instead of polling consensus.
     Learner(LearnerArgs),
+
+    /// Run a standalone metashard.
+    ///
+    /// Manages the partition map and persists reconfiguration state. Hosts a
+    /// persist pubsub server so that routing tasks get instant partition map
+    /// update notifications.
+    Metashard(MetashardArgs),
+
+    /// Run a standalone router (ShardedService).
+    ///
+    /// Routes client requests to remote acceptors and learners via gRPC.
+    /// Subscribes to the metashard persist shard for partition map updates.
+    Router(RouterArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +304,82 @@ struct LearnerArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Standalone metashard mode
+// ---------------------------------------------------------------------------
+
+/// Arguments for standalone metashard mode.
+#[derive(clap::Args, Debug)]
+struct MetashardArgs {
+    /// Address to listen on for the persist pubsub server.
+    ///
+    /// Routing tasks in router processes connect here to receive instant
+    /// partition map update notifications.
+    #[arg(long, default_value = "0.0.0.0:6920")]
+    pubsub_listen_addr: SocketAddr,
+
+    /// Address to listen on for the HTTP metrics endpoint.
+    #[arg(long, default_value = "0.0.0.0:6921")]
+    metrics_listen_addr: SocketAddr,
+
+    #[command(flatten)]
+    storage: StorageArgs,
+
+    /// Shard ID for the metashard persist shard (durable state).
+    #[arg(long, env = "METASHARD_ID")]
+    metashard_id: String,
+
+    /// Shard ID for the initial log shard. If omitted, a new shard is created.
+    #[arg(long, env = "PERSIST_SHARD_ID")]
+    shard_id: Option<String>,
+
+    /// Number of log shards in the initial partition map.
+    #[arg(long, default_value = "1")]
+    num_log_shards: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Standalone router mode
+// ---------------------------------------------------------------------------
+
+/// Arguments for standalone router (ShardedService) mode.
+#[derive(clap::Args, Debug)]
+struct RouterArgs {
+    /// Address to listen on for the PersistSharedLog gRPC service.
+    #[arg(long, default_value = "0.0.0.0:6890")]
+    listen_addr: SocketAddr,
+
+    /// Address to listen on for the HTTP metrics endpoint.
+    #[arg(long, default_value = "0.0.0.0:6891")]
+    metrics_listen_addr: SocketAddr,
+
+    #[command(flatten)]
+    storage: StorageArgs,
+
+    /// Shard ID of the metashard persist shard. The routing task subscribes to
+    /// this shard for partition map updates.
+    #[arg(long, env = "METASHARD_ID")]
+    metashard_id: String,
+
+    /// URL of the metashard's persist pubsub server (e.g. http://metashard:6920).
+    ///
+    /// The routing task connects to this pubsub server so that partition map
+    /// changes are received instantly instead of polling consensus.
+    #[arg(long, env = "METASHARD_PUBSUB_URL")]
+    metashard_pubsub_url: String,
+
+    /// Base directory for resolving actor addresses.
+    ///
+    /// Acceptor and learner socket paths are derived from shard IDs under this
+    /// directory (e.g. `<run-dir>/acceptor-<shard>/grpc.sock`).
+    #[arg(long, env = "RUN_DIR")]
+    run_dir: std::path::PathBuf,
+
+    /// Timeout for connecting to remote acceptors and learners.
+    #[arg(long, default_value = "30")]
+    connect_timeout_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -313,6 +402,8 @@ fn main() {
         Commands::Monolith(args) => rt.block_on(run_monolith(args)),
         Commands::Acceptor(args) => rt.block_on(run_acceptor(args)),
         Commands::Learner(args) => rt.block_on(run_learner(args)),
+        Commands::Metashard(args) => rt.block_on(run_metashard(args)),
+        Commands::Router(args) => rt.block_on(run_router(args)),
     }
 }
 
@@ -411,8 +502,6 @@ async fn run_monolith(args: MonolithArgs) {
     };
 
     let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
-    let directory =
-        mz_persist_shared_log::directory::InProcessDirectory::new(metashard_shard_id);
 
     let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
         bootstrap_state,
@@ -454,7 +543,7 @@ async fn run_monolith(args: MonolithArgs) {
     );
     mz_persist_shared_log::sharded_service::spawn_routing_task(
         &persist_client,
-        &directory,
+        metashard_shard_id,
         Arc::clone(&factory),
         service.routing_handle(),
         service.routing_notify(),
@@ -573,4 +662,143 @@ async fn run_learner(args: LearnerArgs) {
         .serve(args.listen_addr)
         .await
         .expect("learner gRPC server failed");
+}
+
+// ===========================================================================
+// Standalone metashard mode
+// ===========================================================================
+
+async fn run_metashard(args: MetashardArgs) {
+    let metrics_registry = MetricsRegistry::new();
+    spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
+
+    let metashard_shard_id: ShardId = args.metashard_id.parse().expect("invalid --metashard-id");
+    info!(%metashard_shard_id, "starting standalone metashard");
+
+    // Create PersistClient hosting pubsub — routing tasks in router processes
+    // connect to this pubsub server for instant partition map notifications.
+    let (persist_client, pubsub_server) =
+        open_persist_client_hosting_pubsub(&args.storage, &metrics_registry).await;
+
+    // Spawn the pubsub server for remote routing tasks.
+    let pubsub_addr = args.pubsub_listen_addr;
+    mz_ore::task::spawn(|| "metashard-pubsub-server", async move {
+        info!(addr = %pubsub_addr, "starting metashard pubsub server");
+        if let Err(e) = pubsub_server.serve(pubsub_addr).await {
+            error!("metashard pubsub server exited: {e}");
+        }
+    });
+
+    // Build bootstrap partition map.
+    let num_shards = args.num_log_shards;
+    let mut bootstrap_shard_ids: Vec<ShardId> = Vec::with_capacity(num_shards);
+    if let Some(id) = &args.shard_id {
+        bootstrap_shard_ids.push(id.parse().expect("invalid --shard-id"));
+    }
+    while bootstrap_shard_ids.len() < num_shards {
+        bootstrap_shard_ids.push(ShardId::new());
+    }
+    let bootstrap_map = build_partition_map(&bootstrap_shard_ids);
+    let bootstrap_state = if num_shards == 1 {
+        MetashardState::single(bootstrap_shard_ids[0])
+    } else {
+        MetashardState {
+            epoch: 0,
+            partition_map: bootstrap_map,
+            log_shards: BTreeMap::new(),
+            pending_intent: None,
+        }
+    };
+
+    // The metashard doesn't create actors — it just manages the partition map.
+    // We still need a factory for the metashard actor constructor, but it won't
+    // be used to spawn actors in standalone mode.
+    let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
+
+    let (metashard_actor, _metashard_handle) = PersistMetashardActor::new(
+        bootstrap_state,
+        256,
+        persist_client,
+        Arc::clone(&factory),
+        metashard_shard_id,
+    )
+    .await;
+
+    let partition_map = metashard_actor.state().partition_map.clone();
+    let epoch = metashard_actor.state().epoch;
+    info!(
+        epoch,
+        num_ranges = partition_map.ranges.len(),
+        "active partition map: {:?}",
+        partition_map
+            .ranges
+            .iter()
+            .map(|r| format!(
+                "[0x{:02x}, 0x{:03x}) -> {}",
+                r.lo, r.hi_exclusive, r.log_shard
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    // Run the metashard actor forever.
+    metashard_actor.run().await;
+}
+
+// ===========================================================================
+// Standalone router mode
+// ===========================================================================
+
+async fn run_router(args: RouterArgs) {
+    let metrics_registry = MetricsRegistry::new();
+    spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
+
+    let metashard_shard_id: ShardId = args.metashard_id.parse().expect("invalid --metashard-id");
+    info!(
+        %metashard_shard_id,
+        metashard_pubsub = %args.metashard_pubsub_url,
+        "starting standalone router"
+    );
+
+    // Create PersistClient with remote pubsub to the metashard, so the routing
+    // task gets instant partition map notifications.
+    let persist_client = open_persist_client_with_remote_pubsub(
+        &args.storage,
+        &args.metashard_pubsub_url,
+        "router",
+        &metrics_registry,
+    )
+    .await;
+
+    // GrpcActorFactory connects to remote acceptors/learners via the directory.
+    let directory = mz_persist_shared_log::directory::ProcessDirectory::new(
+        args.run_dir,
+        metashard_shard_id,
+    );
+    let factory = Arc::new(mz_persist_shared_log::factory::GrpcActorFactory::new(
+        directory,
+        std::time::Duration::from_secs(args.connect_timeout_secs),
+    ));
+
+    // Start with empty routing — the routing task populates it from the
+    // metashard persist shard.
+    let service = ShardedService::from_routing(Arc::new(
+        tokio::sync::RwLock::new(
+            mz_persist_shared_log::sharded_service::RoutingSnapshot::empty(),
+        ),
+    ));
+    mz_persist_shared_log::sharded_service::spawn_routing_task(
+        &persist_client,
+        metashard_shard_id,
+        Arc::clone(&factory),
+        service.routing_handle(),
+        service.routing_notify(),
+    )
+    .await;
+
+    info!(addr = %args.listen_addr, "starting router gRPC server");
+    Server::builder()
+        .add_service(PersistSharedLogServer::new(service))
+        .serve(args.listen_addr)
+        .await
+        .expect("router gRPC server failed");
 }
