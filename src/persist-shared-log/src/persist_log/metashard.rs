@@ -702,15 +702,16 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         //
         // Snapshots for cold-start recovery (after old shard finalization) can
         // be written as a separate background step once the learner is caught up.
-        let mut new_acceptors = BTreeMap::new();
-        let mut new_learners = BTreeMap::new();
-
         // Phase 2: Spawn actors for new log shards BEFORE sealing.
         //
         // New learners subscribe to live (unsealed) predecessors and start
         // catching up in real-time. This pre-hydration means they're nearly
         // current by the time we seal, minimizing the unavailability window
         // to just the tail of writes between subscribe and seal.
+        //
+        // The factory caches handles internally. The ShardedService's routing
+        // task will pick up the new actors when it processes the updated
+        // partition map from the metashard persist shard.
         for &shard_id in &added {
             let new_range = new_map
                 .ranges
@@ -739,13 +740,13 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
                 })
                 .collect();
 
-            let acceptor_handle = self
+            let _ = self
                 .factory
                 .create_acceptor(shard_id, new_epoch, pred_specs, new_range.clone())
                 .await
                 .map_err(MetashardError::Command)?;
 
-            let learner_handle = self
+            let _ = self
                 .factory
                 .create_learner(shard_id)
                 .await
@@ -758,8 +759,6 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
                 num_predecessors = predecessors.len(),
                 "spawned acceptor + learner for new log shard"
             );
-            new_acceptors.insert(shard_id, acceptor_handle);
-            new_learners.insert(shard_id, learner_handle);
         }
 
         // BUGGIFY: crash after spawning new actors but before seal.
