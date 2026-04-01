@@ -119,8 +119,19 @@ async fn spawn_metashard_with_routing(
     partition_map: PartitionMap,
     service: &ShardedService<PersistAcceptorHandle, PersistLearnerHandle>,
 ) -> crate::persist_log::metashard::PersistMetashardHandle {
+    spawn_metashard_with_routing_and_shard_id(client, partition_map, service, ShardId::new()).await
+}
+
+/// Like `spawn_metashard_with_routing`, but uses a specific metashard shard ID.
+/// Used by restart/recovery tests that need the same durable metashard shard
+/// across process restarts.
+async fn spawn_metashard_with_routing_and_shard_id(
+    client: &PersistClient,
+    partition_map: PartitionMap,
+    service: &ShardedService<PersistAcceptorHandle, PersistLearnerHandle>,
+    metashard_shard_id: ShardId,
+) -> crate::persist_log::metashard::PersistMetashardHandle {
     let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-    let metashard_shard_id = ShardId::new();
     let metashard_state = MetashardState {
         epoch: partition_map.epoch,
         partition_map,
@@ -164,9 +175,6 @@ async fn build_two_shard_service(
     let shard_a = ShardId::new();
     let shard_b = ShardId::new();
 
-    let (acceptor_a, learner_a) = spawn_shard(client, shard_a).await;
-    let (acceptor_b, learner_b) = spawn_shard(client, shard_b).await;
-
     let partition_map = PartitionMap {
         epoch: 0,
         ranges: vec![
@@ -183,15 +191,12 @@ async fn build_two_shard_service(
         ],
     };
 
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_a, acceptor_a);
-    acceptors.insert(shard_b, acceptor_b);
-
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_a, learner_a);
-    learners.insert(shard_b, learner_b);
-
-    let service = ShardedService::new(partition_map, acceptors, learners);
+    let service = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let _metashard_handle = spawn_metashard_with_routing(client, partition_map, &service).await;
     (service, shard_a, shard_b)
 }
 
@@ -516,26 +521,14 @@ async fn test_reconfiguration_state_carryforward() {
 
     // Start with a single log shard covering the full range.
     let shard_old = ShardId::new();
-    let (acceptor_old, learner_old) = spawn_shard(&client, shard_old).await;
-
     let partition_map = PartitionMap::single(shard_old);
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_old, acceptor_old);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_old, learner_old);
 
-    let service = ShardedService::new(partition_map, acceptors, learners);
-
-
-    let metashard_state = MetashardState::single(shard_old);
-    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
-        metashard_state,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        ShardId::new(),
-    )
-    .await;
+    let service = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
     // --- Write data before reconfiguration ---
     let key = "s30000000-0000-0000-0000-000000000000"; // partition key 0x30
@@ -617,26 +610,14 @@ async fn test_multi_shard_workload_with_reconfiguration() {
     let client = new_persist_client_for_test().await;
 
     let shard_1 = ShardId::new();
-    let (acceptor, learner) = spawn_shard(&client, shard_1).await;
-
     let partition_map = PartitionMap::single(shard_1);
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_1, acceptor);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_1, learner);
 
-    let service = ShardedService::new(partition_map, acceptors, learners);
-
-
-    let metashard_state = MetashardState::single(shard_1);
-    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
-        metashard_state,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        ShardId::new(),
-    )
-    .await;
+    let service = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
     // Client shard keys spread across the partition key space.
     let keys = [
@@ -855,26 +836,14 @@ async fn test_shard_ownership_invariant_after_split() {
     let client = new_persist_client_for_test().await;
 
     let shard_old = ShardId::new();
-    let (acceptor, learner) = spawn_shard(&client, shard_old).await;
-
     let partition_map = PartitionMap::single(shard_old);
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_old, acceptor);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_old, learner);
 
-    let service = ShardedService::new(partition_map, acceptors, learners);
-
-
-    let metashard_state = MetashardState::single(shard_old);
-    let (metashard_handle, _) = PersistMetashardActor::spawn(
-        metashard_state,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        ShardId::new(),
-    )
-    .await;
+    let service = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
     // Write data across the full key range.
     let keys = [
@@ -985,8 +954,6 @@ async fn test_reconfiguration_merge() {
     // Start with 2 shards.
     let shard_a = ShardId::new();
     let shard_b = ShardId::new();
-    let (acc_a, lrn_a) = spawn_shard(&client, shard_a).await;
-    let (acc_b, lrn_b) = spawn_shard(&client, shard_b).await;
 
     let partition_map = PartitionMap {
         epoch: 0,
@@ -1004,16 +971,11 @@ async fn test_reconfiguration_merge() {
         ],
     };
 
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_a, acc_a);
-    acceptors.insert(shard_b, acc_b);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_a, lrn_a);
-    learners.insert(shard_b, lrn_b);
-
-    let service = ShardedService::new(partition_map.clone(), acceptors, learners);
-
-
+    let service = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
     let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
     // Write data to both shards.
@@ -1083,26 +1045,14 @@ async fn test_no_silent_loss_during_reconfiguration() {
     let client = new_persist_client_for_test().await;
 
     let shard_old = ShardId::new();
-    let (acc, lrn) = spawn_shard(&client, shard_old).await;
-
     let partition_map = PartitionMap::single(shard_old);
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_old, acc);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_old, lrn);
 
-    let service = std::sync::Arc::new(ShardedService::new(partition_map, acceptors, learners));
-
-
-    let metashard_state = MetashardState::single(shard_old);
-    let (metashard_handle, _) = PersistMetashardActor::spawn(
-        metashard_state,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        ShardId::new(),
-    )
-    .await;
+    let service = std::sync::Arc::new(ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    ));
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
     // Use a key that will stay in [0x00, 0x80) after the split.
     let key = "s20000000-0000-0000-0000-000000000000";
@@ -1232,26 +1182,15 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     let shard_old = ShardId::new();
     let metashard_shard = ShardId::new(); // durable metashard
 
-    let (acc, lrn) = spawn_shard(&client, shard_old).await;
     let partition_map = PartitionMap::single(shard_old);
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_old, acc);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_old, lrn);
-
-    let service1 = ShardedService::new(partition_map, acceptors, learners);
-
-
-    let metashard_state1 = MetashardState::single(shard_old);
-    let (actor1, handle1) = PersistMetashardActor::new(
-        metashard_state1,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        metashard_shard,
-    )
-    .await;
-    let _task1 = mz_ore::task::spawn(|| "metashard-1", actor1.run());
+    let service1 = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let handle1 = spawn_metashard_with_routing_and_shard_id(
+        &client, partition_map, &service1, metashard_shard,
+    ).await;
 
     // Write data that will need to survive reconfiguration + restart.
     let key = "s30000000-0000-0000-0000-000000000000";
@@ -1283,40 +1222,20 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     // --- Phase 2: simulate restart ---
     // Drop the old service (simulates process death).
     drop(handle1);
-    drop(_task1);
     drop(service1);
 
-    // Build a fresh service from "bootstrap" args (epoch 0, stale topology).
-    // This simulates what main.rs does on a fresh start.
-
-
-    // Bootstrap with a dummy shard — the recovery should override this.
-    let bootstrap_shard = ShardId::new();
-    let (acc2, lrn2) = spawn_shard(&client, bootstrap_shard).await;
-    let bootstrap_map = PartitionMap::single(bootstrap_shard);
-    let mut acceptors2 = BTreeMap::new();
-    acceptors2.insert(bootstrap_shard, acc2);
-    let mut learners2 = BTreeMap::new();
-    learners2.insert(bootstrap_shard, lrn2);
-
-    let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
-
-
-    let metashard_state2 = MetashardState::single(bootstrap_shard);
-    let (actor2, _handle2) = PersistMetashardActor::new(
-        metashard_state2,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        metashard_shard,
-    )
-    .await;
-    // Recover from the durable metashard shard — this should restore the
-    // committed partition map and rebuild routing with predecessors.
-    let _task2 = mz_ore::task::spawn(|| "metashard-2", actor2.run());
-
-    // Give the recovery path time to rebuild routing and replay predecessors.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Build a fresh service from "bootstrap" args (empty routing).
+    // The routing task will recover state from the durable metashard shard.
+    let service2 = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    // Use the same metashard_shard so recovery reads the durable state.
+    let bootstrap_map = PartitionMap::single(ShardId::new());
+    let _handle2 = spawn_metashard_with_routing_and_shard_id(
+        &client, bootstrap_map, &service2, metashard_shard,
+    ).await;
 
     // --- Phase 3: verify carried-forward state survived restart ---
     let resp = service2
@@ -1347,9 +1266,6 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     let shard_b = ShardId::new();
     let metashard_shard = ShardId::new();
 
-    let (acc_a, lrn_a) = spawn_shard(&client, shard_a).await;
-    let (acc_b, lrn_b) = spawn_shard(&client, shard_b).await;
-
     let partition_map = PartitionMap {
         epoch: 0,
         ranges: vec![
@@ -1365,31 +1281,15 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
             },
         ],
     };
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_a, acc_a);
-    acceptors.insert(shard_b, acc_b);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_a, lrn_a);
-    learners.insert(shard_b, lrn_b);
 
-    let service1 = ShardedService::new(partition_map.clone(), acceptors, learners);
-
-
-    let metashard_state1 = MetashardState {
-        epoch: 0,
-        partition_map,
-        log_shards: BTreeMap::new(),
-        pending_intent: None,
-    };
-    let (actor1, handle1) = PersistMetashardActor::new(
-        metashard_state1,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        metashard_shard,
-    )
-    .await;
-    let _task1 = mz_ore::task::spawn(|| "metashard-merge-1", actor1.run());
+    let service1 = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let handle1 = spawn_metashard_with_routing_and_shard_id(
+        &client, partition_map, &service1, metashard_shard,
+    ).await;
 
     // Write to shard_a and shard_b.
     let key_lo = "s20000000-0000-0000-0000-000000000000"; // 0x20 → shard_a
@@ -1430,33 +1330,18 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
 
     // --- Phase 2: simulate restart ---
     drop(handle1);
-    drop(_task1);
     drop(service1);
 
-
-    let bootstrap_shard = ShardId::new();
-    let (acc2, lrn2) = spawn_shard(&client, bootstrap_shard).await;
-    let bootstrap_map = PartitionMap::single(bootstrap_shard);
-    let mut acceptors2 = BTreeMap::new();
-    acceptors2.insert(bootstrap_shard, acc2);
-    let mut learners2 = BTreeMap::new();
-    learners2.insert(bootstrap_shard, lrn2);
-
-    let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
-
-
-    let metashard_state2 = MetashardState::single(bootstrap_shard);
-    let (actor2, _handle2) = PersistMetashardActor::new(
-        metashard_state2,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        metashard_shard,
-    )
-    .await;
-    let _task2 = mz_ore::task::spawn(|| "metashard-merge-2", actor2.run());
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let service2 = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    // Use the same metashard_shard so recovery reads the durable state.
+    let bootstrap_map = PartitionMap::single(ShardId::new());
+    let _handle2 = spawn_metashard_with_routing_and_shard_id(
+        &client, bootstrap_map, &service2, metashard_shard,
+    ).await;
 
     // --- Phase 3: verify BOTH predecessors' state survived ---
     let resp = service2
@@ -1496,27 +1381,16 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
 
     // --- Phase 1: write data on a single shard, then start reconfiguration and crash ---
     let shard_old = ShardId::new();
-    let (acc_old, lrn_old) = spawn_shard(&client, shard_old).await;
-
     let partition_map = PartitionMap::single(shard_old);
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_old, acc_old);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_old, lrn_old);
 
-    let service1 = ShardedService::new(partition_map.clone(), acceptors, learners);
-
-
-    let metashard_state1 = MetashardState::single(shard_old);
-    let (actor1, handle1) = PersistMetashardActor::new(
-        metashard_state1,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        metashard_shard,
-    )
-    .await;
-    let task1 = mz_ore::task::spawn(|| "metashard-crash-1", actor1.run());
+    let service1 = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let handle1 = spawn_metashard_with_routing_and_shard_id(
+        &client, partition_map, &service1, metashard_shard,
+    ).await;
 
     // Write data that must survive the crash+recovery.
     let key = "s30000000-0000-0000-0000-000000000000"; // partition key 0x30
@@ -1564,43 +1438,23 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
 
     fault::clear();
 
-    // Crash: drop all handles and abort the actor task.
+    // Crash: drop all handles (simulates process death).
     drop(handle1);
-    task1.abort_and_wait().await;
     drop(service1);
 
     // --- Phase 2: restart with a fresh metashard actor using the same durable shard ---
 
-
-    // Bootstrap with a dummy single shard (the recovery will overwrite this
-    // from the durable partition map + pending intent).
-    let bootstrap_shard = ShardId::new();
-    let (acc_boot, lrn_boot) = spawn_shard(&client, bootstrap_shard).await;
-
-    let bootstrap_map = PartitionMap::single(bootstrap_shard);
-    let mut acceptors2 = BTreeMap::new();
-    acceptors2.insert(bootstrap_shard, acc_boot);
-    let mut learners2 = BTreeMap::new();
-    learners2.insert(bootstrap_shard, lrn_boot);
-
-    let service2 = ShardedService::new(bootstrap_map, acceptors2, learners2);
-
-
-    // Create a new metashard actor with the same durable shard ID. The actor's
-    // constructor reads the durable state and discovers the pending intent.
-    let metashard_state2 = MetashardState::single(bootstrap_shard);
-    let (actor2, handle2) = PersistMetashardActor::new(
-        metashard_state2,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        metashard_shard,
-    )
-    .await;
-
-    // Start the actor — its run() method will detect the pending intent and
-    // resume the reconfiguration automatically.
-    let _task2 = mz_ore::task::spawn(|| "metashard-crash-2", actor2.run());
+    let service2 = ShardedService::new(
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    // Use the same metashard_shard so recovery reads the durable state
+    // (including the pending intent).
+    let bootstrap_map = PartitionMap::single(ShardId::new());
+    let handle2 = spawn_metashard_with_routing_and_shard_id(
+        &client, bootstrap_map, &service2, metashard_shard,
+    ).await;
 
     // Wait for recovery to complete (intent detection + do_reconfigure).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1662,30 +1516,14 @@ async fn test_concurrent_linearizability_during_reconfig() {
 
     // Start with a single log shard.
     let shard_old = ShardId::new();
-    let (acc_old, lrn_old) = spawn_shard(&client, shard_old).await;
-
     let partition_map = PartitionMap::single(shard_old);
-    let mut acceptors = BTreeMap::new();
-    acceptors.insert(shard_old, acc_old);
-    let mut learners = BTreeMap::new();
-    learners.insert(shard_old, lrn_old);
 
     let service = Arc::new(ShardedService::new(
-        partition_map.clone(),
-        acceptors,
-        learners,
+        PartitionMap { epoch: 0, ranges: vec![] },
+        BTreeMap::new(),
+        BTreeMap::new(),
     ));
-
-
-    let metashard_state = MetashardState::single(shard_old);
-    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
-        metashard_state,
-        256,
-        client.clone(),
-        InProcessActorFactory::new(client.clone()),
-        ShardId::new(),
-    )
-    .await;
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
     // Shared state for tracking committed seqnos per client shard.
     let committed_seqnos: Arc<[AtomicU64; 4]> = Arc::new([
@@ -1906,26 +1744,14 @@ async fn test_buggify_reconfiguration_recovery() {
         fault::clear();
 
         let shard_old = ShardId::new();
-        let (acc, lrn) = spawn_shard(&client, shard_old).await;
-
         let partition_map = PartitionMap::single(shard_old);
-        let mut acceptors = BTreeMap::new();
-        acceptors.insert(shard_old, acc);
-        let mut learners = BTreeMap::new();
-        learners.insert(shard_old, lrn);
 
-        let service = ShardedService::new(partition_map, acceptors, learners);
-    
-
-        let metashard_state = MetashardState::single(shard_old);
-        let (metashard_handle, _task) = PersistMetashardActor::spawn(
-            metashard_state,
-            256,
-            client.clone(),
-            InProcessActorFactory::new(client.clone()),
-            ShardId::new(),
-        )
-        .await;
+        let service = ShardedService::new(
+            PartitionMap { epoch: 0, ranges: vec![] },
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
         // Write data before reconfiguration.
         let key = "s30000000-0000-0000-0000-000000000000";
@@ -2032,26 +1858,14 @@ async fn test_buggify_post_commit_injection_points() {
         fault::clear();
 
         let shard_old = ShardId::new();
-        let (acc, lrn) = spawn_shard(&client, shard_old).await;
-
         let partition_map = PartitionMap::single(shard_old);
-        let mut acceptors = BTreeMap::new();
-        acceptors.insert(shard_old, acc);
-        let mut learners = BTreeMap::new();
-        learners.insert(shard_old, lrn);
 
-        let service = ShardedService::new(partition_map, acceptors, learners);
-    
-
-        let metashard_state = MetashardState::single(shard_old);
-        let (metashard_handle, _task) = PersistMetashardActor::spawn(
-            metashard_state,
-            256,
-            client.clone(),
-            InProcessActorFactory::new(client.clone()),
-            ShardId::new(),
-        )
-        .await;
+        let service = ShardedService::new(
+            PartitionMap { epoch: 0, ranges: vec![] },
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
 
         let key = "s30000000-0000-0000-0000-000000000000";
         let resp = service

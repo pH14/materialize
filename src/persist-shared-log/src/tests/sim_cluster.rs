@@ -47,12 +47,10 @@ use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::rpc::PubSubClientConnection;
 use mz_persist_client::{PersistClient, PersistLocation, ShardId};
-use crate::persist_log::acceptor::PersistAcceptor;
-use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig};
 use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
 use crate::sharded_service::ShardedService;
 use crate::factory::InProcessActorFactory;
-use crate::{AcceptorConfig, PartitionMap, RangeAssignment, ReconfigurationPlan};
+use crate::{PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 /// Port for consensus and blob turmoil servers.
 const PERSIST_PORT: u16 = 7000;
@@ -79,30 +77,6 @@ async fn new_turmoil_persist_client() -> PersistClient {
         .open(location)
         .await
         .expect("open turmoil persist client")
-}
-
-/// Build a partition map that evenly divides [0x00, 0x100) across shards.
-fn build_partition_map(shard_ids: &[ShardId]) -> PartitionMap {
-    let n = shard_ids.len();
-    assert!(n > 0);
-    let range_size = 256 / n;
-    let mut ranges = Vec::with_capacity(n);
-    for (i, shard_id) in shard_ids.iter().enumerate() {
-        let lo = u8::try_from(i * range_size).expect("range start fits u8");
-        let hi_exclusive = if i == n - 1 {
-            0x100u16
-        } else {
-            u16::try_from((i + 1) * range_size).expect("range end fits u16")
-        };
-        ranges.push(RangeAssignment {
-            lo,
-            hi_exclusive,
-            log_shard: *shard_id,
-        });
-    }
-    let map = PartitionMap { epoch: 0, ranges };
-    map.validate().expect("generated partition map must be valid");
-    map
 }
 
 // ---------------------------------------------------------------------------
@@ -141,54 +115,32 @@ fn sim_cluster_smoke() {
         let shard_ids = shard_ids.clone();
         async move {
         let client = new_turmoil_persist_client().await;
-        let registry = MetricsRegistry::new();
 
-        let partition_map = build_partition_map(&shard_ids);
+        let service = ShardedService::new(
+            PartitionMap { epoch: 0, ranges: vec![] },
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
 
-        // Spawn acceptor + learner.
-        let acceptor_metrics =
-            crate::metrics::AcceptorMetrics::register(&registry);
-        let learner_metrics =
-            crate::metrics::LearnerMetrics::register(&registry);
-
-        let (acc_handle, _acc_task) = PersistAcceptor::spawn(
-            AcceptorConfig::default(),
-            &client,
-            shard_ids[0],
-            acceptor_metrics,
-            0,
-            Box::new(crate::NoOpRetractionSource),
-            vec![],
-            crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
-        )
-        .await;
-
-        let (lrn_handle, _lrn_task) = PersistLearner::spawn(
-            PersistLearnerConfig::default(),
-            &client,
-            shard_ids[0],
-            learner_metrics,
-        )
-        .await;
-
-        let mut acceptors = BTreeMap::new();
-        acceptors.insert(shard_ids[0], acc_handle);
-        let mut learners = BTreeMap::new();
-        learners.insert(shard_ids[0], lrn_handle);
-
-        let service = ShardedService::new(partition_map, acceptors, learners);
-
-
+        let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
         let metashard_state = MetashardState::single(shard_ids[0]);
-        let factory = InProcessActorFactory::new(client.clone());
         let (_ms_handle, _ms_task) = PersistMetashardActor::spawn(
             metashard_state,
             256,
-            client,
-            factory,
+            client.clone(),
+            std::sync::Arc::clone(&factory),
             ms_shard,
         )
         .await;
+
+        crate::sharded_service::spawn_routing_task(
+            &client,
+            ms_shard,
+            factory,
+            service.routing_handle(),
+            service.routing_notify(),
+        ).await;
+        service.wait_for_routing().await;
 
         // Run the service. In a real turmoil test, we'd serve RPC here.
         // For the smoke test, write and read directly through the service.
@@ -268,33 +220,23 @@ fn sim_cluster_crash_restart() {
             };
 
             let client = new_turmoil_persist_client().await;
-            let registry = MetricsRegistry::new();
-            let partition_map = build_partition_map(&shard_ids);
 
-            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
-            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+            let service = ShardedService::new(
+                PartitionMap { epoch: 0, ranges: vec![] },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
 
-            let (acc_handle, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
-                vec![],
-                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
-            ).await;
-
-            let (lrn_handle, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
-            ).await;
-
-            let mut acceptors = BTreeMap::new();
-            acceptors.insert(shard_ids[0], acc_handle);
-            let mut learners = BTreeMap::new();
-            learners.insert(shard_ids[0], lrn_handle);
-
-            let service = ShardedService::new(partition_map, acceptors, learners);
-
+            let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
+                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
+
+            crate::sharded_service::spawn_routing_task(
+                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+            ).await;
+            service.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
@@ -327,33 +269,23 @@ fn sim_cluster_crash_restart() {
             };
 
             let client = new_turmoil_persist_client().await;
-            let registry = MetricsRegistry::new();
-            let partition_map = build_partition_map(&shard_ids);
 
-            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
-            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+            let service = ShardedService::new(
+                PartitionMap { epoch: 0, ranges: vec![] },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
 
-            let (acc_handle, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
-                vec![],
-                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
-            ).await;
-
-            let (lrn_handle, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
-            ).await;
-
-            let mut acceptors = BTreeMap::new();
-            acceptors.insert(shard_ids[0], acc_handle);
-            let mut learners = BTreeMap::new();
-            learners.insert(shard_ids[0], lrn_handle);
-
-            let service = ShardedService::new(partition_map, acceptors, learners);
-
+            let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
+                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
+
+            crate::sharded_service::spawn_routing_task(
+                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+            ).await;
+            service.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
@@ -419,32 +351,23 @@ fn sim_cluster_persist_partition() {
             };
 
             let client = new_turmoil_persist_client().await;
-            let registry = MetricsRegistry::new();
-            let partition_map = build_partition_map(&shard_ids);
 
-            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
-            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+            let service = ShardedService::new(
+                PartitionMap { epoch: 0, ranges: vec![] },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
 
-            let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
-                vec![],
-                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
-            ).await;
-            let (lrn, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
-            ).await;
-
-            let mut acceptors = BTreeMap::new();
-            acceptors.insert(shard_ids[0], acc);
-            let mut learners = BTreeMap::new();
-            learners.insert(shard_ids[0], lrn);
-
-            let service = ShardedService::new(partition_map, acceptors, learners);
-
+            let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
+                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
+
+            crate::sharded_service::spawn_routing_task(
+                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+            ).await;
+            service.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
             let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
@@ -476,32 +399,23 @@ fn sim_cluster_persist_partition() {
             };
 
             let client = new_turmoil_persist_client().await;
-            let registry = MetricsRegistry::new();
-            let partition_map = build_partition_map(&shard_ids);
 
-            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
-            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+            let service = ShardedService::new(
+                PartitionMap { epoch: 0, ranges: vec![] },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
 
-            let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
-                vec![],
-                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
-            ).await;
-            let (lrn, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
-            ).await;
-
-            let mut acceptors = BTreeMap::new();
-            acceptors.insert(shard_ids[0], acc);
-            let mut learners = BTreeMap::new();
-            learners.insert(shard_ids[0], lrn);
-
-            let service = ShardedService::new(partition_map, acceptors, learners);
-
+            let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (_, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
+                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
+
+            crate::sharded_service::spawn_routing_task(
+                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+            ).await;
+            service.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
@@ -619,32 +533,23 @@ fn sim_cluster_split_with_writes() {
             };
 
             let client = new_turmoil_persist_client().await;
-            let registry = MetricsRegistry::new();
-            let partition_map = build_partition_map(&shard_ids);
 
-            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
-            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+            let service = ShardedService::new(
+                PartitionMap { epoch: 0, ranges: vec![] },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
 
-            let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
-                vec![],
-                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
-            ).await;
-            let (lrn, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
-            ).await;
-
-            let mut acceptors = BTreeMap::new();
-            acceptors.insert(shard_ids[0], acc);
-            let mut learners = BTreeMap::new();
-            learners.insert(shard_ids[0], lrn);
-
-            let service = ShardedService::new(partition_map, acceptors, learners);
-
+            let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
+                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
+
+            crate::sharded_service::spawn_routing_task(
+                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+            ).await;
+            service.wait_for_routing().await;
 
             let key_lo = "s10000000-0000-0000-0000-000000000000"; // 0x10 → [0x00, 0x80)
             let key_hi = "s90000000-0000-0000-0000-000000000000"; // 0x90 → [0x80, 0x100)
@@ -745,32 +650,23 @@ fn sim_cluster_reconfig_with_buggify() {
             };
 
             let client = new_turmoil_persist_client().await;
-            let registry = MetricsRegistry::new();
-            let partition_map = build_partition_map(&shard_ids);
 
-            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
-            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+            let service = ShardedService::new(
+                PartitionMap { epoch: 0, ranges: vec![] },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
 
-            let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
-                vec![],
-                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
-            ).await;
-            let (lrn, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
-            ).await;
-
-            let mut acceptors = BTreeMap::new();
-            acceptors.insert(shard_ids[0], acc);
-            let mut learners = BTreeMap::new();
-            learners.insert(shard_ids[0], lrn);
-
-            let service = ShardedService::new(partition_map, acceptors, learners);
-
+            let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
+                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
+
+            crate::sharded_service::spawn_routing_task(
+                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+            ).await;
+            service.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
@@ -855,32 +751,23 @@ fn sim_cluster_split_during_persist_partition() {
             };
 
             let client = new_turmoil_persist_client().await;
-            let registry = MetricsRegistry::new();
-            let partition_map = build_partition_map(&shard_ids);
 
-            let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
-            let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
+            let service = ShardedService::new(
+                PartitionMap { epoch: 0, ranges: vec![] },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
 
-            let (acc, _) = PersistAcceptor::spawn(
-                AcceptorConfig::default(), &client, shard_ids[0], acceptor_metrics, 0, Box::new(crate::NoOpRetractionSource),
-                vec![],
-                crate::RangeAssignment { lo: 0x00, hi_exclusive: 0x100, log_shard: shard_ids[0] },
-            ).await;
-            let (lrn, _) = PersistLearner::spawn(
-                PersistLearnerConfig::default(), &client, shard_ids[0], learner_metrics,
-            ).await;
-
-            let mut acceptors = BTreeMap::new();
-            acceptors.insert(shard_ids[0], acc);
-            let mut learners = BTreeMap::new();
-            learners.insert(shard_ids[0], lrn);
-
-            let service = ShardedService::new(partition_map, acceptors, learners);
-
+            let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetashardState::single(shard_ids[0]);
             let (ms_handle, _) = PersistMetashardActor::spawn(
-                metashard_state, 256, client.clone(), InProcessActorFactory::new(client), ms_shard,
+                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
+
+            crate::sharded_service::spawn_routing_task(
+                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+            ).await;
+            service.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 

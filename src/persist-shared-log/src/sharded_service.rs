@@ -178,7 +178,9 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
                     return;
                 }
             }
-            tokio::task::yield_now().await;
+            // Use sleep(1ms) instead of yield_now — turmoil needs time to
+            // advance for the routing task's subscribe to deliver events.
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
 
