@@ -133,9 +133,10 @@ fn sim_cluster_smoke() {
         )
         .await;
 
+        let directory = crate::directory::InProcessDirectory::new(ms_shard);
         crate::sharded_service::spawn_routing_task(
             &client,
-            ms_shard,
+            &directory,
             factory,
             service.routing_handle(),
             service.routing_notify(),
@@ -234,7 +235,7 @@ fn sim_cluster_crash_restart() {
             ).await;
 
             crate::sharded_service::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, &crate::directory::InProcessDirectory::new(ms_shard), factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
 
@@ -283,7 +284,7 @@ fn sim_cluster_crash_restart() {
             ).await;
 
             crate::sharded_service::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, &crate::directory::InProcessDirectory::new(ms_shard), factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
 
@@ -365,7 +366,7 @@ fn sim_cluster_persist_partition() {
             ).await;
 
             crate::sharded_service::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, &crate::directory::InProcessDirectory::new(ms_shard), factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
 
@@ -413,7 +414,7 @@ fn sim_cluster_persist_partition() {
             ).await;
 
             crate::sharded_service::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, &crate::directory::InProcessDirectory::new(ms_shard), factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
 
@@ -547,7 +548,7 @@ fn sim_cluster_split_with_writes() {
             ).await;
 
             crate::sharded_service::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, &crate::directory::InProcessDirectory::new(ms_shard), factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
 
@@ -664,7 +665,7 @@ fn sim_cluster_reconfig_with_buggify() {
             ).await;
 
             crate::sharded_service::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, &crate::directory::InProcessDirectory::new(ms_shard), factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
 
@@ -765,7 +766,7 @@ fn sim_cluster_split_during_persist_partition() {
             ).await;
 
             crate::sharded_service::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, &crate::directory::InProcessDirectory::new(ms_shard), factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
 

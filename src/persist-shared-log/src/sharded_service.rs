@@ -196,13 +196,14 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
 /// This decouples the ShardedService from the metashard actor — they communicate
 /// only through the persist shard. The task uses the `ActorFactory` to create
 /// handles for new shards (idempotent — returns cached handles if already created).
-pub async fn spawn_routing_task<F: ActorFactory>(
+pub async fn spawn_routing_task<F: ActorFactory, D: crate::directory::ServiceDirectory<Addr = ShardId>>(
     persist_client: &PersistClient,
-    metashard_shard_id: ShardId,
+    directory: &D,
     factory: F,
     routing: Arc<RwLock<RoutingSnapshot<F::A, F::L>>>,
     routing_notify: Arc<tokio::sync::Notify>,
 ) {
+    let metashard_shard_id = directory.metashard_addr();
     let key_schema = Arc::new(OrderedKeySchema);
     let val_schema = Arc::new(ProposalSchema);
 

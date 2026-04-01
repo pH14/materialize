@@ -197,6 +197,7 @@ async fn run(args: Args) {
     };
 
     let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
+    let directory = mz_persist_shared_log::directory::InProcessDirectory::new(metashard_shard_id);
 
     let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
         bootstrap_state,
@@ -224,14 +225,12 @@ async fn run(args: Args) {
     let _metashard_task = mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
 
     // --- Step 4: Build ShardedService ---
-    // The routing task subscribes to the metashard persist shard and uses the
-    // factory to create actor handles. The factory is idempotent — handles are
-    // cached, so actors created by the metashard during reconfiguration are
-    // reused by the ShardedService.
+    // The routing task subscribes to the metashard persist shard via the
+    // directory and uses the factory to create actor handles.
     let service = ShardedService::new(PartitionMap { epoch: 0, ranges: vec![] }, BTreeMap::new(), BTreeMap::new());
     mz_persist_shared_log::sharded_service::spawn_routing_task(
         &persist_client,
-        metashard_shard_id,
+        &directory,
         Arc::clone(&factory),
         service.routing_handle(),
         service.routing_notify(),
