@@ -292,8 +292,7 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
         self.acceptors.lock().unwrap().remove(&shard_id);
         self.learners.lock().unwrap().remove(&shard_id);
 
-        // Brief delay for processes to exit, then clean up files.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Clean up socket and PID files.
         for dir in [&acceptor_dir, &learner_dir, &pubsub_dir] {
             let _ = std::fs::remove_dir_all(dir);
         }
