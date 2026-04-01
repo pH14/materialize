@@ -527,7 +527,7 @@ async fn run_monolith(args: MonolithArgs) {
     let _metashard_task = mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
 
     // --- Step 4: Build Router ---
-    let service = Router::new(
+    let router = Router::new(
         PartitionMap {
             epoch: 0,
             ranges: vec![],
@@ -539,15 +539,15 @@ async fn run_monolith(args: MonolithArgs) {
         &persist_client,
         metashard_shard_id,
         Arc::clone(&factory),
-        service.routing_handle(),
-        service.routing_notify(),
+        router.routing_handle(),
+        router.routing_notify(),
     )
     .await;
-    let service = service.with_metashard(metashard_handle);
+    let router = router.with_metashard(metashard_handle);
 
     info!(addr = %args.listen_addr, "starting gRPC server");
     Server::builder()
-        .add_service(PersistSharedLogServer::new(service))
+        .add_service(PersistSharedLogServer::new(router))
         .serve(args.listen_addr)
         .await
         .expect("gRPC server failed");
@@ -822,7 +822,7 @@ async fn run_router(args: RouterArgs) {
 
     // Start with empty routing — the routing task populates it from the
     // metashard persist shard.
-    let service = Router::from_routing(Arc::new(
+    let router = Router::from_routing(Arc::new(
         tokio::sync::RwLock::new(
             mz_persist_shared_log::persist_log::router::RoutingSnapshot::empty(),
         ),
@@ -831,14 +831,14 @@ async fn run_router(args: RouterArgs) {
         &persist_client,
         metashard_shard_id,
         Arc::clone(&factory),
-        service.routing_handle(),
-        service.routing_notify(),
+        router.routing_handle(),
+        router.routing_notify(),
     )
     .await;
 
     info!(addr = %args.listen_addr, "starting router gRPC server");
     Server::builder()
-        .add_service(PersistSharedLogServer::new(service))
+        .add_service(PersistSharedLogServer::new(router))
         .serve(args.listen_addr)
         .await
         .expect("router gRPC server failed");

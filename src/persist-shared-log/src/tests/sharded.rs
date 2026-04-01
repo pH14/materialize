@@ -117,9 +117,9 @@ async fn spawn_shard(
 async fn spawn_metashard_with_routing(
     client: &PersistClient,
     partition_map: PartitionMap,
-    service: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
+    router: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
 ) -> crate::persist_log::metashard::PersistMetashardHandle {
-    spawn_metashard_with_routing_and_shard_id(client, partition_map, service, ShardId::new()).await
+    spawn_metashard_with_routing_and_shard_id(client, partition_map, router, ShardId::new()).await
 }
 
 /// Like `spawn_metashard_with_routing`, but uses a specific metashard shard ID.
@@ -128,7 +128,7 @@ async fn spawn_metashard_with_routing(
 async fn spawn_metashard_with_routing_and_shard_id(
     client: &PersistClient,
     partition_map: PartitionMap,
-    service: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
+    router: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
     metashard_shard_id: ShardId,
 ) -> crate::persist_log::metashard::PersistMetashardHandle {
     let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
@@ -153,19 +153,19 @@ async fn spawn_metashard_with_routing_and_shard_id(
         client,
         metashard_shard_id,
         factory,
-        service.routing_handle(),
-        service.routing_notify(),
+        router.routing_handle(),
+        router.routing_notify(),
     )
     .await;
 
     // Wait for the routing task to deliver the initial partition map.
-    service.wait_for_routing().await;
+    router.wait_for_routing().await;
 
     metashard_handle
 }
 
 /// Build a Router with 2 log shards: [0x00, 0x80) and [0x80, 0x100).
-async fn build_two_shard_service(
+async fn build_two_shard_router(
     client: &PersistClient,
 ) -> (
     Router<PersistAcceptorHandle, PersistLearnerHandle>,
@@ -191,13 +191,13 @@ async fn build_two_shard_service(
         ],
     };
 
-    let service = Router::new(
+    let router = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
-    let _metashard_handle = spawn_metashard_with_routing(client, partition_map, &service).await;
-    (service, shard_a, shard_b)
+    let _metashard_handle = spawn_metashard_with_routing(client, partition_map, &router).await;
+    (router, shard_a, shard_b)
 }
 
 fn cas_request(
@@ -225,7 +225,7 @@ fn cas_request(
 #[mz_ore::test(tokio::test)]
 async fn test_sharded_routing_isolation() {
     let client = new_persist_client_for_test().await;
-    let (service, _shard_a, _shard_b) = build_two_shard_service(&client).await;
+    let (router, _shard_a, _shard_b) = build_two_shard_router(&client).await;
 
     // "s10..." → partition key 0x10 → shard_a (range [0x00, 0x80))
     // "s90..." → partition key 0x90 → shard_b (range [0x80, 0x100))
@@ -233,21 +233,21 @@ async fn test_sharded_routing_isolation() {
     let key_b = "s90000000-0000-0000-0000-000000000000";
 
     // CAS on key_a (shard_a).
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key_a, None, 1, b"hello"))
         .await
         .unwrap();
     assert!(resp.into_inner().committed);
 
     // CAS on key_b (shard_b) — independent, also commits.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key_b, None, 1, b"world"))
         .await
         .unwrap();
     assert!(resp.into_inner().committed);
 
     // Head on key_a reads from shard_a's learner.
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key_a.into() }))
         .await
         .unwrap();
@@ -256,7 +256,7 @@ async fn test_sharded_routing_isolation() {
     assert_eq!(data.data, b"hello");
 
     // Head on key_b reads from shard_b's learner.
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key_b.into() }))
         .await
         .unwrap();
@@ -265,30 +265,30 @@ async fn test_sharded_routing_isolation() {
     assert_eq!(data.data, b"world");
 }
 
-/// CAS rejection works correctly through the sharded service.
+/// CAS rejection works correctly through the sharded router.
 #[mz_ore::test(tokio::test)]
 async fn test_sharded_cas_rejection() {
     let client = new_persist_client_for_test().await;
-    let (service, _, _) = build_two_shard_service(&client).await;
+    let (router, _, _) = build_two_shard_router(&client).await;
 
     let key = "s10000000-0000-0000-0000-000000000000";
 
     // First CAS commits.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, None, 1, b"v1"))
         .await
         .unwrap();
     assert!(resp.into_inner().committed);
 
     // Stale CAS rejected.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, None, 2, b"v2"))
         .await
         .unwrap();
     assert!(!resp.into_inner().committed);
 
     // Correct expected → commits.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, Some(1), 2, b"v2"))
         .await
         .unwrap();
@@ -299,23 +299,23 @@ async fn test_sharded_cas_rejection() {
 #[mz_ore::test(tokio::test)]
 async fn test_sharded_list_keys_fan_out() {
     let client = new_persist_client_for_test().await;
-    let (service, _, _) = build_two_shard_service(&client).await;
+    let (router, _, _) = build_two_shard_router(&client).await;
 
     let key_a = "s10000000-0000-0000-0000-000000000000";
     let key_b = "s90000000-0000-0000-0000-000000000000";
 
     // Write to both shards.
-    service
+    router
         .compare_and_set(cas_request(key_a, None, 1, b"a"))
         .await
         .unwrap();
-    service
+    router
         .compare_and_set(cas_request(key_b, None, 1, b"b"))
         .await
         .unwrap();
 
     // list_keys should return both keys (merged from both learners).
-    let resp = service
+    let resp = router
         .list_keys(tonic::Request::new(ProtoListKeysRequest {}))
         .await
         .unwrap();
@@ -339,30 +339,30 @@ async fn test_sharded_list_keys_fan_out() {
     assert_eq!(keys.len(), 2);
 }
 
-/// Truncate works through the sharded service.
+/// Truncate works through the sharded router.
 #[mz_ore::test(tokio::test)]
 async fn test_sharded_truncate() {
     let client = new_persist_client_for_test().await;
-    let (service, _, _) = build_two_shard_service(&client).await;
+    let (router, _, _) = build_two_shard_router(&client).await;
 
     let key = "s10000000-0000-0000-0000-000000000000";
 
     // Write some data.
-    service
+    router
         .compare_and_set(cas_request(key, None, 1, b"v1"))
         .await
         .unwrap();
-    service
+    router
         .compare_and_set(cas_request(key, Some(1), 2, b"v2"))
         .await
         .unwrap();
-    service
+    router
         .compare_and_set(cas_request(key, Some(2), 3, b"v3"))
         .await
         .unwrap();
 
     // Truncate up to seqno 2.
-    let resp = service
+    let resp = router
         .truncate(tonic::Request::new(ProtoTruncateRequest {
             key: key.into(),
             seqno: 2,
@@ -373,7 +373,7 @@ async fn test_sharded_truncate() {
     assert_eq!(deleted, Some(1), "should delete 1 entry (seqno 1)");
 
     // Scan should return only seqno 2 and 3.
-    let resp = service
+    let resp = router
         .scan(tonic::Request::new(ProtoScanRequest {
             key: key.into(),
             from: 0,
@@ -397,18 +397,18 @@ async fn test_reconfiguration_split() {
     let partition_map = PartitionMap::single(shard_1);
 
     // Start with empty routing — the routing task will populate it from the metashard.
-    let service = Router::new(
+    let router = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
-    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
     // --- Pre-reconfiguration: write data on the single shard ---
     let key_lo = "s10000000-0000-0000-0000-000000000000"; // partition key 0x10
     let key_hi = "s90000000-0000-0000-0000-000000000000"; // partition key 0x90
 
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key_lo, None, 1, b"lo_v1"))
         .await
         .unwrap();
@@ -417,7 +417,7 @@ async fn test_reconfiguration_split() {
         "pre-reconfig CAS should commit"
     );
 
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key_hi, None, 1, b"hi_v1"))
         .await
         .unwrap();
@@ -464,7 +464,7 @@ async fn test_reconfiguration_split() {
 
     // State carried forward via chain replay: key_lo and key_hi already have
     // seqno 1 from the predecessor shard. CAS with expected=Some(1) succeeds.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key_lo, Some(1), 2, b"lo_v2_on_shard_a"))
         .await
         .unwrap();
@@ -473,7 +473,7 @@ async fn test_reconfiguration_split() {
         "post-reconfig CAS with carried-forward expected seqno should commit"
     );
 
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key_hi, Some(1), 2, b"hi_v2_on_shard_b"))
         .await
         .unwrap();
@@ -483,14 +483,14 @@ async fn test_reconfiguration_split() {
     );
 
     // Read from new shards — data reflects the post-reconfig writes.
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() }))
         .await
         .unwrap();
     let data = resp.into_inner().data.unwrap();
     assert_eq!(data.data, b"lo_v2_on_shard_a");
 
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key_hi.into() }))
         .await
         .unwrap();
@@ -523,30 +523,30 @@ async fn test_reconfiguration_state_carryforward() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service = Router::new(
+    let router = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
-    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
     // --- Write data before reconfiguration ---
     let key = "s30000000-0000-0000-0000-000000000000"; // partition key 0x30
 
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, None, 1, b"before_reconfig_v1"))
         .await
         .unwrap();
     assert!(resp.into_inner().committed);
 
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, Some(1), 2, b"before_reconfig_v2"))
         .await
         .unwrap();
     assert!(resp.into_inner().committed);
 
     // Verify data is readable before reconfig.
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
         .await
         .unwrap();
@@ -567,7 +567,7 @@ async fn test_reconfiguration_state_carryforward() {
 
     // --- Verify state carried forward ---
     // The new learner should have replayed shard_old and have the data.
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
         .await
         .unwrap();
@@ -582,7 +582,7 @@ async fn test_reconfiguration_state_carryforward() {
     );
 
     // --- Verify new writes work on the new shard ---
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, Some(2), 3, b"after_reconfig_v3"))
         .await
         .unwrap();
@@ -591,7 +591,7 @@ async fn test_reconfiguration_state_carryforward() {
         "CAS with correct expected seqno from carried-forward state should commit"
     );
 
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
         .await
         .unwrap();
@@ -612,12 +612,12 @@ async fn test_multi_shard_workload_with_reconfiguration() {
     let shard_1 = ShardId::new();
     let partition_map = PartitionMap::single(shard_1);
 
-    let service = Router::new(
+    let router = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
-    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
     // Client shard keys spread across the partition key space.
     let keys = [
@@ -637,7 +637,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
         for seqno in 1..=3u64 {
             let prev = if seqno == 1 { None } else { Some(seqno - 1) };
             let data = format!("key={}_seq={}", &key[1..3], seqno);
-            let resp = service
+            let resp = router
                 .compare_and_set(cas_request(key, prev, seqno, data.as_bytes()))
                 .await
                 .unwrap();
@@ -653,7 +653,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
 
     // Verify all heads before reconfiguration.
     for &key in &keys {
-        let resp = service
+        let resp = router
             .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
             .await
             .unwrap();
@@ -695,7 +695,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
 
     // --- Phase 3: Verify state carried forward for ALL keys ---
     for &key in &keys {
-        let resp = service
+        let resp = router
             .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
             .await
             .unwrap();
@@ -720,7 +720,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
             let seqno = prev_seqno + delta;
             let prev = Some(seqno - 1);
             let data = format!("post_reconfig_key={}_seq={}", &key[1..3], seqno);
-            let resp = service
+            let resp = router
                 .compare_and_set(cas_request(key, prev, seqno, data.as_bytes()))
                 .await
                 .unwrap();
@@ -736,7 +736,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
 
     // --- Phase 5: Final verification ---
     for &key in &keys {
-        let resp = service
+        let resp = router
             .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
             .await
             .unwrap();
@@ -751,7 +751,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
     }
 
     // Verify list_keys returns all keys across both shards.
-    let resp = service
+    let resp = router
         .list_keys(tonic::Request::new(ProtoListKeysRequest {}))
         .await
         .unwrap();
@@ -838,12 +838,12 @@ async fn test_shard_ownership_invariant_after_split() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service = Router::new(
+    let router = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
-    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
     // Write data across the full key range.
     let keys = [
@@ -853,7 +853,7 @@ async fn test_shard_ownership_invariant_after_split() {
         "sd0000000-0000-0000-0000-000000000000", // 0xd0 → second half
     ];
     for &key in &keys {
-        service
+        router
             .compare_and_set(cas_request(key, None, 1, b"v1"))
             .await
             .unwrap();
@@ -885,7 +885,7 @@ async fn test_shard_ownership_invariant_after_split() {
         .unwrap();
 
 
-    // Invariant: each key's head is readable through the service, routed to
+    // Invariant: each key's head is readable through the router, routed to
     // the correct shard. Keys in [0x00, 0x80) should route to shard_a, and
     // keys in [0x80, 0x100) should route to shard_b.
     let lo_keys = [
@@ -898,7 +898,7 @@ async fn test_shard_ownership_invariant_after_split() {
     ];
 
     for &key in &lo_keys {
-        let resp = service
+        let resp = router
             .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
             .await
             .unwrap();
@@ -910,7 +910,7 @@ async fn test_shard_ownership_invariant_after_split() {
     }
 
     for &key in &hi_keys {
-        let resp = service
+        let resp = router
             .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
             .await
             .unwrap();
@@ -922,7 +922,7 @@ async fn test_shard_ownership_invariant_after_split() {
     }
 
     // Post-split writes go to the correct shard. Verify with carried-forward state.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(lo_keys[0], Some(1), 2, b"post_split"))
         .await
         .unwrap();
@@ -931,7 +931,7 @@ async fn test_shard_ownership_invariant_after_split() {
         "CaS with expected=1 (carried from predecessor) should commit on shard_a"
     );
 
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(hi_keys[0], Some(1), 2, b"post_split"))
         .await
         .unwrap();
@@ -971,22 +971,22 @@ async fn test_reconfiguration_merge() {
         ],
     };
 
-    let service = Router::new(
+    let router = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
-    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
     // Write data to both shards.
     let key_lo = "s20000000-0000-0000-0000-000000000000"; // 0x20 → shard_a
     let key_hi = "sa0000000-0000-0000-0000-000000000000"; // 0xa0 → shard_b
 
-    service
+    router
         .compare_and_set(cas_request(key_lo, None, 1, b"lo_v1"))
         .await
         .unwrap();
-    service
+    router
         .compare_and_set(cas_request(key_hi, None, 1, b"hi_v1"))
         .await
         .unwrap();
@@ -1004,7 +1004,7 @@ async fn test_reconfiguration_merge() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Both keys should be readable from the merged shard.
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() }))
         .await
         .unwrap();
@@ -1014,7 +1014,7 @@ async fn test_reconfiguration_merge() {
         "key_lo state should carry forward from shard_a"
     );
 
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key_hi.into() }))
         .await
         .unwrap();
@@ -1025,7 +1025,7 @@ async fn test_reconfiguration_merge() {
     );
 
     // CaS with carried-forward state should work.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key_lo, Some(1), 2, b"lo_v2_merged"))
         .await
         .unwrap();
@@ -1047,18 +1047,18 @@ async fn test_no_silent_loss_during_reconfiguration() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service = std::sync::Arc::new(Router::new(
+    let router = std::sync::Arc::new(Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     ));
-    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
     // Use a key that will stay in [0x00, 0x80) after the split.
     let key = "s20000000-0000-0000-0000-000000000000";
 
     // Write initial state.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, None, 1, b"initial"))
         .await
         .unwrap();
@@ -1069,14 +1069,14 @@ async fn test_no_silent_loss_during_reconfiguration() {
     let highest_committed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Spawn a background task that continuously issues CaS operations.
-    let service_clone = Arc::clone(&service);
+    let router_clone = Arc::clone(&router);
     let results_clone = Arc::clone(&results);
     let highest_clone = Arc::clone(&highest_committed);
     let writer_task = mz_ore::task::spawn(|| "concurrent-writer", async move {
         let mut seqno = 2u64;
         let mut expected = 1u64;
         for _ in 0..20 {
-            let result = service_clone
+            let result = router_clone
                 .compare_and_set(cas_request(key, Some(expected), seqno, b"concurrent"))
                 .await;
             match result {
@@ -1156,7 +1156,7 @@ async fn test_no_silent_loss_during_reconfiguration() {
     // reconfiguration, this will catch it.
     let expected_head = highest_committed.load(std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let resp = service
+    let resp = router
         .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
         .await
         .unwrap();
@@ -1183,18 +1183,18 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     let metashard_shard = ShardId::new(); // durable metashard
 
     let partition_map = PartitionMap::single(shard_old);
-    let service1 = Router::new(
+    let router1 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
     let handle1 = spawn_metashard_with_routing_and_shard_id(
-        &client, partition_map, &service1, metashard_shard,
+        &client, partition_map, &router1, metashard_shard,
     ).await;
 
     // Write data that will need to survive reconfiguration + restart.
     let key = "s30000000-0000-0000-0000-000000000000";
-    let resp = service1
+    let resp = router1
         .compare_and_set(cas_request(key, None, 1, b"survive_restart"))
         .await
         .unwrap();
@@ -1213,20 +1213,20 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Verify data is readable after reconfiguration (in-memory carryforward).
-    let resp = service1
+    let resp = router1
         .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
         .await
         .unwrap();
     assert_eq!(resp.into_inner().data.unwrap().seqno, 1);
 
     // --- Phase 2: simulate restart ---
-    // Drop the old service (simulates process death).
+    // Drop the old router (simulates process death).
     drop(handle1);
-    drop(service1);
+    drop(router1);
 
-    // Build a fresh service from "bootstrap" args (empty routing).
+    // Build a fresh router from "bootstrap" args (empty routing).
     // The routing task will recover state from the durable metashard shard.
-    let service2 = Router::new(
+    let router2 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1234,11 +1234,11 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     // Use the same metashard_shard so recovery reads the durable state.
     let bootstrap_map = PartitionMap::single(ShardId::new());
     let _handle2 = spawn_metashard_with_routing_and_shard_id(
-        &client, bootstrap_map, &service2, metashard_shard,
+        &client, bootstrap_map, &router2, metashard_shard,
     ).await;
 
     // --- Phase 3: verify carried-forward state survived restart ---
-    let resp = service2
+    let resp = router2
         .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
         .await
         .unwrap();
@@ -1282,24 +1282,24 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
         ],
     };
 
-    let service1 = Router::new(
+    let router1 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
     let handle1 = spawn_metashard_with_routing_and_shard_id(
-        &client, partition_map, &service1, metashard_shard,
+        &client, partition_map, &router1, metashard_shard,
     ).await;
 
     // Write to shard_a and shard_b.
     let key_lo = "s20000000-0000-0000-0000-000000000000"; // 0x20 → shard_a
     let key_hi = "sa0000000-0000-0000-0000-000000000000"; // 0xa0 → shard_b
 
-    service1
+    router1
         .compare_and_set(cas_request(key_lo, None, 1, b"from_a"))
         .await
         .unwrap();
-    service1
+    router1
         .compare_and_set(cas_request(key_hi, None, 1, b"from_b"))
         .await
         .unwrap();
@@ -1317,12 +1317,12 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Verify both keys readable after merge.
-    let resp = service1
+    let resp = router1
         .head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() }))
         .await
         .unwrap();
     assert_eq!(resp.into_inner().data.unwrap().seqno, 1);
-    let resp = service1
+    let resp = router1
         .head(tonic::Request::new(ProtoHeadRequest { key: key_hi.into() }))
         .await
         .unwrap();
@@ -1330,9 +1330,9 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
 
     // --- Phase 2: simulate restart ---
     drop(handle1);
-    drop(service1);
+    drop(router1);
 
-    let service2 = Router::new(
+    let router2 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1340,11 +1340,11 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     // Use the same metashard_shard so recovery reads the durable state.
     let bootstrap_map = PartitionMap::single(ShardId::new());
     let _handle2 = spawn_metashard_with_routing_and_shard_id(
-        &client, bootstrap_map, &service2, metashard_shard,
+        &client, bootstrap_map, &router2, metashard_shard,
     ).await;
 
     // --- Phase 3: verify BOTH predecessors' state survived ---
-    let resp = service2
+    let resp = router2
         .head(tonic::Request::new(ProtoHeadRequest { key: key_lo.into() }))
         .await
         .unwrap();
@@ -1355,7 +1355,7 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     );
     assert_eq!(data.unwrap().seqno, 1);
 
-    let resp = service2
+    let resp = router2
         .head(tonic::Request::new(ProtoHeadRequest { key: key_hi.into() }))
         .await
         .unwrap();
@@ -1383,18 +1383,18 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service1 = Router::new(
+    let router1 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     );
     let handle1 = spawn_metashard_with_routing_and_shard_id(
-        &client, partition_map, &service1, metashard_shard,
+        &client, partition_map, &router1, metashard_shard,
     ).await;
 
     // Write data that must survive the crash+recovery.
     let key = "s30000000-0000-0000-0000-000000000000"; // partition key 0x30
-    let resp = service1
+    let resp = router1
         .compare_and_set(cas_request(key, None, 1, b"before_crash"))
         .await
         .unwrap();
@@ -1440,11 +1440,11 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
 
     // Crash: drop all handles (simulates process death).
     drop(handle1);
-    drop(service1);
+    drop(router1);
 
     // --- Phase 2: restart with a fresh metashard actor using the same durable shard ---
 
-    let service2 = Router::new(
+    let router2 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1453,7 +1453,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
     // (including the pending intent).
     let bootstrap_map = PartitionMap::single(ShardId::new());
     let handle2 = spawn_metashard_with_routing_and_shard_id(
-        &client, bootstrap_map, &service2, metashard_shard,
+        &client, bootstrap_map, &router2, metashard_shard,
     ).await;
 
     // Wait for recovery to complete (intent detection + do_reconfigure).
@@ -1477,7 +1477,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
 
     // The pre-crash write (key with partition key 0x30, seqno 1) should be
     // readable via the new shard_a (range [0x00, 0x80)) through chain replay.
-    let resp = service2
+    let resp = router2
         .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
         .await
         .unwrap();
@@ -1490,7 +1490,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
 
     // Post-recovery writes should work: CAS with expected=Some(1) from
     // carried-forward state.
-    let resp = service2
+    let resp = router2
         .compare_and_set(cas_request(key, Some(1), 2, b"after_recovery"))
         .await
         .unwrap();
@@ -1518,12 +1518,12 @@ async fn test_concurrent_linearizability_during_reconfig() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service = Arc::new(Router::new(
+    let router = Arc::new(Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
     ));
-    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+    let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
     // Shared state for tracking committed seqnos per client shard.
     let committed_seqnos: Arc<[AtomicU64; 4]> = Arc::new([
@@ -1552,7 +1552,7 @@ async fn test_concurrent_linearizability_during_reconfig() {
     let mut client_tasks = Vec::new();
 
     for client_id in 0..4usize {
-        let service = Arc::clone(&service);
+        let router = Arc::clone(&router);
         let seqnos = Arc::clone(&committed_seqnos);
         let history = Arc::clone(&history);
         let op_counter = Arc::clone(&op_counter);
@@ -1568,7 +1568,7 @@ async fn test_concurrent_linearizability_during_reconfig() {
                     let new_seqno = current + 1;
                     let data = format!("client{}_{}", client_id, new_seqno);
 
-                    let result = service
+                    let result = router
                         .compare_and_set(cas_request(key, expected, new_seqno, data.as_bytes()))
                         .await;
 
@@ -1685,7 +1685,7 @@ async fn test_concurrent_linearizability_during_reconfig() {
     for (i, key) in keys.iter().enumerate() {
         let expected_seqno = committed_seqnos[i].load(Ordering::SeqCst);
         if expected_seqno > 0 {
-            let resp = service
+            let resp = router
                 .head(tonic::Request::new(ProtoHeadRequest {
                     key: key.to_string(),
                 }))
@@ -1746,16 +1746,16 @@ async fn test_buggify_reconfiguration_recovery() {
         let shard_old = ShardId::new();
         let partition_map = PartitionMap::single(shard_old);
 
-        let service = Router::new(
+        let router = Router::new(
             PartitionMap { epoch: 0, ranges: vec![] },
             BTreeMap::new(),
             BTreeMap::new(),
         );
-        let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+        let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
         // Write data before reconfiguration.
         let key = "s30000000-0000-0000-0000-000000000000";
-        let resp = service
+        let resp = router
             .compare_and_set(cas_request(key, None, 1, b"pre_fault"))
             .await
             .unwrap();
@@ -1812,7 +1812,7 @@ async fn test_buggify_reconfiguration_recovery() {
         // Verify the pre-fault write survived via chain replay.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let resp = service
+        let resp = router
             .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
             .await
             .unwrap();
@@ -1860,15 +1860,15 @@ async fn test_buggify_post_commit_injection_points() {
         let shard_old = ShardId::new();
         let partition_map = PartitionMap::single(shard_old);
 
-        let service = Router::new(
+        let router = Router::new(
             PartitionMap { epoch: 0, ranges: vec![] },
             BTreeMap::new(),
             BTreeMap::new(),
         );
-        let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &service).await;
+        let metashard_handle = spawn_metashard_with_routing(&client, partition_map, &router).await;
 
         let key = "s30000000-0000-0000-0000-000000000000";
-        let resp = service
+        let resp = router
             .compare_and_set(cas_request(key, None, 1, b"pre_fault"))
             .await
             .unwrap();
@@ -1918,7 +1918,7 @@ async fn test_buggify_post_commit_injection_points() {
         // predecessor replay to complete, then verify data is accessible.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let resp = service
+        let resp = router
             .head(tonic::Request::new(ProtoHeadRequest { key: key.into() }))
             .await
             .unwrap();
@@ -1953,19 +1953,19 @@ async fn test_get_retractions_filtering() {
     let mut learners = BTreeMap::new();
     learners.insert(shard_old, learner.clone());
 
-    let service = Router::new(partition_map, acceptors, learners);
+    let router = Router::new(partition_map, acceptors, learners);
 
     let key = "s20000000-0000-0000-0000-000000000000";
 
     // Write a CAS that commits.
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, None, 1, b"v1"))
         .await
         .unwrap();
     assert!(resp.into_inner().committed);
 
     // Write a CAS that is rejected (stale expected).
-    let resp = service
+    let resp = router
         .compare_and_set(cas_request(key, None, 2, b"v2"))
         .await
         .unwrap();

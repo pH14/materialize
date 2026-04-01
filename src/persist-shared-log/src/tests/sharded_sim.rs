@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Concurrent-history linearizability tests for the sharded service.
+//! Concurrent-history linearizability tests for the sharded router.
 //!
 //! Multiple client tasks submit overlapping CAS and Head operations through
 //! the `Router`. Every operation is checked against the
@@ -187,7 +187,7 @@ async fn sharded_sim_concurrent_linearizability() {
     let mut learners = BTreeMap::new();
     learners.insert(shard, lrn);
 
-    let service = Arc::new(Router::new(partition_map, acceptors, learners));
+    let router = Arc::new(Router::new(partition_map, acceptors, learners));
 
     let oracle = SharedLogOracle::new();
     let harness = Arc::new(Mutex::new(ConcurrentHarness {
@@ -207,7 +207,7 @@ async fn sharded_sim_concurrent_linearizability() {
     let mut tasks = Vec::new();
 
     for client_id in 0..num_clients {
-        let service = Arc::clone(&service);
+        let router = Arc::clone(&router);
         let harness = Arc::clone(&harness);
         let thread = SimThread::Client(client_id);
         // Each client alternates between two keys to create contention.
@@ -244,7 +244,7 @@ async fn sharded_sim_concurrent_linearizability() {
                         // Mutex released — other tasks can interleave here.
 
                         // Execute the operation.
-                        let result = service
+                        let result = router
                             .compare_and_set(cas_request(&key, expected, new_seqno, &data))
                             .await;
 
@@ -291,7 +291,7 @@ async fn sharded_sim_concurrent_linearizability() {
                             h.step += 1;
                         }
 
-                        let resp = service
+                        let resp = router
                             .head(tonic::Request::new(ProtoHeadRequest {
                                 key: key.clone(),
                             }))
@@ -365,7 +365,7 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
         let mut learners = BTreeMap::new();
         learners.insert(shard, lrn);
 
-        let service = Arc::new(Router::new(partition_map, acceptors, learners));
+        let router = Arc::new(Router::new(partition_map, acceptors, learners));
 
         let oracle = SharedLogOracle::new();
         let harness = Arc::new(Mutex::new(ConcurrentHarness {
@@ -383,7 +383,7 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
         let mut tasks = Vec::new();
 
         for client_id in 0..num_clients {
-            let service = Arc::clone(&service);
+            let router = Arc::clone(&router);
             let harness = Arc::clone(&harness);
             let thread = SimThread::Client(client_id);
             let key = keys[client_id % keys.len()].to_string();
@@ -405,7 +405,7 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
                                 h.step += 1;
                             }
 
-                            let resp = service
+                            let resp = router
                                 .head(tonic::Request::new(ProtoHeadRequest {
                                     key: key.clone(),
                                 }))
@@ -448,7 +448,7 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
                                 h.step += 1;
                             }
 
-                            let result = service
+                            let result = router
                                 .compare_and_set(cas_request(&key, expected, new_seqno, &data))
                                 .await;
 
@@ -512,7 +512,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
     let mut learners = BTreeMap::new();
     learners.insert(shard_old, lrn);
 
-    let service = Arc::new(Router::new(partition_map, acceptors, learners));
+    let router = Arc::new(Router::new(partition_map, acceptors, learners));
 
 
     let metashard_state = MetashardState::single(shard_old);
@@ -542,7 +542,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
     let mut tasks = Vec::new();
 
     for client_id in 0..num_clients {
-        let service = Arc::clone(&service);
+        let router = Arc::clone(&router);
         let harness = Arc::clone(&harness);
         let thread = SimThread::Client(client_id);
         let key = keys[client_id % keys.len()].to_string();
@@ -573,7 +573,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
                             h.step += 1;
                         }
 
-                        let result = service
+                        let result = router
                             .compare_and_set(cas_request(&key, expected, new_seqno, &data))
                             .await;
 
@@ -620,7 +620,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
                             h.step += 1;
                         }
 
-                        let resp = service
+                        let resp = router
                             .head(tonic::Request::new(ProtoHeadRequest {
                                 key: key.clone(),
                             }))

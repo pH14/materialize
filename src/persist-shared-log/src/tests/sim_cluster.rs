@@ -116,7 +116,7 @@ fn sim_cluster_smoke() {
         async move {
         let client = new_turmoil_persist_client().await;
 
-        let service = Router::new(
+        let router = Router::new(
             PartitionMap { epoch: 0, ranges: vec![] },
             BTreeMap::new(),
             BTreeMap::new(),
@@ -137,13 +137,13 @@ fn sim_cluster_smoke() {
             &client,
             ms_shard,
             factory,
-            service.routing_handle(),
-            service.routing_notify(),
+            router.routing_handle(),
+            router.routing_notify(),
         ).await;
-        service.wait_for_routing().await;
+        router.wait_for_routing().await;
 
-        // Run the service. In a real turmoil test, we'd serve RPC here.
-        // For the smoke test, write and read directly through the service.
+        // Run the router. In a real turmoil test, we'd serve RPC here.
+        // For the smoke test, write and read directly through the router.
         use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
         use mz_persist::generated::consensus_service::{
             ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
@@ -152,7 +152,7 @@ fn sim_cluster_smoke() {
         let key = "s30000000-0000-0000-0000-000000000000";
 
         // Write.
-        let resp = service
+        let resp = router
             .compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                 key: key.to_string(),
                 expected: None,
@@ -166,7 +166,7 @@ fn sim_cluster_smoke() {
         assert!(resp.into_inner().committed, "first CAS should commit");
 
         // Read.
-        let resp = service
+        let resp = router
             .head(tonic::Request::new(ProtoHeadRequest {
                 key: key.to_string(),
             }))
@@ -221,7 +221,7 @@ fn sim_cluster_crash_restart() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = Router::new(
+            let router = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -234,20 +234,20 @@ fn sim_cluster_crash_restart() {
             ).await;
 
             crate::persist_log::router::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
-            service.wait_for_routing().await;
+            router.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
-            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                 key: key.to_string(),
                 expected: None,
                 new: Some(ProtoVersionedData { seqno: 1, data: b"survive crash".to_vec() }),
             })).await.expect("CAS should succeed");
             assert!(resp.into_inner().committed);
 
-            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
                 key: key.to_string(),
             })).await.expect("head should succeed");
             assert_eq!(resp.into_inner().data.unwrap().seqno, 1);
@@ -270,7 +270,7 @@ fn sim_cluster_crash_restart() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = Router::new(
+            let router = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -283,14 +283,14 @@ fn sim_cluster_crash_restart() {
             ).await;
 
             crate::persist_log::router::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
-            service.wait_for_routing().await;
+            router.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
             // Data from before the "crash" should be readable.
-            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
                 key: key.to_string(),
             })).await.expect("head after restart should succeed");
             let data = resp.into_inner().data;
@@ -298,7 +298,7 @@ fn sim_cluster_crash_restart() {
             assert_eq!(data.unwrap().seqno, 1);
 
             // New writes should work with carried-forward expected seqno.
-            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                 key: key.to_string(),
                 expected: Some(1),
                 new: Some(ProtoVersionedData { seqno: 2, data: b"after restart".to_vec() }),
@@ -352,7 +352,7 @@ fn sim_cluster_persist_partition() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = Router::new(
+            let router = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -365,12 +365,12 @@ fn sim_cluster_persist_partition() {
             ).await;
 
             crate::persist_log::router::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
-            service.wait_for_routing().await;
+            router.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
-            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                 key: key.to_string(),
                 expected: None,
                 new: Some(ProtoVersionedData { seqno: 1, data: b"before partition".to_vec() }),
@@ -400,7 +400,7 @@ fn sim_cluster_persist_partition() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = Router::new(
+            let router = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -413,15 +413,15 @@ fn sim_cluster_persist_partition() {
             ).await;
 
             crate::persist_log::router::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
-            service.wait_for_routing().await;
+            router.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
             // Verify pre-partition data is readable from the learner
             // (learner subscribed and caught up during boot, before partition).
-            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
                 key: key.to_string(),
             })).await.expect("head should succeed (learner has local state)");
             let data = resp.into_inner().data;
@@ -437,7 +437,7 @@ fn sim_cluster_persist_partition() {
             // detect the hang and move on.
             let partitioned_result = tokio::time::timeout(
                 Duration::from_secs(5),
-                service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                     key: key.to_string(),
                     expected: Some(1),
                     new: Some(ProtoVersionedData { seqno: 2, data: b"during partition".to_vec() }),
@@ -461,7 +461,7 @@ fn sim_cluster_persist_partition() {
             // Give the background retry a moment to resolve.
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
                 key: key.to_string(),
             })).await.expect("head should succeed after partition heals");
             let head = resp.into_inner().data.expect("should have data");
@@ -476,7 +476,7 @@ fn sim_cluster_persist_partition() {
 
             // Write from the actual head — this must succeed.
             let next_seqno = head.seqno + 1;
-            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                 key: key.to_string(),
                 expected: Some(head.seqno),
                 new: Some(ProtoVersionedData {
@@ -534,7 +534,7 @@ fn sim_cluster_split_with_writes() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = Router::new(
+            let router = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -547,16 +547,16 @@ fn sim_cluster_split_with_writes() {
             ).await;
 
             crate::persist_log::router::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
-            service.wait_for_routing().await;
+            router.wait_for_routing().await;
 
             let key_lo = "s10000000-0000-0000-0000-000000000000"; // 0x10 → [0x00, 0x80)
             let key_hi = "s90000000-0000-0000-0000-000000000000"; // 0x90 → [0x80, 0x100)
 
             // Write to both keys on the single shard.
             for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
-                let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                     key: key.to_string(),
                     expected: None,
                     new: Some(ProtoVersionedData {
@@ -585,7 +585,7 @@ fn sim_cluster_split_with_writes() {
 
             // Verify carried-forward data.
             for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
-                let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+                let resp = router.head(tonic::Request::new(ProtoHeadRequest {
                     key: key.to_string(),
                 })).await.expect("head after split");
                 let data = resp.into_inner().data;
@@ -595,7 +595,7 @@ fn sim_cluster_split_with_writes() {
 
             // Post-split writes to both new shards.
             for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
-                let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+                let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                     key: key.to_string(),
                     expected: Some(1),
                     new: Some(ProtoVersionedData {
@@ -651,7 +651,7 @@ fn sim_cluster_reconfig_with_buggify() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = Router::new(
+            let router = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -664,13 +664,13 @@ fn sim_cluster_reconfig_with_buggify() {
             ).await;
 
             crate::persist_log::router::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
-            service.wait_for_routing().await;
+            router.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
-            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                 key: key.to_string(),
                 expected: None,
                 new: Some(ProtoVersionedData { seqno: 1, data: b"pre".to_vec() }),
@@ -702,7 +702,7 @@ fn sim_cluster_reconfig_with_buggify() {
 
             tokio::time::sleep(Duration::from_millis(200)).await;
 
-            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
                 key: key.to_string(),
             })).await.unwrap();
             assert_eq!(resp.into_inner().data.unwrap().seqno, 1,
@@ -752,7 +752,7 @@ fn sim_cluster_split_during_persist_partition() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = Router::new(
+            let router = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -765,13 +765,13 @@ fn sim_cluster_split_during_persist_partition() {
             ).await;
 
             crate::persist_log::router::spawn_routing_task(
-                &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
+                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
-            service.wait_for_routing().await;
+            router.wait_for_routing().await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
-            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                 key: key.to_string(),
                 expected: None,
                 new: Some(ProtoVersionedData { seqno: 1, data: b"pre_split".to_vec() }),
@@ -822,14 +822,14 @@ fn sim_cluster_split_during_persist_partition() {
 
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            let resp = service.head(tonic::Request::new(ProtoHeadRequest {
+            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
                 key: key.to_string(),
             })).await.unwrap();
             let data = resp.into_inner().data;
             assert!(data.is_some(), "pre-split data should survive");
             assert_eq!(data.unwrap().seqno, 1);
 
-            let resp = service.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
+            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
                 key: key.to_string(),
                 expected: Some(1),
                 new: Some(ProtoVersionedData { seqno: 2, data: b"post_split".to_vec() }),
