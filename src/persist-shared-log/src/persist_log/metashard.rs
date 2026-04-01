@@ -584,8 +584,8 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             let mut routing_guard = self.routing.write().await;
             *routing_guard = RoutingState {
                 partition_map: map.clone(),
-                acceptors,
-                learners,
+                acceptors: Arc::new(acceptors),
+                learners: Arc::new(learners),
             };
         }
         info!(
@@ -928,8 +928,8 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
 
             *routing_guard = RoutingState {
                 partition_map: new_partition_map.clone(),
-                acceptors: all_acceptors,
-                learners: all_learners,
+                acceptors: Arc::new(all_acceptors),
+                learners: Arc::new(all_learners),
             };
             new_partition_map
         };

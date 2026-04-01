@@ -10,16 +10,13 @@
 //! Sharded gRPC service: routes client requests to the correct acceptor/learner
 //! based on the partition map.
 //!
-//! Replaces `PersistSharedLogGrpcService` for multi-shard deployments. For each
-//! incoming request, the service extracts the client shard key, looks up the
-//! owning log shard in the partition map, and routes to the corresponding
+//! For each incoming request, the service extracts the client shard key, looks
+//! up the owning log shard in the partition map, and routes to the corresponding
 //! acceptor and learner.
-//!
-//! The routing state is held behind an `Arc<RwLock<...>>` so that the metashard
-//! actor can atomically swap it during reconfiguration.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -42,8 +39,7 @@ use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, Reconfi
 // ---------------------------------------------------------------------------
 
 /// Implements [`RetractionSource`] by fanning out to learner replicas and
-/// returning the first response. All replicas are deterministic, so any
-/// response is correct given the same `frontier`.
+/// returning the first response.
 pub struct ShardedRetractionSource {
     learners: Vec<crate::persist_log::learner::PersistLearnerHandle>,
 }
@@ -60,12 +56,10 @@ impl crate::RetractionSource for ShardedRetractionSource {
         &self,
         frontier: u64,
     ) -> Vec<(OrderedKey, Proposal)> {
-        // Try each learner replica in order. All replicas are deterministic,
-        // so any response is correct. The first success is returned.
         for learner in &self.learners {
             match learner.get_retractions(frontier).await {
                 Ok(retractions) => return retractions,
-                Err(_) => continue, // Try next replica.
+                Err(_) => continue,
             }
         }
         Vec::new()
@@ -73,28 +67,18 @@ impl crate::RetractionSource for ShardedRetractionSource {
 }
 
 // ---------------------------------------------------------------------------
-// RoutingState
+// RoutingSnapshot
 // ---------------------------------------------------------------------------
 
-/// The routing state that can be atomically swapped during reconfiguration.
-#[derive(Debug)]
-pub struct RoutingState<A: Acceptor, L: Learner> {
+/// An immutable snapshot of routing state.
+#[derive(Clone, Debug)]
+pub struct RoutingSnapshot<A: Acceptor, L: Learner> {
     pub partition_map: PartitionMap,
-    pub acceptors: BTreeMap<ShardId, A>,
-    pub learners: BTreeMap<ShardId, L>,
+    pub acceptors: Arc<BTreeMap<ShardId, A>>,
+    pub learners: Arc<BTreeMap<ShardId, L>>,
 }
 
-impl<A: Acceptor, L: Learner> RoutingState<A, L> {
-    /// Create an empty routing state. Used as a placeholder during startup
-    /// before the real routing is populated.
-    pub fn empty() -> Self {
-        RoutingState {
-            partition_map: PartitionMap { epoch: 0, ranges: vec![] },
-            acceptors: BTreeMap::new(),
-            learners: BTreeMap::new(),
-        }
-    }
-
+impl<A: Acceptor, L: Learner> RoutingSnapshot<A, L> {
     pub fn new(
         partition_map: PartitionMap,
         acceptors: BTreeMap<ShardId, A>,
@@ -112,30 +96,37 @@ impl<A: Acceptor, L: Learner> RoutingState<A, L> {
                 range.log_shard
             );
         }
-        RoutingState {
+        RoutingSnapshot {
             partition_map,
-            acceptors,
-            learners,
+            acceptors: Arc::new(acceptors),
+            learners: Arc::new(learners),
+        }
+    }
+
+    pub fn empty() -> Self {
+        RoutingSnapshot {
+            partition_map: PartitionMap { epoch: 0, ranges: vec![] },
+            acceptors: Arc::new(BTreeMap::new()),
+            learners: Arc::new(BTreeMap::new()),
         }
     }
 }
+
+/// Backward-compat alias.
+pub type RoutingState<A, L> = RoutingSnapshot<A, L>;
 
 // ---------------------------------------------------------------------------
 // ShardedService
 // ---------------------------------------------------------------------------
 
 /// A sharded gRPC service that routes requests by partition key.
-///
-/// The routing state (partition map + acceptor/learner pools) is behind an
-/// `Arc<RwLock<...>>` so that the metashard actor can atomically swap it
-/// during reconfiguration without blocking in-flight requests.
 pub struct ShardedService<A: Acceptor, L: Learner> {
-    routing: Arc<RwLock<RoutingState<A, L>>>,
-    /// Metashard handle for triggering reconfigurations via the Reconfigure RPC.
+    routing: Arc<RwLock<RoutingSnapshot<A, L>>>,
+    /// Signaled when routing changes (e.g., after reconfiguration).
+    routing_notify: Arc<tokio::sync::Notify>,
     metashard: Option<PersistMetashardHandle>,
 }
 
-// Manual Debug impl to avoid requiring Debug on A, L.
 impl<A: Acceptor, L: Learner> std::fmt::Debug for ShardedService<A, L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardedService").finish_non_exhaustive()
@@ -148,31 +139,30 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
         acceptors: BTreeMap<ShardId, A>,
         learners: BTreeMap<ShardId, L>,
     ) -> Self {
-        let routing = RoutingState::new(partition_map, acceptors, learners);
+        let snapshot = RoutingSnapshot::new(partition_map, acceptors, learners);
         ShardedService {
-            routing: Arc::new(RwLock::new(routing)),
+            routing: Arc::new(RwLock::new(snapshot)),
+            routing_notify: Arc::new(tokio::sync::Notify::new()),
             metashard: None,
         }
     }
 
-    /// Create a service that shares an existing routing state Arc.
-    ///
-    /// Use this when the routing state is also held by the metashard actor,
-    /// so that reconfiguration swaps are visible to the service.
-    pub fn from_routing(routing: Arc<RwLock<RoutingState<A, L>>>) -> Self {
+    pub fn from_routing(routing: Arc<RwLock<RoutingSnapshot<A, L>>>) -> Self {
         ShardedService {
             routing,
+            routing_notify: Arc::new(tokio::sync::Notify::new()),
             metashard: None,
         }
     }
 
-    /// Get a handle to the routing state for external updates (e.g., from the
-    /// metashard actor during reconfiguration).
-    pub fn routing_handle(&self) -> Arc<RwLock<RoutingState<A, L>>> {
+    pub fn routing_handle(&self) -> Arc<RwLock<RoutingSnapshot<A, L>>> {
         Arc::clone(&self.routing)
     }
 
-    /// Attach a metashard handle to enable the Reconfigure RPC.
+    pub fn routing_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.routing_notify)
+    }
+
     pub fn with_metashard(mut self, handle: PersistMetashardHandle) -> Self {
         self.metashard = Some(handle);
         self
@@ -231,7 +221,6 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
                 Err(e) => return Err(tonic::Status::from(e)),
             }
         }
-        // Drop the read lock before streaming.
         drop(routing);
 
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(64);
@@ -262,9 +251,7 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
             .new
             .ok_or_else(|| tonic::Status::invalid_argument("missing new"))?;
 
-        // Retry loop: if the acceptor returns Sealed, refresh routing and retry
-        // on the replacement shard. Bounded to 3 attempts.
-        for attempt in 0..3u32 {
+        loop {
             let proposal = ProtoLogProposal {
                 op: Some(proto_log_proposal::Op::Cas(
                     mz_persist::generated::consensus_service::ProtoCasProposal {
@@ -302,20 +289,26 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
                 Err(crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown) => {
                     debug!(
                         key = %req.key,
-                        attempt,
-                        "acceptor sealed/shutdown, refreshing routing and retrying"
+                        "acceptor sealed/shutdown, waiting for routing update"
                     );
-                    // Brief yield to let the routing swap propagate.
-                    tokio::task::yield_now().await;
-                    continue;
+                    // Wait for a routing update notification, with timeout.
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.routing_notify.notified(),
+                    )
+                    .await
+                    {
+                        Ok(()) => continue,
+                        Err(_) => {
+                            return Err(tonic::Status::unavailable(
+                                "acceptor sealed and no routing update received within timeout",
+                            ));
+                        }
+                    }
                 }
                 Err(e) => return Err(tonic::Status::from(e)),
             }
         }
-
-        Err(tonic::Status::unavailable(
-            "acceptor sealed after 3 retry attempts; reconfiguration may be in progress",
-        ))
     }
 
     async fn truncate(
@@ -325,7 +318,7 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
         let req = request.into_inner();
         debug!(key = %req.key, seqno = req.seqno, "sharded truncate");
 
-        for attempt in 0..3u32 {
+        loop {
             let proposal = ProtoLogProposal {
                 op: Some(proto_log_proposal::Op::Truncate(
                     mz_persist::generated::consensus_service::ProtoTruncateProposal {
@@ -361,19 +354,25 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
                 Err(crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown) => {
                     debug!(
                         key = %req.key,
-                        attempt,
-                        "acceptor sealed/shutdown during truncate, refreshing routing"
+                        "acceptor sealed/shutdown during truncate, waiting for routing update"
                     );
-                    tokio::task::yield_now().await;
-                    continue;
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.routing_notify.notified(),
+                    )
+                    .await
+                    {
+                        Ok(()) => continue,
+                        Err(_) => {
+                            return Err(tonic::Status::unavailable(
+                                "acceptor sealed and no routing update received within timeout",
+                            ));
+                        }
+                    }
                 }
                 Err(e) => return Err(tonic::Status::from(e)),
             }
         }
-
-        Err(tonic::Status::unavailable(
-            "acceptor sealed after 3 retry attempts; reconfiguration may be in progress",
-        ))
     }
 
     async fn reconfigure(
@@ -400,7 +399,6 @@ impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
 
-        // Build a new partition map with `num_shards` evenly-sized ranges.
         let range_size = 256 / num_shards;
         let mut ranges = Vec::with_capacity(num_shards);
         for i in 0..num_shards {
