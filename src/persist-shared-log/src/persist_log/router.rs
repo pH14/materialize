@@ -244,16 +244,17 @@ pub async fn spawn_routing_task<F: ActorFactory>(
             if let Some(data) = new_data {
                 if let Some(snapshot) = decode_and_build_snapshot(&data, &factory).await {
                     let epoch = snapshot.partition_map.epoch;
-                    let ranges: Vec<_> = snapshot.partition_map.ranges
+                    let ranges = snapshot.partition_map.ranges
                         .iter()
                         .map(|r| format!(
-                            "[0x{:02x}, 0x{:03x}) -> {}",
+                            "  [0x{:02x}, 0x{:03x}) -> {}",
                             r.lo, r.hi_exclusive, r.log_shard
                         ))
-                        .collect();
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     *routing.write().await = snapshot;
                     routing_notify.notify_waiters();
-                    info!(epoch, "routing task: applied partition map update: {ranges:?}");
+                    info!(epoch, "routing task: applied partition map update\n{ranges}");
                 }
             }
         }
