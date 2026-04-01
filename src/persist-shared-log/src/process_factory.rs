@@ -270,16 +270,30 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
     }
 
     async fn stop_shard(&self, shard_id: ShardId) {
-        // Drop supervisor handles — AbortOnDropHandle aborts the task on drop,
-        // which kills the child processes.
+        // Kill child processes by reading their PID files and sending SIGKILL.
+        // Must happen BEFORE aborting supervisors — otherwise the supervisor
+        // might restart the child between our kill and the abort.
+        let acceptor_dir = self.run_dir.join(format!("acceptor-{shard_id}"));
+        let learner_dir = self.run_dir.join(format!("learner-{shard_id}-0"));
+        let pubsub_dir = self.run_dir.join(format!("pubsub-{shard_id}"));
+
+        for dir in [&acceptor_dir, &learner_dir] {
+            let pid_file = dir.join("pid");
+            if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    info!(%shard_id, pid, ?dir, "killing child process");
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                }
+            }
+        }
+
+        // Abort supervisor tasks so they don't restart the killed children.
         self.supervisors.lock().unwrap().remove(&shard_id);
         self.acceptors.lock().unwrap().remove(&shard_id);
         self.learners.lock().unwrap().remove(&shard_id);
 
-        // Clean up socket files and PID files.
-        let acceptor_dir = self.run_dir.join(format!("acceptor-{shard_id}"));
-        let learner_dir = self.run_dir.join(format!("learner-{shard_id}-0"));
-        let pubsub_dir = self.run_dir.join(format!("pubsub-{shard_id}"));
+        // Brief delay for processes to exit, then clean up files.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         for dir in [&acceptor_dir, &learner_dir, &pubsub_dir] {
             let _ = std::fs::remove_dir_all(dir);
         }

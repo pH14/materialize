@@ -33,6 +33,7 @@ differential-dataflow = "0.20.0"
 bytes = "1.11.1"
 clap = { version = "4.5.23", features = ["derive", "env"] }
 glob = "0.3"
+libc = "0.2"
 mz-aws-util = { path = "../aws-util", features = ["s3"] }
 mz-dyncfg = { path = "../dyncfg" }
 mz-build-info = { path = "../build-info" }

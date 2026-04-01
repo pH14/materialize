@@ -7404,6 +7404,7 @@ dependencies = [
  "differential-dataflow 0.20.0",
  "glob",
  "hyper-util",
+ "libc",
  "mz-aws-util",
  "mz-build-info",
  "mz-dyncfg",
