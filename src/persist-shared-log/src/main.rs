@@ -20,7 +20,7 @@ use tracing::info;
 
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLogServer;
 use mz_persist_client::ShardId;
-use mz_persist_shared_log::factory::{ActorFactory, InProcessActorFactory};
+use mz_persist_shared_log::factory::InProcessActorFactory;
 use mz_persist_shared_log::persist_log::metashard::{MetashardState, PersistMetashardActor};
 use mz_persist_shared_log::sharded_service::{RoutingState, ShardedService};
 use mz_persist_shared_log::{PartitionMap, RangeAssignment};
@@ -229,64 +229,25 @@ async fn run(args: Args) {
         )).collect::<Vec<_>>()
     );
 
-    // --- Step 3: Spawn acceptors and learners via factory ---
-    // The factory creates actors and caches handles. It auto-wires retraction
-    // sources: when both acceptor and learner exist for a shard, the acceptor
-    // queries the learner directly for retractions.
-    // Acceptors must be created before learners (setup batches advance upper
-    // past T=0, which the learner's subscribe needs).
-    let mut acceptor_handles = BTreeMap::new();
-    let mut learner_handles = BTreeMap::new();
-
-    for range in &partition_map.ranges {
-        let shard_id = range.log_shard;
-        let acceptor_handle = factory
-            .create_acceptor(shard_id, epoch, vec![], range.clone())
-            .await
-            .expect("failed to create acceptor");
-        info!(
-            %shard_id,
-            range = %format!("[0x{:02x}, 0x{:03x})", range.lo, range.hi_exclusive),
-            "acceptor ready"
-        );
-        acceptor_handles.insert(shard_id, acceptor_handle);
-    }
-
-    for (i, range) in partition_map.ranges.iter().enumerate() {
-        let shard_id = range.log_shard;
-        let learner_handle = factory
-            .create_learner(shard_id)
-            .await
-            .expect("failed to create learner");
-        info!(
-            %shard_id,
-            range = %format!("[0x{:02x}, 0x{:03x})", range.lo, range.hi_exclusive),
-            index = i,
-            "learner ready"
-        );
-        learner_handles.insert(shard_id, learner_handle);
-    }
-
-    info!(num_shards = partition_map.ranges.len(), "all log shards ready");
-
-    // --- Step 4: Build ShardedService with routing from factory ---
-    // The factory caches handles, so these return the same handles created above.
-    {
-        let mut routing = empty_routing.write().await;
-        *routing = RoutingState::new(
-            partition_map.clone(),
-            acceptor_handles.clone(),
-            learner_handles.clone(),
-        );
-    }
-    let service = ShardedService::new(
-        partition_map.clone(),
-        acceptor_handles,
-        learner_handles,
-    );
-
-    // --- Step 5: Start metashard actor + gRPC server ---
+    // --- Step 3: Start metashard actor ---
     let _metashard_task = mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
+
+    // --- Step 4: Build ShardedService with routing from metashard persist shard ---
+    // The routing task subscribes to the metashard persist shard, decodes
+    // partition map updates, and uses the factory to create actor handles.
+    // The factory is idempotent — handles are cached, so actors created by
+    // the metashard during reconfiguration are reused by the ShardedService.
+    let service = ShardedService::from_routing(
+        Arc::clone(&empty_routing),
+    );
+    mz_persist_shared_log::sharded_service::spawn_routing_task(
+        &persist_client,
+        metashard_shard_id,
+        Arc::clone(&factory),
+        service.routing_handle(),
+        service.routing_notify(),
+    )
+    .await;
     let service = service.with_metashard(metashard_handle);
 
     info!(addr = %args.listen_addr, "starting gRPC server");

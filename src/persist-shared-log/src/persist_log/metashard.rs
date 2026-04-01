@@ -1047,6 +1047,10 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             }
         }
 
+        // Persist the initial state so that subscribers (e.g., the routing task)
+        // can discover the partition map.
+        self.persist_state().await;
+
         // Check for a pending reconfiguration intent from a previous crash.
         // Resume the reconfiguration from the last completed phase.
         if let Some(intent) = self.state.pending_intent.take() {

@@ -18,20 +18,24 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use prost::Message;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
 use mz_persist::generated::consensus_service::{
     ProtoCompareAndSetRequest, ProtoCompareAndSetResponse, ProtoHeadRequest, ProtoHeadResponse,
-    ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal, ProtoReconfigureRequest,
-    ProtoReconfigureResponse, ProtoScanRequest, ProtoScanResponse, ProtoTruncateRequest,
-    ProtoTruncateResponse, proto_log_proposal,
+    ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal, ProtoMetashardState,
+    ProtoReconfigureRequest, ProtoReconfigureResponse, ProtoScanRequest, ProtoScanResponse,
+    ProtoTruncateRequest, ProtoTruncateResponse, proto_log_proposal,
 };
-use mz_persist_client::ShardId;
+use mz_persist_client::read::ListenEvent;
+use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
+use crate::factory::ActorFactory;
 use crate::persist_log::metashard::PersistMetashardHandle;
-use crate::persist_log::{OrderedKey, Proposal};
+use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 // ---------------------------------------------------------------------------
@@ -168,6 +172,145 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
         self
     }
 }
+
+/// Spawn a background task that subscribes to the metashard persist shard and
+/// updates the ShardedService's routing state when the partition map changes.
+///
+/// This decouples the ShardedService from the metashard actor — they communicate
+/// only through the persist shard. The task uses the `ActorFactory` to create
+/// handles for new shards (idempotent — returns cached handles if already created).
+pub async fn spawn_routing_task<F: ActorFactory>(
+    persist_client: &PersistClient,
+    metashard_shard_id: ShardId,
+    factory: F,
+    routing: Arc<RwLock<RoutingSnapshot<F::A, F::L>>>,
+    routing_notify: Arc<tokio::sync::Notify>,
+) {
+    let key_schema = Arc::new(OrderedKeySchema);
+    let val_schema = Arc::new(ProposalSchema);
+
+    let (_, read) = persist_client
+        .open::<OrderedKey, Proposal, u64, i64>(
+            metashard_shard_id,
+            key_schema,
+            val_schema,
+            Diagnostics::from_purpose("routing-task-subscribe"),
+            false,
+        )
+        .await
+        .expect("open metashard shard for routing subscription");
+
+    let since = read.since().clone();
+    let subscribe = read
+        .subscribe(since)
+        .await
+        .expect("subscribe to metashard shard");
+
+    // The subscribe is handed to the background task which processes all
+    // events (initial catchup + ongoing updates). The ShardedService starts
+    // with empty routing and updates when the metashard writes its state.
+    mz_ore::task::spawn(|| "routing-task", async move {
+        let mut subscribe = subscribe;
+        loop {
+            let events = subscribe.fetch_next().await;
+            let mut new_data: Option<Bytes> = None;
+            for event in events {
+                match event {
+                    ListenEvent::Progress(_) => {}
+                    ListenEvent::Updates(updates) => {
+                        for ((key, proposal), _ts, diff) in updates {
+                            if diff == 1 && key.shard == "__metashard" {
+                                new_data = Some(proposal.encoded.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(data) = new_data {
+                if let Some(snapshot) = decode_and_build_snapshot(&data, &factory).await {
+                    let epoch = snapshot.partition_map.epoch;
+                    *routing.write().await = snapshot;
+                    routing_notify.notify_waiters();
+                    info!(epoch, "routing task: applied partition map update");
+                }
+            }
+        }
+    });
+}
+
+/// Decode a `ProtoMetashardState` and build a `RoutingSnapshot` using the factory.
+async fn decode_and_build_snapshot<F: ActorFactory>(
+    data: &[u8],
+    factory: &F,
+) -> Option<RoutingSnapshot<F::A, F::L>> {
+    let proto = match ProtoMetashardState::decode(data) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("failed to decode metashard state: {e}");
+            return None;
+        }
+    };
+
+    let ranges: Vec<RangeAssignment> = proto
+        .ranges
+        .iter()
+        .filter_map(|r| {
+            Some(RangeAssignment {
+                lo: u8::try_from(r.lo).ok()?,
+                hi_exclusive: u16::try_from(r.hi_exclusive).ok()?,
+                log_shard: r.log_shard.parse().ok()?,
+            })
+        })
+        .collect();
+
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let partition_map = PartitionMap {
+        epoch: proto.epoch,
+        ranges: ranges.clone(),
+    };
+    if partition_map.validate().is_err() {
+        warn!("decoded invalid partition map, ignoring");
+        return None;
+    }
+
+    let mut acceptors = BTreeMap::new();
+    let mut learners = BTreeMap::new();
+
+    // Create acceptors first (setup batches advance upper), then learners.
+    for range in &ranges {
+        let shard_id = range.log_shard;
+        match factory.create_acceptor(shard_id, proto.epoch, vec![], range.clone()).await {
+            Ok(a) => { acceptors.insert(shard_id, a); }
+            Err(e) => {
+                warn!(%shard_id, "failed to create acceptor: {e}");
+                return None;
+            }
+        }
+    }
+    for range in &ranges {
+        let shard_id = range.log_shard;
+        match factory.create_learner(shard_id).await {
+            Ok(l) => { learners.insert(shard_id, l); }
+            Err(e) => {
+                warn!(%shard_id, "failed to create learner: {e}");
+                return None;
+            }
+        }
+    }
+
+    Some(RoutingSnapshot {
+        partition_map,
+        acceptors: Arc::new(acceptors),
+        learners: Arc::new(learners),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// PersistSharedLog gRPC implementation
+// ---------------------------------------------------------------------------
 
 #[tonic::async_trait]
 impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
