@@ -95,6 +95,16 @@ grpcurl -plaintext \
   mz_persist.gen.consensus_service.ConsensusMetashard/GetPartitionMap
 ```
 
+**Reconfigure (split to 2 shards):**
+
+```bash
+grpcurl -plaintext \
+  -proto src/persist/src/consensus_service.proto \
+  -d '{"num_shards": 2}' \
+  unix:///$RUN_DIR/metashard-$METASHARD_ID/grpc.sock \
+  mz_persist.gen.consensus_service.ConsensusMetashard/Reconfigure
+```
+
 ### Socket path layout
 
 In distributed mode, each actor listens on a deterministic Unix socket path:
