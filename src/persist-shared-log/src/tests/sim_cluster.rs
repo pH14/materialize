@@ -21,7 +21,7 @@
 //! turmoil::Sim
 //! ├── "consensus" host       (MemConsensus over turmoil TCP)
 //! ├── "blob" host            (MemBlob over turmoil TCP)
-//! ├── "service" host         (ShardedService + metashard + acceptors + learners)
+//! ├── "service" host         (Router + metashard + acceptors + learners)
 //! └── "client-N" hosts       (workload generators with linearizability checking)
 //! ```
 //!
@@ -48,7 +48,7 @@ use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::rpc::PubSubClientConnection;
 use mz_persist_client::{PersistClient, PersistLocation, ShardId};
 use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
-use crate::sharded_service::ShardedService;
+use crate::persist_log::router::Router;
 use crate::factory::InProcessActorFactory;
 use crate::{PartitionMap, RangeAssignment, ReconfigurationPlan};
 
@@ -116,7 +116,7 @@ fn sim_cluster_smoke() {
         async move {
         let client = new_turmoil_persist_client().await;
 
-        let service = ShardedService::new(
+        let service = Router::new(
             PartitionMap { epoch: 0, ranges: vec![] },
             BTreeMap::new(),
             BTreeMap::new(),
@@ -133,7 +133,7 @@ fn sim_cluster_smoke() {
         )
         .await;
 
-        crate::sharded_service::spawn_routing_task(
+        crate::persist_log::router::spawn_routing_task(
             &client,
             ms_shard,
             factory,
@@ -221,7 +221,7 @@ fn sim_cluster_crash_restart() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = ShardedService::new(
+            let service = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -233,7 +233,7 @@ fn sim_cluster_crash_restart() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::sharded_service::spawn_routing_task(
+            crate::persist_log::router::spawn_routing_task(
                 &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
@@ -270,7 +270,7 @@ fn sim_cluster_crash_restart() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = ShardedService::new(
+            let service = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -282,7 +282,7 @@ fn sim_cluster_crash_restart() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::sharded_service::spawn_routing_task(
+            crate::persist_log::router::spawn_routing_task(
                 &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
@@ -352,7 +352,7 @@ fn sim_cluster_persist_partition() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = ShardedService::new(
+            let service = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -364,7 +364,7 @@ fn sim_cluster_persist_partition() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::sharded_service::spawn_routing_task(
+            crate::persist_log::router::spawn_routing_task(
                 &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
@@ -400,7 +400,7 @@ fn sim_cluster_persist_partition() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = ShardedService::new(
+            let service = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -412,7 +412,7 @@ fn sim_cluster_persist_partition() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::sharded_service::spawn_routing_task(
+            crate::persist_log::router::spawn_routing_task(
                 &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
@@ -534,7 +534,7 @@ fn sim_cluster_split_with_writes() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = ShardedService::new(
+            let service = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -546,7 +546,7 @@ fn sim_cluster_split_with_writes() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::sharded_service::spawn_routing_task(
+            crate::persist_log::router::spawn_routing_task(
                 &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
@@ -651,7 +651,7 @@ fn sim_cluster_reconfig_with_buggify() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = ShardedService::new(
+            let service = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -663,7 +663,7 @@ fn sim_cluster_reconfig_with_buggify() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::sharded_service::spawn_routing_task(
+            crate::persist_log::router::spawn_routing_task(
                 &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;
@@ -752,7 +752,7 @@ fn sim_cluster_split_during_persist_partition() {
 
             let client = new_turmoil_persist_client().await;
 
-            let service = ShardedService::new(
+            let service = Router::new(
                 PartitionMap { epoch: 0, ranges: vec![] },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -764,7 +764,7 @@ fn sim_cluster_split_during_persist_partition() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::sharded_service::spawn_routing_task(
+            crate::persist_log::router::spawn_routing_task(
                 &client, ms_shard, factory, service.routing_handle(), service.routing_notify(),
             ).await;
             service.wait_for_routing().await;

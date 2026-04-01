@@ -41,11 +41,8 @@ pub mod factory;
 pub mod fault;
 pub mod metrics;
 pub mod persist_log;
-pub mod service;
 pub mod rpc;
 pub mod uds;
-
-pub mod sharded_service;
 
 #[cfg(test)]
 mod tests;
@@ -213,6 +210,19 @@ impl std::fmt::Display for AcceptorError {
     }
 }
 
+impl From<AcceptorError> for tonic::Status {
+    fn from(e: AcceptorError) -> Self {
+        match e {
+            AcceptorError::Shutdown => tonic::Status::unavailable("acceptor shut down"),
+            AcceptorError::DroppedReply => tonic::Status::internal("acceptor dropped reply"),
+            AcceptorError::Command(msg) => tonic::Status::internal(msg),
+            AcceptorError::Sealed => {
+                tonic::Status::failed_precondition("log shard sealed; retry with new routing")
+            }
+        }
+    }
+}
+
 /// Error returned by learner handle methods.
 #[derive(Debug)]
 pub enum LearnerError {
@@ -230,6 +240,16 @@ impl std::fmt::Display for LearnerError {
             LearnerError::Shutdown => write!(f, "learner shut down"),
             LearnerError::DroppedReply => write!(f, "learner dropped reply"),
             LearnerError::Command(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl From<LearnerError> for tonic::Status {
+    fn from(e: LearnerError) -> Self {
+        match e {
+            LearnerError::Shutdown => tonic::Status::unavailable("learner shut down"),
+            LearnerError::DroppedReply => tonic::Status::internal("learner dropped reply"),
+            LearnerError::Command(msg) => tonic::Status::internal(msg),
         }
     }
 }

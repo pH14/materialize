@@ -10,7 +10,7 @@
 //! Actor factory: abstracts how acceptors and learners are created.
 //!
 //! The metashard uses this trait during reconfiguration to create new actors.
-//! The ShardedService uses it to obtain handles when the partition map changes.
+//! The Router uses it to obtain handles when the partition map changes.
 //!
 //! In monolithic mode, the factory spawns in-process tokio tasks and caches
 //! handles so repeated calls for the same shard return clones. In multi-process
@@ -29,7 +29,7 @@ use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
 use crate::rpc::{GrpcAcceptorHandle, GrpcLearnerHandle};
-use crate::sharded_service::ShardedRetractionSource;
+use crate::persist_log::router::ShardedRetractionSource;
 use crate::{Acceptor, AcceptorConfig, Learner, RangeAssignment};
 
 // ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ impl ActorFactory for InProcessActorFactory {
 
 /// Factory that connects to remote acceptor and learner processes via gRPC.
 ///
-/// Used by the standalone router (ShardedService) to create handles to actors
+/// Used by the standalone router (Router) to create handles to actors
 /// running in separate processes. The `ServiceDirectory` resolves shard IDs to
 /// network addresses; this factory connects to those addresses with retry.
 ///

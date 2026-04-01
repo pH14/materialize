@@ -25,6 +25,7 @@ pub mod client;
 pub mod latency_blob;
 pub mod learner;
 pub mod metashard;
+pub mod router;
 
 use std::sync::Arc;
 

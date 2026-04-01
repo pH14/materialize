@@ -10,7 +10,7 @@
 //! Concurrent-history linearizability tests for the sharded service.
 //!
 //! Multiple client tasks submit overlapping CAS and Head operations through
-//! the `ShardedService`. Every operation is checked against the
+//! the `Router`. Every operation is checked against the
 //! `SharedLogOracle` via Stateright's `LinearizabilityTester`, which verifies
 //! that the combined history of overlapping operations can be linearized.
 //!
@@ -53,7 +53,7 @@ use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
 use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
 use crate::persist_log::{OrderedKeySchema, ProposalSchema};
-use crate::sharded_service::ShardedService;
+use crate::persist_log::router::Router;
 use crate::{AcceptorConfig, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 use super::scenario::{SharedLogObservation, SharedLogOp, SharedLogOracle, VersionedData};
@@ -165,7 +165,7 @@ struct ConcurrentHarness {
 // ---------------------------------------------------------------------------
 
 /// Concurrent-history linearizability: N client tasks submit overlapping CAS
-/// and Head operations through a ShardedService. The combined history is
+/// and Head operations through a Router. The combined history is
 /// verified against the SharedLogOracle via Stateright's LinearizabilityTester.
 ///
 /// Key difference from persist_sim: operations genuinely overlap. Between
@@ -187,7 +187,7 @@ async fn sharded_sim_concurrent_linearizability() {
     let mut learners = BTreeMap::new();
     learners.insert(shard, lrn);
 
-    let service = Arc::new(ShardedService::new(partition_map, acceptors, learners));
+    let service = Arc::new(Router::new(partition_map, acceptors, learners));
 
     let oracle = SharedLogOracle::new();
     let harness = Arc::new(Mutex::new(ConcurrentHarness {
@@ -365,7 +365,7 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
         let mut learners = BTreeMap::new();
         learners.insert(shard, lrn);
 
-        let service = Arc::new(ShardedService::new(partition_map, acceptors, learners));
+        let service = Arc::new(Router::new(partition_map, acceptors, learners));
 
         let oracle = SharedLogOracle::new();
         let harness = Arc::new(Mutex::new(ConcurrentHarness {
@@ -512,7 +512,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
     let mut learners = BTreeMap::new();
     learners.insert(shard_old, lrn);
 
-    let service = Arc::new(ShardedService::new(partition_map, acceptors, learners));
+    let service = Arc::new(Router::new(partition_map, acceptors, learners));
 
 
     let metashard_state = MetashardState::single(shard_old);

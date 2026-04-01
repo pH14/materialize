@@ -16,7 +16,7 @@ sockets (distributed mode):
   to persist. One per log shard.
 - **Learner** -- state machine that tails the log, evaluates CAS during
   playback, serves reads. N replicas per log shard.
-- **Router** (ShardedService) -- routes client gRPC requests to the correct
+- **Router** -- routes client gRPC requests to the correct
   acceptor/learner based on the partition map.
 
 ## Running

@@ -41,7 +41,7 @@ use mz_persist_shared_log::persist_log::metashard::{MetashardState, PersistMetas
 use mz_persist_shared_log::rpc::{
     AcceptorGrpcServer, ConsensusAcceptorServer, ConsensusLearnerServer, LearnerGrpcServer,
 };
-use mz_persist_shared_log::sharded_service::ShardedService;
+use mz_persist_shared_log::persist_log::router::Router;
 use mz_persist_shared_log::{AcceptorConfig, PartitionMap, RangeAssignment};
 
 /// Persist shared log service.
@@ -76,7 +76,7 @@ enum Commands {
     /// update notifications.
     Metashard(MetashardArgs),
 
-    /// Run a standalone router (ShardedService).
+    /// Run a standalone router (Router).
     ///
     /// Routes client requests to remote acceptors and learners via gRPC.
     /// Subscribes to the metashard persist shard for partition map updates.
@@ -338,7 +338,7 @@ struct MetashardArgs {
 // Standalone router mode
 // ---------------------------------------------------------------------------
 
-/// Arguments for standalone router (ShardedService) mode.
+/// Arguments for standalone router (Router) mode.
 #[derive(clap::Args, Debug)]
 struct RouterArgs {
     /// Address to listen on for the PersistSharedLog gRPC service (TCP).
@@ -526,8 +526,8 @@ async fn run_monolith(args: MonolithArgs) {
     // --- Step 3: Start metashard actor ---
     let _metashard_task = mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
 
-    // --- Step 4: Build ShardedService ---
-    let service = ShardedService::new(
+    // --- Step 4: Build Router ---
+    let service = Router::new(
         PartitionMap {
             epoch: 0,
             ranges: vec![],
@@ -535,7 +535,7 @@ async fn run_monolith(args: MonolithArgs) {
         BTreeMap::new(),
         BTreeMap::new(),
     );
-    mz_persist_shared_log::sharded_service::spawn_routing_task(
+    mz_persist_shared_log::persist_log::router::spawn_routing_task(
         &persist_client,
         metashard_shard_id,
         Arc::clone(&factory),
@@ -822,12 +822,12 @@ async fn run_router(args: RouterArgs) {
 
     // Start with empty routing — the routing task populates it from the
     // metashard persist shard.
-    let service = ShardedService::from_routing(Arc::new(
+    let service = Router::from_routing(Arc::new(
         tokio::sync::RwLock::new(
-            mz_persist_shared_log::sharded_service::RoutingSnapshot::empty(),
+            mz_persist_shared_log::persist_log::router::RoutingSnapshot::empty(),
         ),
     ));
-    mz_persist_shared_log::sharded_service::spawn_routing_task(
+    mz_persist_shared_log::persist_log::router::spawn_routing_task(
         &persist_client,
         metashard_shard_id,
         Arc::clone(&factory),

@@ -709,7 +709,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         // current by the time we seal, minimizing the unavailability window
         // to just the tail of writes between subscribe and seal.
         //
-        // The factory caches handles internally. The ShardedService's routing
+        // The factory caches handles internally. The Router's routing
         // task will pick up the new actors when it processes the updated
         // partition map from the metashard persist shard.
         for &shard_id in &added {
@@ -804,7 +804,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         crate::fault::maybe_fail("after_seal").map_err(MetashardError::Command)?;
 
         // Phase 4: Build new partition map.
-        // The ShardedService discovers the new routing by subscribing to the
+        // The Router discovers the new routing by subscribing to the
         // metashard persist shard — no direct routing swap needed.
         let new_partition_map = PartitionMap {
             epoch: new_epoch,

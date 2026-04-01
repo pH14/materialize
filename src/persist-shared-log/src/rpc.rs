@@ -13,7 +13,7 @@
 //!
 //! **Client handles** (`GrpcAcceptorHandle`, `GrpcLearnerHandle`): implement the
 //! `Acceptor` and `Learner` traits by forwarding calls over gRPC to a remote
-//! actor process. These can be plugged into `ShardedService<GrpcAcceptorHandle,
+//! actor process. These can be plugged into `Router<GrpcAcceptorHandle,
 //! GrpcLearnerHandle>` to create a stateless router that connects to remote
 //! actors.
 //!
@@ -25,7 +25,7 @@
 //!
 //! Together, these enable the same actor code to run either in-process (via mpsc
 //! channel handles) or as separate OS processes (via gRPC), without changing
-//! `ShardedService` or the metashard.
+//! `Router` or the metashard.
 //!
 //! See also: `persist-client/src/rpc.rs` for the Persist PubSub pattern that
 //! inspired this design.
@@ -80,7 +80,7 @@ fn status_to_learner_error(status: tonic::Status) -> LearnerError {
 /// A handle to a remote acceptor process, communicating over gRPC.
 ///
 /// Implements the `Acceptor` trait so it can be used interchangeably with
-/// the in-process `PersistAcceptorHandle` in `ShardedService` and
+/// the in-process `PersistAcceptorHandle` in `Router` and
 /// `RoutingSnapshot`.
 #[derive(Debug, Clone)]
 pub struct GrpcAcceptorHandle {

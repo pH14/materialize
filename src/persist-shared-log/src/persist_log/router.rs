@@ -7,11 +7,11 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Sharded gRPC service: routes client requests to the correct acceptor/learner
-//! based on the partition map.
+//! Router: routes client gRPC requests to the correct acceptor/learner based on
+//! the partition map.
 //!
-//! For each incoming request, the service extracts the client shard key, looks
-//! up the owning log shard in the partition map, and routes to the corresponding
+//! For each incoming request, the router extracts the client shard key, looks up
+//! the owning log shard in the partition map, and routes to the corresponding
 //! acceptor and learner.
 
 use std::collections::BTreeMap;
@@ -118,31 +118,31 @@ impl<A: Acceptor, L: Learner> RoutingSnapshot<A, L> {
 
 
 // ---------------------------------------------------------------------------
-// ShardedService
+// Router
 // ---------------------------------------------------------------------------
 
 /// A sharded gRPC service that routes requests by partition key.
-pub struct ShardedService<A: Acceptor, L: Learner> {
+pub struct Router<A: Acceptor, L: Learner> {
     routing: Arc<RwLock<RoutingSnapshot<A, L>>>,
     /// Signaled when routing changes (e.g., after reconfiguration).
     routing_notify: Arc<tokio::sync::Notify>,
     metashard: Option<PersistMetashardHandle>,
 }
 
-impl<A: Acceptor, L: Learner> std::fmt::Debug for ShardedService<A, L> {
+impl<A: Acceptor, L: Learner> std::fmt::Debug for Router<A, L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShardedService").finish_non_exhaustive()
+        f.debug_struct("Router").finish_non_exhaustive()
     }
 }
 
-impl<A: Acceptor, L: Learner> ShardedService<A, L> {
+impl<A: Acceptor, L: Learner> Router<A, L> {
     pub fn new(
         partition_map: PartitionMap,
         acceptors: BTreeMap<ShardId, A>,
         learners: BTreeMap<ShardId, L>,
     ) -> Self {
         let snapshot = RoutingSnapshot::new(partition_map, acceptors, learners);
-        ShardedService {
+        Router {
             routing: Arc::new(RwLock::new(snapshot)),
             routing_notify: Arc::new(tokio::sync::Notify::new()),
             metashard: None,
@@ -150,7 +150,7 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
     }
 
     pub fn from_routing(routing: Arc<RwLock<RoutingSnapshot<A, L>>>) -> Self {
-        ShardedService {
+        Router {
             routing,
             routing_notify: Arc::new(tokio::sync::Notify::new()),
             metashard: None,
@@ -189,9 +189,9 @@ impl<A: Acceptor, L: Learner> ShardedService<A, L> {
 }
 
 /// Spawn a background task that subscribes to the metashard persist shard and
-/// updates the ShardedService's routing state when the partition map changes.
+/// updates the Router's routing state when the partition map changes.
 ///
-/// This decouples the ShardedService from the metashard actor — they communicate
+/// This decouples the Router from the metashard actor — they communicate
 /// only through the persist shard. The task uses the `ActorFactory` to create
 /// handles for new shards (idempotent — returns cached handles if already created).
 pub async fn spawn_routing_task<F: ActorFactory>(
@@ -222,7 +222,7 @@ pub async fn spawn_routing_task<F: ActorFactory>(
         .expect("subscribe to metashard shard");
 
     // The subscribe is handed to the background task which processes all
-    // events (initial catchup + ongoing updates). The ShardedService starts
+    // events (initial catchup + ongoing updates). The Router starts
     // with empty routing and updates when the metashard writes its state.
     mz_ore::task::spawn(|| "routing-task", async move {
         let mut subscribe = subscribe;
@@ -328,7 +328,7 @@ async fn decode_and_build_snapshot<F: ActorFactory>(
 // ---------------------------------------------------------------------------
 
 #[tonic::async_trait]
-impl<A: Acceptor, L: Learner> PersistSharedLog for ShardedService<A, L> {
+impl<A: Acceptor, L: Learner> PersistSharedLog for Router<A, L> {
     async fn head(
         &self,
         request: tonic::Request<ProtoHeadRequest>,

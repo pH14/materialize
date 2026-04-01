@@ -11,7 +11,7 @@
 //!
 //! Every actor in the shared log uses the directory to discover its peers:
 //!
-//! - **ShardedService** resolves acceptor and learner addresses for routing.
+//! - **Router** resolves acceptor and learner addresses for routing.
 //! - **Acceptor** resolves learner addresses to query retractions directly.
 //! - **Learner** resolves its acceptor to connect as a persist pubsub client.
 //! - **Everyone** resolves the metashard to subscribe for partition map updates.

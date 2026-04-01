@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Integration tests for multi-shard routing via `ShardedService`.
+//! Integration tests for multi-shard routing via `Router`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
 use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
 use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
-use crate::sharded_service::ShardedService;
+use crate::persist_log::router::Router;
 use crate::{Acceptor, AcceptorConfig, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 async fn new_persist_client_for_test() -> PersistClient {
@@ -111,13 +111,13 @@ async fn spawn_shard(
 }
 
 /// Spawn a metashard actor and routing task. The routing task subscribes to
-/// the metashard persist shard and updates the given ShardedService's routing.
+/// the metashard persist shard and updates the given Router's routing.
 ///
 /// Returns the metashard handle for triggering reconfigurations.
 async fn spawn_metashard_with_routing(
     client: &PersistClient,
     partition_map: PartitionMap,
-    service: &ShardedService<PersistAcceptorHandle, PersistLearnerHandle>,
+    service: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
 ) -> crate::persist_log::metashard::PersistMetashardHandle {
     spawn_metashard_with_routing_and_shard_id(client, partition_map, service, ShardId::new()).await
 }
@@ -128,7 +128,7 @@ async fn spawn_metashard_with_routing(
 async fn spawn_metashard_with_routing_and_shard_id(
     client: &PersistClient,
     partition_map: PartitionMap,
-    service: &ShardedService<PersistAcceptorHandle, PersistLearnerHandle>,
+    service: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
     metashard_shard_id: ShardId,
 ) -> crate::persist_log::metashard::PersistMetashardHandle {
     let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
@@ -148,8 +148,8 @@ async fn spawn_metashard_with_routing_and_shard_id(
     .await;
     mz_ore::task::spawn(|| "test-metashard", _metashard_actor.run());
 
-    // Spawn routing task so the ShardedService picks up partition map changes.
-    crate::sharded_service::spawn_routing_task(
+    // Spawn routing task so the Router picks up partition map changes.
+    crate::persist_log::router::spawn_routing_task(
         client,
         metashard_shard_id,
         factory,
@@ -164,11 +164,11 @@ async fn spawn_metashard_with_routing_and_shard_id(
     metashard_handle
 }
 
-/// Build a ShardedService with 2 log shards: [0x00, 0x80) and [0x80, 0x100).
+/// Build a Router with 2 log shards: [0x00, 0x80) and [0x80, 0x100).
 async fn build_two_shard_service(
     client: &PersistClient,
 ) -> (
-    ShardedService<PersistAcceptorHandle, PersistLearnerHandle>,
+    Router<PersistAcceptorHandle, PersistLearnerHandle>,
     ShardId,
     ShardId,
 ) {
@@ -191,7 +191,7 @@ async fn build_two_shard_service(
         ],
     };
 
-    let service = ShardedService::new(
+    let service = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -397,7 +397,7 @@ async fn test_reconfiguration_split() {
     let partition_map = PartitionMap::single(shard_1);
 
     // Start with empty routing — the routing task will populate it from the metashard.
-    let service = ShardedService::new(
+    let service = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -523,7 +523,7 @@ async fn test_reconfiguration_state_carryforward() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service = ShardedService::new(
+    let service = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -612,7 +612,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
     let shard_1 = ShardId::new();
     let partition_map = PartitionMap::single(shard_1);
 
-    let service = ShardedService::new(
+    let service = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -838,7 +838,7 @@ async fn test_shard_ownership_invariant_after_split() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service = ShardedService::new(
+    let service = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -971,7 +971,7 @@ async fn test_reconfiguration_merge() {
         ],
     };
 
-    let service = ShardedService::new(
+    let service = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1047,7 +1047,7 @@ async fn test_no_silent_loss_during_reconfiguration() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service = std::sync::Arc::new(ShardedService::new(
+    let service = std::sync::Arc::new(Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1183,7 +1183,7 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     let metashard_shard = ShardId::new(); // durable metashard
 
     let partition_map = PartitionMap::single(shard_old);
-    let service1 = ShardedService::new(
+    let service1 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1226,7 +1226,7 @@ async fn test_restart_after_reconfiguration_preserves_state() {
 
     // Build a fresh service from "bootstrap" args (empty routing).
     // The routing task will recover state from the durable metashard shard.
-    let service2 = ShardedService::new(
+    let service2 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1282,7 +1282,7 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
         ],
     };
 
-    let service1 = ShardedService::new(
+    let service1 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1332,7 +1332,7 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     drop(handle1);
     drop(service1);
 
-    let service2 = ShardedService::new(
+    let service2 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1383,7 +1383,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service1 = ShardedService::new(
+    let service1 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1444,7 +1444,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
 
     // --- Phase 2: restart with a fresh metashard actor using the same durable shard ---
 
-    let service2 = ShardedService::new(
+    let service2 = Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1518,7 +1518,7 @@ async fn test_concurrent_linearizability_during_reconfig() {
     let shard_old = ShardId::new();
     let partition_map = PartitionMap::single(shard_old);
 
-    let service = Arc::new(ShardedService::new(
+    let service = Arc::new(Router::new(
         PartitionMap { epoch: 0, ranges: vec![] },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1746,7 +1746,7 @@ async fn test_buggify_reconfiguration_recovery() {
         let shard_old = ShardId::new();
         let partition_map = PartitionMap::single(shard_old);
 
-        let service = ShardedService::new(
+        let service = Router::new(
             PartitionMap { epoch: 0, ranges: vec![] },
             BTreeMap::new(),
             BTreeMap::new(),
@@ -1860,7 +1860,7 @@ async fn test_buggify_post_commit_injection_points() {
         let shard_old = ShardId::new();
         let partition_map = PartitionMap::single(shard_old);
 
-        let service = ShardedService::new(
+        let service = Router::new(
             PartitionMap { epoch: 0, ranges: vec![] },
             BTreeMap::new(),
             BTreeMap::new(),
@@ -1953,7 +1953,7 @@ async fn test_get_retractions_filtering() {
     let mut learners = BTreeMap::new();
     learners.insert(shard_old, learner.clone());
 
-    let service = ShardedService::new(partition_map, acceptors, learners);
+    let service = Router::new(partition_map, acceptors, learners);
 
     let key = "s20000000-0000-0000-0000-000000000000";
 
