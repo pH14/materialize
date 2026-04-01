@@ -238,16 +238,9 @@ struct MonolithArgs {
 /// Arguments for standalone acceptor mode.
 #[derive(clap::Args, Debug)]
 struct AcceptorArgs {
-    /// Address to listen on for the consensus acceptor gRPC service.
-    #[arg(long, default_value = "0.0.0.0:6900")]
-    listen_addr: SocketAddr,
-
-    /// Address to listen on for the persist pubsub server.
-    ///
-    /// Learners connect to this address to receive instant write notifications.
-    /// Must be reachable from the learner process.
-    #[arg(long, default_value = "0.0.0.0:6901")]
-    pubsub_listen_addr: SocketAddr,
+    /// Shared run directory for Unix domain sockets.
+    #[arg(long, env = "RUN_DIR")]
+    run_dir: std::path::PathBuf,
 
     /// Address to listen on for the HTTP metrics endpoint.
     #[arg(long, default_value = "0.0.0.0:6902")]
@@ -280,9 +273,9 @@ struct AcceptorArgs {
 /// Arguments for standalone learner mode.
 #[derive(clap::Args, Debug)]
 struct LearnerArgs {
-    /// Address to listen on for the consensus learner gRPC service.
-    #[arg(long, default_value = "0.0.0.0:6910")]
-    listen_addr: SocketAddr,
+    /// Shared run directory for Unix domain sockets.
+    #[arg(long, env = "RUN_DIR")]
+    run_dir: std::path::PathBuf,
 
     /// Address to listen on for the HTTP metrics endpoint.
     #[arg(long, default_value = "0.0.0.0:6911")]
@@ -295,12 +288,12 @@ struct LearnerArgs {
     #[arg(long, env = "PERSIST_SHARD_ID")]
     shard_id: String,
 
-    /// URL of the acceptor's persist pubsub server (e.g. http://acceptor:6901).
+    /// Replica ID for this learner instance.
     ///
-    /// Connects to this address so that the learner's Subscribe gets instant
-    /// write notifications from the acceptor.
-    #[arg(long, env = "ACCEPTOR_PUBSUB_URL")]
-    acceptor_pubsub_url: String,
+    /// Multiple learners for the same shard are distinguished by replica ID.
+    /// The socket path is `<run_dir>/learner-<shard_id>-<replica_id>/grpc.sock`.
+    #[arg(long, default_value = "0")]
+    replica_id: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,12 +303,9 @@ struct LearnerArgs {
 /// Arguments for standalone metashard mode.
 #[derive(clap::Args, Debug)]
 struct MetashardArgs {
-    /// Address to listen on for the persist pubsub server.
-    ///
-    /// Routing tasks in router processes connect here to receive instant
-    /// partition map update notifications.
-    #[arg(long, default_value = "0.0.0.0:6920")]
-    pubsub_listen_addr: SocketAddr,
+    /// Shared run directory for Unix domain sockets.
+    #[arg(long, env = "RUN_DIR")]
+    run_dir: std::path::PathBuf,
 
     /// Address to listen on for the HTTP metrics endpoint.
     #[arg(long, default_value = "0.0.0.0:6921")]
@@ -344,7 +334,10 @@ struct MetashardArgs {
 /// Arguments for standalone router (ShardedService) mode.
 #[derive(clap::Args, Debug)]
 struct RouterArgs {
-    /// Address to listen on for the PersistSharedLog gRPC service.
+    /// Address to listen on for the PersistSharedLog gRPC service (TCP).
+    ///
+    /// The router is the external-facing entry point — it listens on TCP for
+    /// client requests and routes them to actors over Unix sockets.
     #[arg(long, default_value = "0.0.0.0:6890")]
     listen_addr: SocketAddr,
 
@@ -360,17 +353,11 @@ struct RouterArgs {
     #[arg(long, env = "METASHARD_ID")]
     metashard_id: String,
 
-    /// URL of the metashard's persist pubsub server (e.g. http://metashard:6920).
+    /// Shared run directory containing actor Unix sockets.
     ///
-    /// The routing task connects to this pubsub server so that partition map
-    /// changes are received instantly instead of polling consensus.
-    #[arg(long, env = "METASHARD_PUBSUB_URL")]
-    metashard_pubsub_url: String,
-
-    /// Base directory for resolving actor addresses.
-    ///
-    /// Acceptor and learner socket paths are derived from shard IDs under this
-    /// directory (e.g. `<run-dir>/acceptor-<shard>/grpc.sock`).
+    /// The router discovers acceptors and learners via `ProcessDirectory` socket
+    /// paths under this directory. Also connects to the metashard's pubsub socket
+    /// for instant partition map notifications.
     #[arg(long, env = "RUN_DIR")]
     run_dir: std::path::PathBuf,
 
@@ -568,18 +555,30 @@ async fn run_acceptor(args: AcceptorArgs) {
     spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
 
     let shard_id: ShardId = args.shard_id.parse().expect("invalid --shard-id");
-    info!(%shard_id, epoch = args.epoch, "starting standalone acceptor");
+
+    // Derive socket paths from ProcessDirectory convention.
+    let acceptor_sock = args.run_dir.join(format!("acceptor-{shard_id}")).join("grpc.sock");
+    let pubsub_sock = args.run_dir.join(format!("pubsub-{shard_id}")).join("grpc.sock");
+    info!(%shard_id, epoch = args.epoch, ?acceptor_sock, ?pubsub_sock, "starting standalone acceptor");
 
     // Create PersistClient with same-process pubsub and get the server handle
     // so we can also serve pubsub to remote learners.
     let (persist_client, pubsub_server) =
         open_persist_client_hosting_pubsub(&args.storage, &metrics_registry).await;
 
-    // Spawn the pubsub server on a separate port for remote learners.
-    let pubsub_addr = args.pubsub_listen_addr;
+    // Serve pubsub on a Unix socket for remote learners.
+    let pubsub_path = pubsub_sock.clone();
     mz_ore::task::spawn(|| "persist-pubsub-server", async move {
-        info!(addr = %pubsub_addr, "starting persist pubsub server");
-        if let Err(e) = pubsub_server.serve(pubsub_addr).await {
+        info!(?pubsub_path, "starting persist pubsub server on Unix socket");
+        let uds = {
+            if let Some(parent) = pubsub_path.parent() {
+                std::fs::create_dir_all(parent).expect("create pubsub socket dir");
+            }
+            let _ = std::fs::remove_file(&pubsub_path);
+            tokio::net::UnixListener::bind(&pubsub_path).expect("bind pubsub socket")
+        };
+        let stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
+        if let Err(e) = pubsub_server.serve_with_incoming(stream).await {
             error!("persist pubsub server exited: {e}");
         }
     });
@@ -606,16 +605,11 @@ async fn run_acceptor(args: AcceptorArgs) {
     )
     .await;
 
-    info!(
-        addr = %args.listen_addr,
-        pubsub_addr = %args.pubsub_listen_addr,
-        "starting acceptor gRPC server"
-    );
-    Server::builder()
-        .add_service(ConsensusAcceptorServer::new(AcceptorGrpcServer::new(
-            handle,
-        )))
-        .serve(args.listen_addr)
+    info!(?acceptor_sock, "starting acceptor gRPC server on Unix socket");
+    let router = Server::builder().add_service(ConsensusAcceptorServer::new(
+        AcceptorGrpcServer::new(handle),
+    ));
+    mz_persist_shared_log::uds::serve_uds(&acceptor_sock, router)
         .await
         .expect("acceptor gRPC server failed");
 }
@@ -629,17 +623,22 @@ async fn run_learner(args: LearnerArgs) {
     spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
 
     let shard_id: ShardId = args.shard_id.parse().expect("invalid --shard-id");
-    info!(
-        %shard_id,
-        acceptor_pubsub = %args.acceptor_pubsub_url,
-        "starting standalone learner"
-    );
+    let replica_id = args.replica_id;
 
-    // Create PersistClient with remote pubsub connection to the acceptor.
+    // Derive socket paths from ProcessDirectory convention.
+    let learner_sock = args
+        .run_dir
+        .join(format!("learner-{shard_id}-{replica_id}"))
+        .join("grpc.sock");
+    let pubsub_sock = args.run_dir.join(format!("pubsub-{shard_id}")).join("grpc.sock");
+    let pubsub_path = pubsub_sock.to_string_lossy().to_string();
+    info!(%shard_id, replica_id, ?learner_sock, pubsub = %pubsub_path, "starting standalone learner");
+
+    // Create PersistClient with remote pubsub to the acceptor's Unix socket.
     let persist_client = open_persist_client_with_remote_pubsub(
         &args.storage,
-        &args.acceptor_pubsub_url,
-        &format!("learner-{shard_id}"),
+        &pubsub_path,
+        &format!("learner-{shard_id}-{replica_id}"),
         &metrics_registry,
     )
     .await;
@@ -656,10 +655,11 @@ async fn run_learner(args: LearnerArgs) {
     )
     .await;
 
-    info!(addr = %args.listen_addr, "starting learner gRPC server");
-    Server::builder()
-        .add_service(ConsensusLearnerServer::new(LearnerGrpcServer::new(handle)))
-        .serve(args.listen_addr)
+    info!(?learner_sock, "starting learner gRPC server on Unix socket");
+    let router = Server::builder().add_service(ConsensusLearnerServer::new(
+        LearnerGrpcServer::new(handle),
+    ));
+    mz_persist_shared_log::uds::serve_uds(&learner_sock, router)
         .await
         .expect("learner gRPC server failed");
 }
@@ -669,22 +669,42 @@ async fn run_learner(args: LearnerArgs) {
 // ===========================================================================
 
 async fn run_metashard(args: MetashardArgs) {
+    use mz_persist_shared_log::rpc::{ConsensusMetashardServer, MetashardGrpcServer};
+
     let metrics_registry = MetricsRegistry::new();
     spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
 
     let metashard_shard_id: ShardId = args.metashard_id.parse().expect("invalid --metashard-id");
-    info!(%metashard_shard_id, "starting standalone metashard");
+    let metashard_sock = args
+        .run_dir
+        .join(format!("metashard-{metashard_shard_id}"))
+        .join("grpc.sock");
+    info!(%metashard_shard_id, ?metashard_sock, "starting standalone metashard");
 
-    // Create PersistClient hosting pubsub — routing tasks in router processes
-    // connect to this pubsub server for instant partition map notifications.
+    // Create PersistClient hosting pubsub — the pubsub server is served on
+    // the same Unix socket as the metashard gRPC (via the same tonic Router).
     let (persist_client, pubsub_server) =
         open_persist_client_hosting_pubsub(&args.storage, &metrics_registry).await;
 
-    // Spawn the pubsub server for remote routing tasks.
-    let pubsub_addr = args.pubsub_listen_addr;
+    // Serve pubsub on the metashard socket alongside the metashard gRPC service.
+    // We'll use the pubsub server's serve_with_incoming after building a combined
+    // tonic router. For now, pubsub goes on the same socket as the metashard gRPC.
+    let pubsub_sock = args
+        .run_dir
+        .join(format!("metashard-{metashard_shard_id}"))
+        .join("pubsub.sock");
+    let pubsub_path = pubsub_sock.clone();
     mz_ore::task::spawn(|| "metashard-pubsub-server", async move {
-        info!(addr = %pubsub_addr, "starting metashard pubsub server");
-        if let Err(e) = pubsub_server.serve(pubsub_addr).await {
+        info!(?pubsub_path, "starting metashard pubsub server on Unix socket");
+        let uds = {
+            if let Some(parent) = pubsub_path.parent() {
+                std::fs::create_dir_all(parent).expect("create pubsub socket dir");
+            }
+            let _ = std::fs::remove_file(&pubsub_path);
+            tokio::net::UnixListener::bind(&pubsub_path).expect("bind pubsub socket")
+        };
+        let stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
+        if let Err(e) = pubsub_server.serve_with_incoming(stream).await {
             error!("metashard pubsub server exited: {e}");
         }
     });
@@ -710,12 +730,9 @@ async fn run_metashard(args: MetashardArgs) {
         }
     };
 
-    // The metashard doesn't create actors — it just manages the partition map.
-    // We still need a factory for the metashard actor constructor, but it won't
-    // be used to spawn actors in standalone mode.
     let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
 
-    let (metashard_actor, _metashard_handle) = PersistMetashardActor::new(
+    let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
         bootstrap_state,
         256,
         persist_client,
@@ -740,8 +757,17 @@ async fn run_metashard(args: MetashardArgs) {
             .collect::<Vec<_>>()
     );
 
-    // Run the metashard actor forever.
-    metashard_actor.run().await;
+    // Start the metashard actor on a background task.
+    mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
+
+    // Serve the ConsensusMetashard gRPC service on a Unix socket (grpcurl-able).
+    info!(?metashard_sock, "starting metashard gRPC server on Unix socket");
+    let router = Server::builder().add_service(ConsensusMetashardServer::new(
+        MetashardGrpcServer::new(metashard_handle),
+    ));
+    mz_persist_shared_log::uds::serve_uds(&metashard_sock, router)
+        .await
+        .expect("metashard gRPC server failed");
 }
 
 // ===========================================================================
@@ -753,27 +779,35 @@ async fn run_router(args: RouterArgs) {
     spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
 
     let metashard_shard_id: ShardId = args.metashard_id.parse().expect("invalid --metashard-id");
+
+    // Compute the metashard pubsub socket path before moving run_dir.
+    let metashard_pubsub_path = args
+        .run_dir
+        .join(format!("metashard-{metashard_shard_id}"))
+        .join("pubsub.sock")
+        .to_string_lossy()
+        .to_string();
+
+    let directory = mz_persist_shared_log::directory::ProcessDirectory::new(
+        args.run_dir,
+        metashard_shard_id,
+    );
     info!(
         %metashard_shard_id,
-        metashard_pubsub = %args.metashard_pubsub_url,
+        metashard_pubsub = %metashard_pubsub_path,
         "starting standalone router"
     );
 
-    // Create PersistClient with remote pubsub to the metashard, so the routing
-    // task gets instant partition map notifications.
+    // Create PersistClient with remote pubsub to the metashard over Unix socket.
     let persist_client = open_persist_client_with_remote_pubsub(
         &args.storage,
-        &args.metashard_pubsub_url,
+        &metashard_pubsub_path,
         "router",
         &metrics_registry,
     )
     .await;
 
-    // GrpcActorFactory connects to remote acceptors/learners via the directory.
-    let directory = mz_persist_shared_log::directory::ProcessDirectory::new(
-        args.run_dir,
-        metashard_shard_id,
-    );
+    // GrpcActorFactory connects to actors over Unix sockets via ProcessDirectory.
     let factory = Arc::new(mz_persist_shared_log::factory::GrpcActorFactory::new(
         directory,
         std::time::Duration::from_secs(args.connect_timeout_secs),

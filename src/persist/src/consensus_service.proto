@@ -44,6 +44,14 @@ service ConsensusLearner {
   rpc GetRetractions(ProtoGetRetractionsRequest) returns (ProtoGetRetractionsResponse);
 }
 
+// Metashard: partition map authority. Manages the mapping from key ranges to
+// log shards. Standalone metashard processes serve this so operators can
+// discover shard IDs via grpcurl before starting acceptors/learners.
+service ConsensusMetashard {
+  // Return the current partition map and metashard state.
+  rpc GetPartitionMap(ProtoGetPartitionMapRequest) returns (ProtoGetPartitionMapResponse);
+}
+
 // Combined service: maps 1:1 to the persist Consensus trait, plus
 // administrative operations like reconfiguration.
 service PersistSharedLog {
@@ -175,6 +183,14 @@ message ProtoListKeysRequest {}
 
 message ProtoListKeysResponse {
   string key = 1;
+}
+
+// --- Metashard messages ---
+
+message ProtoGetPartitionMapRequest {}
+
+message ProtoGetPartitionMapResponse {
+  ProtoMetashardState state = 1;
 }
 
 // --- Reconfiguration messages ---

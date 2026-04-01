@@ -43,6 +43,7 @@ pub mod metrics;
 pub mod persist_log;
 pub mod service;
 pub mod rpc;
+pub mod uds;
 
 pub mod sharded_service;
 

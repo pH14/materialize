@@ -101,6 +101,17 @@ impl ServiceDirectory for InProcessDirectory {
 /// Each actor gets a deterministic socket path derived from its shard ID
 /// under a shared run directory. Used by `ProcessOrchestrator`-style
 /// deployments where each actor runs as a separate OS process.
+///
+/// Socket path structure:
+/// ```text
+/// <run_dir>/metashard-<metashard_id>/grpc.sock
+/// <run_dir>/acceptor-<shard_id>/grpc.sock
+/// <run_dir>/pubsub-<shard_id>/grpc.sock
+/// <run_dir>/learner-<shard_id>-0/grpc.sock
+/// <run_dir>/learner-<shard_id>-1/grpc.sock
+/// ```
+///
+/// Learner replicas are discovered by globbing `learner-<shard_id>-*/grpc.sock`.
 pub struct ProcessDirectory {
     run_dir: std::path::PathBuf,
     metashard_shard_id: ShardId,
@@ -114,6 +125,15 @@ impl ProcessDirectory {
     fn socket_path(&self, role: &str, shard_id: ShardId) -> String {
         self.run_dir
             .join(format!("{role}-{shard_id}"))
+            .join("grpc.sock")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Socket path for a specific learner replica.
+    pub fn learner_replica_path(&self, shard_id: ShardId, replica_id: u32) -> String {
+        self.run_dir
+            .join(format!("learner-{shard_id}-{replica_id}"))
             .join("grpc.sock")
             .to_string_lossy()
             .into_owned()
@@ -132,11 +152,27 @@ impl ServiceDirectory for ProcessDirectory {
     }
 
     fn learner_addrs(&self, shard_id: ShardId) -> Vec<String> {
-        // Single learner replica per shard for now.
-        vec![self.socket_path("learner", shard_id)]
+        // Discover learner replicas by globbing the run directory.
+        let pattern = self
+            .run_dir
+            .join(format!("learner-{shard_id}-*"))
+            .join("grpc.sock");
+        let pattern_str = pattern.to_string_lossy();
+        match glob::glob(&pattern_str) {
+            Ok(paths) => {
+                let mut addrs: Vec<String> = paths
+                    .filter_map(|p| p.ok())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                addrs.sort();
+                addrs
+            }
+            Err(_) => vec![],
+        }
     }
 
     fn pubsub_addr(&self, shard_id: ShardId) -> String {
         self.socket_path("pubsub", shard_id)
     }
 }
+

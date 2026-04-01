@@ -48,7 +48,7 @@ use mz_persist::generated::consensus_service::{
 use crate::persist_log::acceptor::PersistAcceptorHandle;
 use crate::persist_log::learner::PersistLearnerHandle;
 use crate::persist_log::{OrderedKey, Proposal};
-use crate::{Acceptor, AcceptorError, LearnerError};
+use crate::{Acceptor, AcceptorError, LearnerError, Metashard};
 
 // ---------------------------------------------------------------------------
 // Error conversions (tonic::Status -> domain errors)
@@ -94,15 +94,29 @@ impl GrpcAcceptorHandle {
         Ok(GrpcAcceptorHandle { client })
     }
 
+    /// Connect to a remote acceptor over a Unix domain socket.
+    pub async fn connect_unix(socket_path: &str) -> Result<Self, anyhow::Error> {
+        let channel = crate::uds::connect_uds(socket_path).await?;
+        Ok(GrpcAcceptorHandle {
+            client: ConsensusAcceptorClient::new(channel),
+        })
+    }
+
     /// Connect to a remote acceptor, retrying until success or timeout.
+    /// Auto-detects Unix sockets (paths starting with `/`) vs TCP URLs.
     pub async fn connect_with_retry(
         addr: String,
         timeout: std::time::Duration,
     ) -> Result<Self, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            match ConsensusAcceptorClient::connect(addr.clone()).await {
-                Ok(client) => return Ok(GrpcAcceptorHandle { client }),
+            let result: Result<Self, String> = if addr.starts_with('/') {
+                Self::connect_unix(&addr).await.map_err(|e| e.to_string())
+            } else {
+                Self::connect(addr.clone()).await.map_err(|e| e.to_string())
+            };
+            match result {
+                Ok(handle) => return Ok(handle),
                 Err(e) => {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(format!(
@@ -156,15 +170,29 @@ impl GrpcLearnerHandle {
         Ok(GrpcLearnerHandle { client })
     }
 
+    /// Connect to a remote learner over a Unix domain socket.
+    pub async fn connect_unix(socket_path: &str) -> Result<Self, anyhow::Error> {
+        let channel = crate::uds::connect_uds(socket_path).await?;
+        Ok(GrpcLearnerHandle {
+            client: ConsensusLearnerClient::new(channel),
+        })
+    }
+
     /// Connect to a remote learner, retrying until success or timeout.
+    /// Auto-detects Unix sockets (paths starting with `/`) vs TCP URLs.
     pub async fn connect_with_retry(
         addr: String,
         timeout: std::time::Duration,
     ) -> Result<Self, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            match ConsensusLearnerClient::connect(addr.clone()).await {
-                Ok(client) => return Ok(GrpcLearnerHandle { client }),
+            let result: Result<Self, String> = if addr.starts_with('/') {
+                Self::connect_unix(&addr).await.map_err(|e| e.to_string())
+            } else {
+                Self::connect(addr.clone()).await.map_err(|e| e.to_string())
+            };
+            match result {
+                Ok(handle) => return Ok(handle),
                 Err(e) => {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(format!(
@@ -485,8 +513,79 @@ impl consensus_learner_server::ConsensusLearner for LearnerGrpcServer {
 }
 
 // ---------------------------------------------------------------------------
+// MetashardGrpcServer
+// ---------------------------------------------------------------------------
+
+/// Server-side adapter: implements the `ConsensusMetashard` gRPC service trait
+/// by delegating to an in-process `PersistMetashardHandle`.
+///
+/// Used by standalone metashard binaries so operators can `grpcurl` the
+/// partition map to discover shard IDs before starting acceptors/learners.
+pub struct MetashardGrpcServer {
+    handle: crate::persist_log::metashard::PersistMetashardHandle,
+}
+
+impl MetashardGrpcServer {
+    pub fn new(handle: crate::persist_log::metashard::PersistMetashardHandle) -> Self {
+        MetashardGrpcServer { handle }
+    }
+}
+
+#[tonic::async_trait]
+impl mz_persist::generated::consensus_service::consensus_metashard_server::ConsensusMetashard
+    for MetashardGrpcServer
+{
+    async fn get_partition_map(
+        &self,
+        _request: tonic::Request<
+            mz_persist::generated::consensus_service::ProtoGetPartitionMapRequest,
+        >,
+    ) -> Result<
+        tonic::Response<mz_persist::generated::consensus_service::ProtoGetPartitionMapResponse>,
+        tonic::Status,
+    > {
+        use mz_persist::generated::consensus_service::{
+            ProtoGetPartitionMapResponse, ProtoMetashardState, ProtoRangeAssignment,
+        };
+
+        let partition_map = self
+            .handle
+            .partition_map()
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let epoch = self
+            .handle
+            .current_epoch()
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+
+        let ranges = partition_map
+            .ranges
+            .iter()
+            .map(|r| ProtoRangeAssignment {
+                lo: u32::from(r.lo),
+                hi_exclusive: u32::from(r.hi_exclusive),
+                log_shard: r.log_shard.to_string(),
+            })
+            .collect();
+
+        let state = ProtoMetashardState {
+            epoch,
+            ranges,
+            predecessors: vec![],
+            intent: None,
+        };
+
+        Ok(tonic::Response::new(ProtoGetPartitionMapResponse {
+            state: Some(state),
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Convenience re-exports for standalone binaries
 // ---------------------------------------------------------------------------
 
 pub use mz_persist::generated::consensus_service::consensus_acceptor_server::ConsensusAcceptorServer;
 pub use mz_persist::generated::consensus_service::consensus_learner_server::ConsensusLearnerServer;
+pub use mz_persist::generated::consensus_service::consensus_metashard_server::ConsensusMetashardServer;

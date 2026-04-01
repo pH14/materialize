@@ -1,103 +1,150 @@
 # persist-shared-log
 
 A group commit consensus service for Materialize persist. Batches independent
-cross-shard CAS writes into a single durable S3 Express One Zone PUT per flush
-interval, making cost O(1/batch_window) instead of O(shards).
+cross-shard CAS proposals into a single durable persist write per flush
+interval, then a learner evaluates them deterministically during playback.
 
 ## Architecture
 
-```
-environmentd ──gRPC──▶ consensus-svc (single-threaded actor)
-                              │
-                              ▼
-                        S3 Express One Zone
-                        ├── consensus/wal/00000000000000000001
-                        ├── consensus/wal/00000000000000000002
-                        └── consensus/snapshot
-```
+The service is split into four actor types that can run in a single process
+(monolith mode) or as separate OS processes communicating over Unix domain
+sockets (distributed mode):
 
-All shard state lives in-memory in a single-threaded actor. Writes are buffered
-and flushed to S3 as a single WAL batch every flush interval (default 20ms).
-Snapshots are written periodically for faster recovery.
-
-## Prerequisites
-
-- CockroachDB running locally (for timestamp oracle and other metadata)
-- AWS credentials with access to an S3 Express One Zone directory bucket
-- Standard Materialize dev setup (`bin/environmentd` must work)
+- **Metashard** -- partition map authority. Manages the mapping from key ranges
+  to log shards. Persists reconfiguration state for crash recovery.
+- **Acceptor** -- blind group commit. Receives proposals, batches them, flushes
+  to persist. One per log shard.
+- **Learner** -- state machine that tails the log, evaluates CAS during
+  playback, serves reads. N replicas per log shard.
+- **Router** (ShardedService) -- routes client gRPC requests to the correct
+  acceptor/learner based on the partition map.
 
 ## Running
 
-### 1. Start the consensus service
+### Monolith mode (all-in-one)
+
+Simplest way to run -- all actors in a single process with in-memory storage:
 
 ```bash
-AWS_PROFILE=mz-scratch-admin cargo run -p mz-persist-shared-log -- \
-  --s3-bucket <your-s3-express-bucket> \
-  --s3-prefix consensus/ \
-  --s3-region us-east-1
+cargo run -p mz-persist-shared-log -- monolith \
+  --metashard-id s00000000-0000-0000-0000-000000000000
 ```
 
-The service listens on `0.0.0.0:6890` by default.
-
-For local development with LocalStack/MinIO, pass `--s3-endpoint`:
+With external storage (Postgres consensus + file blob):
 
 ```bash
-cargo run -p mz-persist-shared-log -- \
-  --s3-bucket test-bucket \
-  --s3-prefix consensus/ \
-  --s3-endpoint http://localhost:4566
+cargo run -p mz-persist-shared-log -- monolith \
+  --metashard-id s00000000-0000-0000-0000-000000000000 \
+  --blob-url file:///tmp/persist/blob \
+  --consensus-url 'postgres://$(whoami)@localhost:5432/consensus'
 ```
 
-### 2. Start environmentd
+### Distributed mode (separate processes)
+
+Each actor runs as a separate process. They find each other via Unix domain
+sockets under a shared `--run-dir` directory.
 
 ```bash
-./bin/environmentd --reset -- \
-  --persist-consensus-url='rpc://localhost:6890' \
-  --system-parameter-default=default_timestamp_interval=100ms
+export RUN_DIR=/tmp/shared-log
+export METASHARD_ID=s00000000-0000-0000-0000-000000000000
+export PERSIST_BLOB_URL=file:///tmp/persist/blob
+export PERSIST_CONSENSUS_URL='postgres://phemberger@localhost:5432/consensus'
 ```
 
-The `--reset` flag clears previous state. Omit it on subsequent runs to keep
-data across restarts. The `--system-parameter-default` flag sets the timestamp
-interval to 100ms (default 1s), which controls how frequently tables and sources
-commit data through the consensus service.
-
-### 3. Connect
+**Terminal 1 -- Metashard:**
 
 ```bash
-psql postgres://materialize@localhost:6875/materialize
+cargo run -p mz-persist-shared-log -- metashard \
+  --run-dir $RUN_DIR \
+  --metashard-id $METASHARD_ID \
+  --blob-url $PERSIST_BLOB_URL \
+  --consensus-url $PERSIST_CONSENSUS_URL
 ```
 
-## CLI flags
+**Terminal 2 -- Discover shard IDs:**
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--listen-addr` | `0.0.0.0:6890` | gRPC listen address |
-| `--s3-bucket` | (required) | S3 bucket for WAL and snapshot storage |
-| `--s3-prefix` | `consensus/` | Key prefix for all S3 objects |
-| `--s3-endpoint` | (none) | S3 endpoint override for LocalStack/MinIO |
-| `--s3-region` | `us-east-1` | AWS region |
-| `--flush-interval-ms` | `20` | How often to flush buffered writes to S3 |
-| `--snapshot-interval` | `100` | Write a snapshot every N WAL batches |
-
-## Tuning
-
-### Flush interval
-
-The flush interval controls the trade-off between write latency and S3 cost.
-Each flush produces one S3 PUT regardless of how many shards wrote.
-
-### Source/table timestamp interval
-
-By default, sources and tables advance timestamps every 1s. This can be set at
-startup via `--system-parameter-default=default_timestamp_interval=100ms` (as
-shown above), or changed at runtime:
-
-```sql
-ALTER SYSTEM SET default_timestamp_interval = '100ms';
+```bash
+grpcurl -plaintext -unix \
+  $RUN_DIR/metashard-$METASHARD_ID/grpc.sock \
+  mz_persist.gen.consensus_service.ConsensusMetashard/GetPartitionMap
 ```
 
-Or per-source:
+This returns the partition map with the log shard IDs the metashard generated.
+Note the `log_shard` value for the next steps (e.g.
+`s11111111-1111-1111-1111-111111111111`).
 
-```sql
-ALTER SOURCE my_src SET (TIMESTAMP INTERVAL = '100ms');
+**Terminal 3 -- Acceptor** (using the shard ID from step 2):
+
+```bash
+export PERSIST_SHARD_ID=<shard-id-from-step-2>
+
+cargo run -p mz-persist-shared-log -- acceptor \
+  --run-dir $RUN_DIR \
+  --shard-id $PERSIST_SHARD_ID \
+  --blob-url $PERSIST_BLOB_URL \
+  --consensus-url $PERSIST_CONSENSUS_URL
+```
+
+**Terminal 4 -- Learner** (same shard ID):
+
+```bash
+cargo run -p mz-persist-shared-log -- learner \
+  --run-dir $RUN_DIR \
+  --shard-id $PERSIST_SHARD_ID \
+  --replica-id 0 \
+  --blob-url $PERSIST_BLOB_URL \
+  --consensus-url $PERSIST_CONSENSUS_URL
+```
+
+**Terminal 5 -- Router:**
+
+```bash
+cargo run -p mz-persist-shared-log -- router \
+  --run-dir $RUN_DIR \
+  --metashard-id $METASHARD_ID \
+  --listen-addr 0.0.0.0:6890 \
+  --blob-url $PERSIST_BLOB_URL \
+  --consensus-url $PERSIST_CONSENSUS_URL
+```
+
+The router listens on TCP `:6890` for client requests and connects to actors
+via Unix sockets under `$RUN_DIR`.
+
+**Terminal 6 -- Test a write:**
+
+```bash
+grpcurl -plaintext -d '{
+  "key": "test-key",
+  "new": {"seqno": 1, "data": "aGVsbG8="}
+}' localhost:6890 \
+  mz_persist.gen.consensus_service.PersistSharedLog/CompareAndSet
+```
+
+### Socket path layout
+
+In distributed mode, each actor listens on a deterministic Unix socket path:
+
+```
+$RUN_DIR/
+  metashard-<metashard_id>/grpc.sock      # metashard gRPC (grpcurl-able)
+  metashard-<metashard_id>/pubsub.sock    # metashard persist pubsub
+  acceptor-<shard_id>/grpc.sock           # acceptor gRPC
+  pubsub-<shard_id>/grpc.sock             # acceptor-hosted persist pubsub
+  learner-<shard_id>-0/grpc.sock          # learner replica 0
+  learner-<shard_id>-1/grpc.sock          # learner replica 1 (optional)
+```
+
+The router discovers learner replicas by globbing
+`learner-<shard_id>-*/grpc.sock`.
+
+## Running the benchmarks
+
+```bash
+cargo run --release --example spec -- --num-keys 100 --ops-per-key 100
+```
+
+## Running the tests
+
+```bash
+cargo test -p mz-persist-shared-log --lib
 ```
