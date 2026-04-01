@@ -125,9 +125,13 @@ async fn reset_state(storage: &StorageArgs, run_dir: Option<&std::path::Path>) {
             }
         });
         client
-            .batch_execute("DROP SCHEMA IF EXISTS consensus CASCADE; CREATE SCHEMA IF NOT EXISTS consensus")
+            .batch_execute(
+                "DROP TABLE IF EXISTS consensus; \
+                 DROP SCHEMA IF EXISTS consensus CASCADE; \
+                 CREATE SCHEMA IF NOT EXISTS consensus",
+            )
             .await
-            .expect("reset consensus schema");
+            .expect("reset consensus state");
     }
 
     // Delete run directory (stale sockets, PID files).
