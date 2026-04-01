@@ -201,6 +201,7 @@ async fn run(args: Args) {
     // log shard actors. The metashard actor needs it for reconfiguration
     // but doesn't use it during construction.
     let empty_routing = Arc::new(RwLock::new(RoutingState::empty()));
+    let routing_notify = Arc::new(tokio::sync::Notify::new());
 
     let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
 
@@ -210,6 +211,7 @@ async fn run(args: Args) {
         persist_client.clone(),
         Arc::clone(&factory),
         Arc::clone(&empty_routing),
+        Arc::clone(&routing_notify),
         metashard_shard_id,
     )
     .await;

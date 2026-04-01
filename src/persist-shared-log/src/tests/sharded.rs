@@ -130,6 +130,7 @@ async fn spawn_metashard(
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle,
+        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await
@@ -391,6 +392,7 @@ async fn test_reconfiguration_split() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle,
+        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -530,6 +532,7 @@ async fn test_reconfiguration_state_carryforward() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle,
+        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -632,6 +635,7 @@ async fn test_multi_shard_workload_with_reconfiguration() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle,
+        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -871,6 +875,7 @@ async fn test_shard_ownership_invariant_after_split() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle,
+        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -1100,6 +1105,7 @@ async fn test_no_silent_loss_during_reconfiguration() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle,
+        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -1249,6 +1255,7 @@ async fn test_restart_after_reconfiguration_preserves_state() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle1,
+        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1310,6 +1317,7 @@ async fn test_restart_after_reconfiguration_preserves_state() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle2,
+        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1389,6 +1397,7 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle1,
+        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1455,6 +1464,7 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle2,
+        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1518,6 +1528,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle1,
+        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1600,6 +1611,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle2,
+        Arc::new(tokio::sync::Notify::new()),
         metashard_shard,
     )
     .await;
@@ -1690,6 +1702,7 @@ async fn test_concurrent_linearizability_during_reconfig() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle,
+        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
@@ -1931,6 +1944,7 @@ async fn test_buggify_reconfiguration_recovery() {
             client.clone(),
             InProcessActorFactory::new(client.clone()),
             routing_handle,
+            Arc::new(tokio::sync::Notify::new()),
             ShardId::new(),
         )
         .await;
@@ -2058,6 +2072,7 @@ async fn test_buggify_post_commit_injection_points() {
             client.clone(),
             InProcessActorFactory::new(client.clone()),
             routing_handle,
+            Arc::new(tokio::sync::Notify::new()),
             ShardId::new(),
         )
         .await;

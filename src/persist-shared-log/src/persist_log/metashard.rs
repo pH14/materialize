@@ -237,6 +237,9 @@ pub struct PersistMetashardActor<F: ActorFactory> {
     factory: F,
     /// Handle to the ShardedService's routing state, for atomic swaps during reconfiguration.
     routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
+    /// Notify handle — signaled after routing swaps so the ShardedService's
+    /// sealed-retry waiters wake up immediately.
+    routing_notify: Arc<tokio::sync::Notify>,
     /// Whether a reconfiguration is currently in progress.
     reconfiguring: bool,
     /// Persist shard for durable metashard state. The partition map and
@@ -257,6 +260,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         persist_client: PersistClient,
         factory: F,
         routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
+        routing_notify: Arc<tokio::sync::Notify>,
         metashard_shard_id: ShardId,
     ) -> (Self, PersistMetashardHandle) {
         let (tx, rx) = mpsc::channel(queue_depth);
@@ -431,6 +435,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             persist_client,
             factory,
             routing,
+            routing_notify,
             reconfiguring: false,
             metashard_shard_id,
             metashard_write,
@@ -588,6 +593,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
                 learners: Arc::new(learners),
             };
         }
+        self.routing_notify.notify_waiters();
         info!(
             epoch = self.state.epoch,
             num_shards = map.ranges.len(),
@@ -934,6 +940,9 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             new_partition_map
         };
 
+        // Wake any ShardedService sealed-retry waiters.
+        self.routing_notify.notify_waiters();
+
         // Track new log shards in metashard state.
         for range in &new_map.ranges {
             if added.contains(&range.log_shard) {
@@ -1105,6 +1114,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         persist_client: PersistClient,
         factory: F,
         routing: Arc<RwLock<RoutingState<F::A, F::L>>>,
+        routing_notify: Arc<tokio::sync::Notify>,
         metashard_shard_id: ShardId,
     ) -> (PersistMetashardHandle, mz_ore::task::JoinHandle<()>) {
         let (actor, handle) = Self::new(
@@ -1113,6 +1123,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             persist_client,
             factory,
             routing,
+            routing_notify,
             metashard_shard_id,
         )
         .await;
@@ -1374,6 +1385,7 @@ mod tests {
             client.clone(),
             factory,
             Arc::clone(&routing),
+            Arc::new(tokio::sync::Notify::new()),
             metashard_shard,
         )
         .await;
@@ -1393,6 +1405,7 @@ mod tests {
             client.clone(),
             factory2,
             Arc::clone(&routing),
+            Arc::new(tokio::sync::Notify::new()),
             metashard_shard,
         )
         .await;

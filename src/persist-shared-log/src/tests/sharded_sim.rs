@@ -522,6 +522,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
         client.clone(),
         InProcessActorFactory::new(client.clone()),
         routing_handle,
+        Arc::new(tokio::sync::Notify::new()),
         ShardId::new(),
     )
     .await;
