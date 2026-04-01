@@ -47,8 +47,8 @@ use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::rpc::PubSubClientConnection;
 use mz_persist_client::{PersistClient, PersistLocation, ShardId};
-use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
-use crate::persist_log::router::Router;
+use crate::actors::metashard::{MetashardState, PersistMetashardActor};
+use crate::actors::router::Router;
 use crate::factory::InProcessActorFactory;
 use crate::{PartitionMap, RangeAssignment, ReconfigurationPlan};
 
@@ -133,7 +133,7 @@ fn sim_cluster_smoke() {
         )
         .await;
 
-        crate::persist_log::router::spawn_routing_task(
+        crate::actors::router::spawn_routing_task(
             &client,
             ms_shard,
             factory,
@@ -233,7 +233,7 @@ fn sim_cluster_crash_restart() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::persist_log::router::spawn_routing_task(
+            crate::actors::router::spawn_routing_task(
                 &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
             router.wait_for_routing().await;
@@ -282,7 +282,7 @@ fn sim_cluster_crash_restart() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::persist_log::router::spawn_routing_task(
+            crate::actors::router::spawn_routing_task(
                 &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
             router.wait_for_routing().await;
@@ -364,7 +364,7 @@ fn sim_cluster_persist_partition() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::persist_log::router::spawn_routing_task(
+            crate::actors::router::spawn_routing_task(
                 &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
             router.wait_for_routing().await;
@@ -412,7 +412,7 @@ fn sim_cluster_persist_partition() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::persist_log::router::spawn_routing_task(
+            crate::actors::router::spawn_routing_task(
                 &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
             router.wait_for_routing().await;
@@ -546,7 +546,7 @@ fn sim_cluster_split_with_writes() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::persist_log::router::spawn_routing_task(
+            crate::actors::router::spawn_routing_task(
                 &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
             router.wait_for_routing().await;
@@ -663,7 +663,7 @@ fn sim_cluster_reconfig_with_buggify() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::persist_log::router::spawn_routing_task(
+            crate::actors::router::spawn_routing_task(
                 &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
             router.wait_for_routing().await;
@@ -764,7 +764,7 @@ fn sim_cluster_split_during_persist_partition() {
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
-            crate::persist_log::router::spawn_routing_task(
+            crate::actors::router::spawn_routing_task(
                 &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
             ).await;
             router.wait_for_routing().await;

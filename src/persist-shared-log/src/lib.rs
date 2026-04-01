@@ -42,7 +42,7 @@ pub mod factory;
 pub mod fault;
 pub mod latency_blob;
 pub mod metrics;
-pub mod persist_log;
+pub mod actors;
 pub mod process_factory;
 pub mod rpc;
 pub mod uds;
@@ -365,7 +365,7 @@ pub trait RetractionSource: Send + Sync + 'static {
     async fn get_retractions(
         &self,
         frontier: u64,
-    ) -> Vec<(persist_log::OrderedKey, persist_log::Proposal)>;
+    ) -> Vec<(actors::OrderedKey, actors::Proposal)>;
 }
 
 /// A no-op retraction source that always returns an empty list.
@@ -379,7 +379,7 @@ impl RetractionSource for NoOpRetractionSource {
     async fn get_retractions(
         &self,
         _frontier: u64,
-    ) -> Vec<(persist_log::OrderedKey, persist_log::Proposal)> {
+    ) -> Vec<(actors::OrderedKey, actors::Proposal)> {
         Vec::new()
     }
 }

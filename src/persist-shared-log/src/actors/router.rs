@@ -34,8 +34,8 @@ use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
 use crate::factory::ActorFactory;
-use crate::persist_log::metashard::PersistMetashardHandle;
-use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
+use crate::actors::metashard::PersistMetashardHandle;
+use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 // ---------------------------------------------------------------------------
@@ -45,11 +45,11 @@ use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, Reconfi
 /// Implements [`RetractionSource`] by fanning out to learner replicas and
 /// returning the first response.
 pub struct ShardedRetractionSource {
-    learners: Vec<crate::persist_log::learner::PersistLearnerHandle>,
+    learners: Vec<crate::actors::learner::PersistLearnerHandle>,
 }
 
 impl ShardedRetractionSource {
-    pub fn new(learners: Vec<crate::persist_log::learner::PersistLearnerHandle>) -> Self {
+    pub fn new(learners: Vec<crate::actors::learner::PersistLearnerHandle>) -> Self {
         ShardedRetractionSource { learners }
     }
 }

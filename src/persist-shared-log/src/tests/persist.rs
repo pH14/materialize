@@ -23,9 +23,9 @@ use mz_ore::metrics::MetricsRegistry;
 use crate::Acceptor as _;
 use crate::AcceptorConfig;
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
-use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
-use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
-use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
+use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
+use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 
 // ---------------------------------------------------------------------------
 // Persist client helper

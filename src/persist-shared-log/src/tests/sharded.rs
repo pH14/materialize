@@ -25,11 +25,11 @@ use mz_ore::metrics::MetricsRegistry;
 
 use crate::factory::InProcessActorFactory;
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
-use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
-use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
-use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
-use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
-use crate::persist_log::router::Router;
+use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
+use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::actors::metashard::{MetashardState, PersistMetashardActor};
+use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
+use crate::actors::router::Router;
 use crate::{Acceptor, AcceptorConfig, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 async fn new_persist_client_for_test() -> PersistClient {
@@ -118,7 +118,7 @@ async fn spawn_metashard_with_routing(
     client: &PersistClient,
     partition_map: PartitionMap,
     router: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
-) -> crate::persist_log::metashard::PersistMetashardHandle {
+) -> crate::actors::metashard::PersistMetashardHandle {
     spawn_metashard_with_routing_and_shard_id(client, partition_map, router, ShardId::new()).await
 }
 
@@ -130,7 +130,7 @@ async fn spawn_metashard_with_routing_and_shard_id(
     partition_map: PartitionMap,
     router: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
     metashard_shard_id: ShardId,
-) -> crate::persist_log::metashard::PersistMetashardHandle {
+) -> crate::actors::metashard::PersistMetashardHandle {
     let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
     let metashard_state = MetashardState {
         epoch: partition_map.epoch,
@@ -149,7 +149,7 @@ async fn spawn_metashard_with_routing_and_shard_id(
     mz_ore::task::spawn(|| "test-metashard", _metashard_actor.run());
 
     // Spawn routing task so the Router picks up partition map changes.
-    crate::persist_log::router::spawn_routing_task(
+    crate::actors::router::spawn_routing_task(
         client,
         metashard_shard_id,
         factory,

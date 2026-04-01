@@ -45,9 +45,9 @@ use mz_persist::generated::consensus_service::{
     ProtoScanRequest, ProtoScanResponse, ProtoTruncateResponse,
 };
 
-use crate::persist_log::acceptor::PersistAcceptorHandle;
-use crate::persist_log::learner::PersistLearnerHandle;
-use crate::persist_log::{OrderedKey, Proposal};
+use crate::actors::acceptor::PersistAcceptorHandle;
+use crate::actors::learner::PersistLearnerHandle;
+use crate::actors::{OrderedKey, Proposal};
 use crate::{Acceptor, AcceptorError, LearnerError, Metashard};
 
 // ---------------------------------------------------------------------------
@@ -536,11 +536,11 @@ impl consensus_learner_server::ConsensusLearner for LearnerGrpcServer {
 /// Used by standalone metashard binaries so operators can `grpcurl` the
 /// partition map to discover shard IDs before starting acceptors/learners.
 pub struct MetashardGrpcServer {
-    handle: crate::persist_log::metashard::PersistMetashardHandle,
+    handle: crate::actors::metashard::PersistMetashardHandle,
 }
 
 impl MetashardGrpcServer {
-    pub fn new(handle: crate::persist_log::metashard::PersistMetashardHandle) -> Self {
+    pub fn new(handle: crate::actors::metashard::PersistMetashardHandle) -> Self {
         MetashardGrpcServer { handle }
     }
 }

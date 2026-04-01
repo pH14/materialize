@@ -26,10 +26,10 @@ use mz_persist_client::{PersistClient, ShardId};
 
 use crate::directory::ServiceDirectory;
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
-use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
-use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
+use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
 use crate::rpc::{GrpcAcceptorHandle, GrpcLearnerHandle};
-use crate::persist_log::router::ShardedRetractionSource;
+use crate::actors::router::ShardedRetractionSource;
 use crate::{Acceptor, AcceptorConfig, Learner, RangeAssignment};
 
 // ---------------------------------------------------------------------------

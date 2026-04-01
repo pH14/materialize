@@ -37,11 +37,11 @@ use mz_persist_client::rpc::{
 };
 use mz_persist_client::{PersistClient, ShardId};
 use mz_persist_shared_log::factory::InProcessActorFactory;
-use mz_persist_shared_log::persist_log::metashard::{MetashardState, PersistMetashardActor};
+use mz_persist_shared_log::actors::metashard::{MetashardState, PersistMetashardActor};
 use mz_persist_shared_log::rpc::{
     AcceptorGrpcServer, ConsensusAcceptorServer, ConsensusLearnerServer, LearnerGrpcServer,
 };
-use mz_persist_shared_log::persist_log::router::Router;
+use mz_persist_shared_log::actors::router::Router;
 use mz_persist_shared_log::{AcceptorConfig, PartitionMap, RangeAssignment};
 
 /// Persist shared log service.
@@ -621,7 +621,7 @@ async fn run_monolith(args: MonolithArgs) {
         BTreeMap::new(),
         BTreeMap::new(),
     );
-    mz_persist_shared_log::persist_log::router::spawn_routing_task(
+    mz_persist_shared_log::actors::router::spawn_routing_task(
         &persist_client,
         metashard_shard_id,
         Arc::clone(&factory),
@@ -695,7 +695,7 @@ async fn run_acceptor(args: AcceptorArgs) {
         })
         .collect();
 
-    let (handle, _task) = mz_persist_shared_log::persist_log::acceptor::PersistAcceptor::spawn(
+    let (handle, _task) = mz_persist_shared_log::actors::acceptor::PersistAcceptor::spawn(
         AcceptorConfig::default(),
         &persist_client,
         shard_id,
@@ -749,8 +749,8 @@ async fn run_learner(args: LearnerArgs) {
     let learner_metrics =
         mz_persist_shared_log::metrics::LearnerMetrics::register(&shard_registry);
 
-    let (handle, _task) = mz_persist_shared_log::persist_log::learner::PersistLearner::spawn(
-        mz_persist_shared_log::persist_log::learner::PersistLearnerConfig::default(),
+    let (handle, _task) = mz_persist_shared_log::actors::learner::PersistLearner::spawn(
+        mz_persist_shared_log::actors::learner::PersistLearnerConfig::default(),
         &persist_client,
         shard_id,
         learner_metrics,
@@ -933,10 +933,10 @@ async fn run_router(args: RouterArgs) {
     // metashard persist shard.
     let router = Router::from_routing(Arc::new(
         tokio::sync::RwLock::new(
-            mz_persist_shared_log::persist_log::router::RoutingSnapshot::empty(),
+            mz_persist_shared_log::actors::router::RoutingSnapshot::empty(),
         ),
     ));
-    mz_persist_shared_log::persist_log::router::spawn_routing_task(
+    mz_persist_shared_log::actors::router::spawn_routing_task(
         &persist_client,
         metashard_shard_id,
         Arc::clone(&factory),

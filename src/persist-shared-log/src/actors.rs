@@ -7,18 +7,106 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Acceptor and learner implementation backed by a persist shard.
+//! Actor implementations for the shared log service.
 //!
-//! The `WriteHandle` drives the acceptor (blind writes); the
-//! `ReadHandle`/`Subscribe` drives the learner (CAS evaluation + reads).
-//! Data lives in differential format.
+//! # Why actors?
 //!
-//! A single persist shard stores all proposals:
+//! Each component is a message-driven actor: an async task that owns private
+//! state and communicates exclusively through typed command channels (mpsc).
+//! This design has two key benefits:
+//!
+//! - **No shared mutable state.** All state is owned by a single task. There
+//!   are no mutexes, no lock ordering concerns, no data races. The actor
+//!   processes one command at a time, making the state machine easy to reason
+//!   about.
+//!
+//! - **Deterministic simulation testing.** Because actors interact only through
+//!   message channels and persist APIs (which go through turmoil's simulated
+//!   network), the entire system can run under turmoil with a fixed seed and
+//!   produce identical traces. This is the foundation of our DST suite — see
+//!   `tests/persist_sim.rs` and `tests/sim_cluster.rs`.
+//!
+//! # Actors
+//!
+//! - **[`metashard::PersistMetashardActor`]** — Partition map authority.
+//!   Manages the mapping from key ranges to log shards. Persists its state to
+//!   a dedicated persist shard (the "meta shard") for crash recovery. Drives
+//!   reconfiguration (split/merge). At startup, creates acceptor and learner
+//!   actors for all shards in the partition map via the [`ActorFactory`].
+//!
+//! - **[`acceptor::PersistAcceptor`]** — Blind group commit. Receives CAS and
+//!   truncate proposals, batches them, flushes to a persist shard. Returns
+//!   receipts (batch number + position) but does not evaluate CAS — that's
+//!   the learner's job.
+//!
+//! - **[`learner::PersistLearner`]** — State machine. Subscribes to the
+//!   acceptor's persist shard, evaluates CAS proposals during playback,
+//!   materializes state, serves reads (head, scan, list_keys) and result
+//!   queries (await_cas_result, await_truncate_result).
+//!
+//! - **[`router::Router`]** — Request router. Routes client gRPC requests to
+//!   the correct acceptor/learner based on the partition map. Subscribes to
+//!   the meta shard for partition map updates.
+//!
+//! # Actor relationships
+//!
+//! ```text
+//!                   ┌──────────────────────┐
+//!                   │  Meta Persist Shard   │
+//!                   │  (partition map)      │
+//!                   └──────┬───────┬────────┘
+//!            writes to     │       │  subscribes to
+//!                 ┌────────┘       └────────┐
+//!                 ▼                         ▼
+//!          ┌─────────────┐          ┌──────────────┐
+//!          │  Metashard   │          │    Router     │
+//!          │  (authority) │          │  (routing)    │
+//!          └─────────────┘          └───┬──────┬────┘
+//!                                       │      │
+//!                  routes writes ────────┘      └──── routes reads
+//!                       │                               │
+//!                       ▼                               ▼
+//!          ┌────────────────────┐          ┌────────────────────┐
+//!          │     Acceptor       │          │      Learner       │
+//!          │  (blind commit)    │          │  (CAS evaluation)  │
+//!          └────────┬───────────┘          └────────┬───────────┘
+//!                   │                               │
+//!                   │    Log Persist Shard           │
+//!                   │    (proposals + diffs)         │
+//!                   └───────── writes to ────────────┘
+//!                              subscribes to ────────┘
+//! ```
+//!
+//! # Persist pubsub groups
+//!
+//! Pubsub provides instant write notifications so that subscribers don't have
+//! to poll consensus. Two pubsub groups exist:
+//!
+//! - **Meta shard pubsub** — The metashard hosts a pubsub server. The router's
+//!   routing task connects as a client. When the metashard persists a new
+//!   partition map, the router sees it instantly.
+//!
+//! - **Per-shard pubsub** — Each acceptor hosts a pubsub server. Its learner(s)
+//!   connect as clients. When the acceptor flushes a batch, the learner's
+//!   `Subscribe::fetch_next()` returns instantly instead of polling consensus.
+//!
+//! # Boundaries
+//!
+//! The acceptor and learner know nothing about the metashard or the partition
+//! map. They operate on a single persist shard identified by `ShardId`. The
+//! metashard and router are the only actors that deal with partition maps and
+//! multi-shard coordination.
+//!
+//! # Data model
+//!
+//! Each log persist shard stores proposals in differential format:
 //! - K: [`OrderedKey`] — `(batch_id, position, shard)` StructArray that gives
 //!   a stable total order through compaction
 //! - V: [`Proposal`] — serialized protobuf bytes
 //! - T: `u64` (incremented by 1 per batch, in lock-step with persist upper)
 //! - D: `i64` (+1 for proposals, -1 for learner retractions)
+//!
+//! [`ActorFactory`]: crate::factory::ActorFactory
 
 pub mod acceptor;
 pub mod learner;

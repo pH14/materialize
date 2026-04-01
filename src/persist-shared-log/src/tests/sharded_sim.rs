@@ -49,11 +49,11 @@ use mz_persist::generated::consensus_service::{
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::{PersistClient, PersistLocation, ShardId};
 
-use crate::persist_log::acceptor::{PersistAcceptor, PersistAcceptorHandle};
-use crate::persist_log::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
-use crate::persist_log::metashard::{MetashardState, PersistMetashardActor};
-use crate::persist_log::{OrderedKeySchema, ProposalSchema};
-use crate::persist_log::router::Router;
+use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
+use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::actors::metashard::{MetashardState, PersistMetashardActor};
+use crate::actors::{OrderedKeySchema, ProposalSchema};
+use crate::actors::router::Router;
 use crate::{AcceptorConfig, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 use super::scenario::{SharedLogObservation, SharedLogOp, SharedLogOracle, VersionedData};
@@ -81,7 +81,7 @@ async fn spawn_shard(
     let val_schema = Arc::new(ProposalSchema);
 
     let mut write = client
-        .open_writer::<crate::persist_log::OrderedKey, crate::persist_log::Proposal, u64, i64>(
+        .open_writer::<crate::actors::OrderedKey, crate::actors::Proposal, u64, i64>(
             shard_id,
             Arc::clone(&key_schema),
             Arc::clone(&val_schema),

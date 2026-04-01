@@ -11,7 +11,7 @@
 //!
 //! Defines the operations, observations, and sequential specification (oracle)
 //! for the persist-backed shared log. The oracle is an independent reimplementation
-//! of the learner's [`StateMachine`](crate::persist_log::learner) semantics — if
+//! of the learner's [`StateMachine`](crate::actors::learner) semantics — if
 //! both agree, we have confidence; if they diverge, we have a bug.
 //!
 //! The [`SharedLogOracle`] implements Stateright's [`SequentialSpec`] trait, so it

@@ -32,7 +32,7 @@ use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
 use crate::factory::ActorFactory;
-use crate::persist_log::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
+use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::{
     MetashardError, PartitionMap, RangeAssignment, ReconfigurationPlan,
 };

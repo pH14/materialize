@@ -36,9 +36,9 @@ use mz_persist_client::ShardId;
 use mz_persist_shared_log::Acceptor as _;
 use mz_persist_shared_log::AcceptorConfig;
 use mz_persist_shared_log::metrics::{AcceptorMetrics, LearnerMetrics};
-use mz_persist_shared_log::persist_log::acceptor::PersistAcceptor;
+use mz_persist_shared_log::actors::acceptor::PersistAcceptor;
 use mz_persist_shared_log::latency_blob::LatencyProfile;
-use mz_persist_shared_log::persist_log::learner::{PersistLearner, PersistLearnerConfig};
+use mz_persist_shared_log::actors::learner::{PersistLearner, PersistLearnerConfig};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Deserialize;
@@ -321,8 +321,8 @@ impl WorkloadConfig {
 enum Transport {
     /// Direct handles to the acceptor and learner (no serialization overhead).
     Direct {
-        acceptor: mz_persist_shared_log::persist_log::acceptor::PersistAcceptorHandle,
-        learner: mz_persist_shared_log::persist_log::learner::PersistLearnerHandle,
+        acceptor: mz_persist_shared_log::actors::acceptor::PersistAcceptorHandle,
+        learner: mz_persist_shared_log::actors::learner::PersistLearnerHandle,
     },
 }
 
