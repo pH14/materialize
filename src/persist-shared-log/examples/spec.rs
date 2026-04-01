@@ -37,7 +37,7 @@ use mz_persist_shared_log::Acceptor as _;
 use mz_persist_shared_log::AcceptorConfig;
 use mz_persist_shared_log::metrics::{AcceptorMetrics, LearnerMetrics};
 use mz_persist_shared_log::persist_log::acceptor::PersistAcceptor;
-use mz_persist_shared_log::persist_log::latency_blob::LatencyProfile;
+use mz_persist_shared_log::latency_blob::LatencyProfile;
 use mz_persist_shared_log::persist_log::learner::{PersistLearner, PersistLearnerConfig};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -1181,7 +1181,7 @@ async fn main() {
     let num_clients = cfg.num_shards * cfg.writers_per_shard;
 
     // --- Backend setup ---
-    use mz_persist_shared_log::persist_log::client::{self, PersistClientConfig};
+    use mz_persist_shared_log::bench_client::{self as client, PersistClientConfig};
     use mz_persist_shared_log::{PartitionMap, RangeAssignment};
 
     let num_log_shards = cli_num_log_shards;

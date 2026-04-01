@@ -35,7 +35,7 @@ use mz_persist_client::metrics::Metrics;
 use mz_persist_client::rpc::PersistGrpcPubSubServer;
 use mz_persist_client::stats::STATS_COLLECTION_ENABLED;
 
-use super::latency_blob::{LatencyBlob, LatencyProfile};
+use crate::latency_blob::{LatencyBlob, LatencyProfile};
 
 /// Configuration for building a [`PersistClient`] with in-process pubsub.
 pub struct PersistClientConfig {

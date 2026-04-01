@@ -21,8 +21,6 @@
 //! - D: `i64` (+1 for proposals, -1 for learner retractions)
 
 pub mod acceptor;
-pub mod client;
-pub mod latency_blob;
 pub mod learner;
 pub mod metashard;
 pub mod router;
