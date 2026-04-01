@@ -64,8 +64,9 @@ cargo run -p mz-persist-shared-log -- metashard \
 **Terminal 2 -- Discover shard IDs:**
 
 ```bash
-grpcurl -plaintext -unix \
-  $RUN_DIR/metashard-$METASHARD_ID/grpc.sock \
+grpcurl -plaintext \
+  -proto src/persist/src/consensus_service.proto \
+  unix:///$RUN_DIR/metashard-$METASHARD_ID/grpc.sock \
   mz_persist.gen.consensus_service.ConsensusMetashard/GetPartitionMap
 ```
 
