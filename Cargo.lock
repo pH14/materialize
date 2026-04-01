@@ -7421,6 +7421,7 @@ dependencies = [
  "stateright",
  "timely 0.28.0",
  "tokio",
+ "tokio-postgres",
  "tokio-stream",
  "tonic",
  "tower 0.5.3",

@@ -99,6 +99,48 @@ struct StorageArgs {
     consensus_url: String,
 }
 
+/// Delete all state from prior runs: blob directory, consensus schema, run directory.
+async fn reset_state(storage: &StorageArgs, run_dir: Option<&std::path::Path>) {
+    info!("--reset: clearing all prior state");
+
+    // Delete blob directory (file:///path → /path).
+    if let Some(path) = storage.blob_url.strip_prefix("file://") {
+        let path = std::path::Path::new(path);
+        if path.exists() {
+            info!(?path, "deleting blob directory");
+            std::fs::remove_dir_all(path).expect("delete blob directory");
+        }
+    }
+
+    // Drop and recreate the consensus schema in Postgres.
+    if storage.consensus_url.starts_with("postgres://") {
+        info!("dropping and recreating consensus schema");
+        let (client, connection) =
+            tokio_postgres::connect(&storage.consensus_url, tokio_postgres::NoTls)
+                .await
+                .expect("connect to postgres for reset");
+        mz_ore::task::spawn(|| "pg-reset-conn", async move {
+            if let Err(e) = connection.await {
+                error!("postgres connection error during reset: {e}");
+            }
+        });
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS consensus CASCADE; CREATE SCHEMA IF NOT EXISTS consensus")
+            .await
+            .expect("reset consensus schema");
+    }
+
+    // Delete run directory (stale sockets, PID files).
+    if let Some(run_dir) = run_dir {
+        if run_dir.exists() {
+            info!(?run_dir, "deleting run directory");
+            std::fs::remove_dir_all(run_dir).expect("delete run directory");
+        }
+    }
+
+    info!("reset complete");
+}
+
 /// Create a persist config suitable for the shared log service.
 fn new_persist_config() -> PersistConfig {
     PersistConfig::new_default_configs(
@@ -208,6 +250,10 @@ async fn open_persist_client_with_remote_pubsub(
 /// Arguments for monolith mode (all actors in one process).
 #[derive(clap::Args, Debug)]
 struct MonolithArgs {
+    /// Delete all prior state (blob, consensus, run directory) before starting.
+    #[arg(long)]
+    reset: bool,
+
     /// Address to listen on for gRPC connections.
     #[arg(long, default_value = "0.0.0.0:6890")]
     listen_addr: SocketAddr,
@@ -310,6 +356,10 @@ struct LearnerArgs {
 /// Arguments for standalone metashard mode.
 #[derive(clap::Args, Debug)]
 struct MetashardArgs {
+    /// Delete all prior state (blob, consensus, run directory) before starting.
+    #[arg(long)]
+    reset: bool,
+
     /// Shared run directory for Unix domain sockets.
     #[arg(long, env = "RUN_DIR")]
     run_dir: std::path::PathBuf,
@@ -451,6 +501,16 @@ fn build_partition_map(shard_ids: &[ShardId]) -> PartitionMap {
 // ===========================================================================
 
 async fn run_monolith(args: MonolithArgs) {
+    if args.reset {
+        if let (Some(blob_url), Some(consensus_url)) = (&args.blob_url, &args.consensus_url) {
+            let storage = StorageArgs {
+                blob_url: blob_url.clone(),
+                consensus_url: consensus_url.clone(),
+            };
+            reset_state(&storage, None).await;
+        }
+    }
+
     let metrics_registry = MetricsRegistry::new();
     spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
 
@@ -677,6 +737,10 @@ async fn run_learner(args: LearnerArgs) {
 
 async fn run_metashard(args: MetashardArgs) {
     use mz_persist_shared_log::rpc::{ConsensusMetashardServer, MetashardGrpcServer};
+
+    if args.reset {
+        reset_state(&args.storage, Some(&args.run_dir)).await;
+    }
 
     let metrics_registry = MetricsRegistry::new();
     spawn_metrics_server(args.metrics_listen_addr, metrics_registry.clone());
