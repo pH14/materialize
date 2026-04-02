@@ -26,27 +26,25 @@ shards via the `ActorFactory`.
 
 ### Acceptor (`acceptor.rs`)
 
-Blind group commit. Receives CAS and truncate proposals via its command
-channel, batches them, and flushes to a persist shard using
-`compare_and_append`. Returns receipts (batch number + position) but does NOT
-evaluate CAS — proposals are appended unconditionally. The learner evaluates
-them during playback.
+Blind group commit. Receives CAS and truncate proposals, batches them, and
+flushes to a persist shard. Returns receipts (batch number + position) but
+does NOT evaluate CAS — proposals are appended unconditionally. The learner
+evaluates them during playback.
 
 ### Learner (`learner.rs`)
 
 Replicated state machine. Each learner subscribes to the acceptor's persist
-shard via `Subscribe::fetch_next()` and deterministically replays the same
-ordered log of proposals. Because every replica processes the same log in the
-same order, they all converge to identical state — any replica can serve reads.
-During playback, the learner evaluates CAS preconditions, materializes state,
-and serves reads (head, scan, list_keys) and result queries (await_cas_result,
-await_truncate_result).
+shard and deterministically replays the same ordered log of proposals. Because
+every replica processes the same log in the same order, they all converge to
+identical state — any replica can serve reads. During playback, the learner
+evaluates CAS preconditions, materializes state, and serves reads and result
+queries.
 
 ### Router (`router.rs`)
 
-Request router. Routes client gRPC requests to the correct acceptor/learner
-based on the partition map. Subscribes to the meta shard for partition map
-updates via a background routing task.
+Client-facing entry point. Clients connect to the router, which routes each
+request to the correct acceptor or learner based on the partition map.
+Subscribes to the meta shard for partition map updates.
 
 ## Actor relationships
 
