@@ -6,8 +6,6 @@ command channels (mpsc). This directory contains their implementations.
 
 ## Why actors?
 
-Two reasons:
-
 **No shared mutable state.** All state is owned by a single task — no mutexes,
 no lock ordering concerns. Each actor processes one command at a time, making
 the state machine straightforward to reason about.
@@ -36,10 +34,13 @@ them during playback.
 
 ### Learner (`learner.rs`)
 
-State machine. Subscribes to the acceptor's persist shard via
-`Subscribe::fetch_next()`, evaluates CAS proposals during playback,
-materializes state, and serves reads (head, scan, list_keys) and result
-queries (await_cas_result, await_truncate_result).
+Replicated state machine. Each learner subscribes to the acceptor's persist
+shard via `Subscribe::fetch_next()` and deterministically replays the same
+ordered log of proposals. Because every replica processes the same log in the
+same order, they all converge to identical state — any replica can serve reads.
+During playback, the learner evaluates CAS preconditions, materializes state,
+and serves reads (head, scan, list_keys) and result queries (await_cas_result,
+await_truncate_result).
 
 ### Router (`router.rs`)
 
@@ -53,17 +54,17 @@ updates via a background routing task.
   ┌─ meta shard ──────────────────────────────────────────────┐
   │                                                           │
   │  ┌─────────────┐       ┌─────────────────────────────┐    │
-  │  │  Metashard   │       │     Meta Persist Shard      │    │
-  │  │  (authority) │──────▶│     (partition map)          │    │
+  │  │  Metashard   │       │     Meta Persist Shard     │    │
+  │  │  (authority) │──────▶│     (partition map)        │    │
   │  └─────────────┘       └──────────────┬──────────────┘    │
   │                                       │                   │
   └───────────────────────────────────────│───────────────────┘
                                           │ subscribes to
                                           ▼
                                    ┌─────────────┐
-                                   │   Router(s)  │
-                                   └──┬───────┬───┘
-                          writes      │       │     reads
+                                   │   Router(s) │
+                                   └──┬───────┬──┘
+                       writes / reads │       │ to each shard range
                        ┌──────────────┘       └──────────────┐
                        ▼                                     ▼
   ┌─ log shard 0 ──────────────────┐  ┌─ log shard 1 ──────────────────┐
