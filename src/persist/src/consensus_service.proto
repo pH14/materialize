@@ -37,11 +37,6 @@ service ConsensusLearner {
   rpc Head(ProtoHeadRequest) returns (ProtoHeadResponse);
   rpc Scan(ProtoScanRequest) returns (ProtoScanResponse);
   rpc ListKeys(ProtoListKeysRequest) returns (stream ProtoListKeysResponse);
-  // Return pending retractions for proposals evaluated through the given upper.
-  // Non-destructive: the learner retains entries until -1 diffs arrive via
-  // subscription. Called by the acceptor (via the serving layer) to source
-  // retractions for inclusion in its flush batches.
-  rpc GetRetractions(ProtoGetRetractionsRequest) returns (ProtoGetRetractionsResponse);
 }
 
 // Metashard: partition map authority. Manages the mapping from key ranges to
@@ -62,8 +57,6 @@ service PersistSharedLog {
   rpc ListKeys(ProtoListKeysRequest) returns (stream ProtoListKeysResponse);
   rpc CompareAndSet(ProtoCompareAndSetRequest) returns (ProtoCompareAndSetResponse);
   rpc Truncate(ProtoTruncateRequest) returns (ProtoTruncateResponse);
-  // Trigger a reconfiguration to a new number of shards.
-  rpc Reconfigure(ProtoReconfigureRequest) returns (ProtoReconfigureResponse);
 }
 
 // --- Acceptor request/response messages ---
@@ -112,26 +105,6 @@ message ProtoReconfigurationIntent {
   string status = 1;      // "Preparing", "Sealed", "Committed"
   uint64 epoch = 2;       // target epoch
   repeated ProtoRangeAssignment new_ranges = 3; // target partition map
-}
-
-// --- Retraction messages ---
-
-message ProtoGetRetractionsRequest {
-  // Return retractions for proposals evaluated through this upper.
-  uint64 through_upper = 1;
-}
-
-message ProtoGetRetractionsResponse {
-  repeated ProtoRetractionEntry entries = 1;
-}
-
-message ProtoRetractionEntry {
-  // OrderedKey fields.
-  uint64 batch_id = 1;
-  uint32 position = 2;
-  string shard = 3;
-  // Serialized Proposal (protobuf bytes).
-  bytes proposal = 4;
 }
 
 // --- Learner request/response messages ---

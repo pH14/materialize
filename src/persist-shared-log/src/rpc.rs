@@ -30,24 +30,20 @@
 //! See also: `persist-client/src/rpc.rs` for the Persist PubSub pattern that
 //! inspired this design.
 
-use bytes::Bytes;
 use tokio_stream::StreamExt;
-use tracing::debug;
 
 use mz_persist::generated::consensus_service::consensus_acceptor_client::ConsensusAcceptorClient;
 use mz_persist::generated::consensus_service::consensus_acceptor_server;
 use mz_persist::generated::consensus_service::consensus_learner_client::ConsensusLearnerClient;
 use mz_persist::generated::consensus_service::consensus_learner_server;
 use mz_persist::generated::consensus_service::{
-    ProtoAppendRequest, ProtoAppendResponse, ProtoAwaitResultRequest,
-    ProtoCompareAndSetResponse, ProtoGetRetractionsRequest, ProtoHeadRequest,
-    ProtoHeadResponse, ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal,
-    ProtoScanRequest, ProtoScanResponse, ProtoTruncateResponse,
+    ProtoAppendRequest, ProtoAppendResponse, ProtoAwaitResultRequest, ProtoCompareAndSetResponse,
+    ProtoHeadRequest, ProtoHeadResponse, ProtoListKeysRequest, ProtoListKeysResponse,
+    ProtoLogProposal, ProtoScanRequest, ProtoScanResponse, ProtoTruncateResponse,
 };
 
 use crate::actors::acceptor::PersistAcceptorHandle;
 use crate::actors::learner::PersistLearnerHandle;
-use crate::actors::{OrderedKey, Proposal};
 use crate::{Acceptor, AcceptorError, LearnerError, Metashard};
 
 // ---------------------------------------------------------------------------
@@ -307,64 +303,6 @@ impl crate::Learner for GrpcLearnerHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GrpcRetractionSource
-// ---------------------------------------------------------------------------
-
-/// A `RetractionSource` that fetches retractions from a remote learner via gRPC.
-///
-/// Used by acceptor processes in multi-process mode: the acceptor needs to poll
-/// the learner for pending retractions, but the learner runs in a different
-/// process.
-pub struct GrpcRetractionSource {
-    client: ConsensusLearnerClient<tonic::transport::Channel>,
-}
-
-impl GrpcRetractionSource {
-    pub fn new(client: ConsensusLearnerClient<tonic::transport::Channel>) -> Self {
-        GrpcRetractionSource { client }
-    }
-
-    pub async fn from_addr(addr: String) -> Result<Self, tonic::transport::Error> {
-        let client = ConsensusLearnerClient::connect(addr).await?;
-        Ok(GrpcRetractionSource { client })
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::RetractionSource for GrpcRetractionSource {
-    async fn get_retractions(
-        &self,
-        frontier: u64,
-    ) -> Vec<(OrderedKey, Proposal)> {
-        let request = ProtoGetRetractionsRequest { through_upper: frontier };
-        match self.client.clone().get_retractions(request).await {
-            Ok(response) => {
-                let proto = response.into_inner();
-                proto
-                    .entries
-                    .into_iter()
-                    .map(|e| {
-                        let key = OrderedKey {
-                            batch_id: e.batch_id,
-                            position: e.position,
-                            shard: e.shard,
-                        };
-                        let proposal = Proposal {
-                            encoded: Bytes::from(e.proposal),
-                        };
-                        (key, proposal)
-                    })
-                    .collect()
-            }
-            Err(e) => {
-                debug!("gRPC get_retractions failed: {}", e);
-                Vec::new()
-            }
-        }
-    }
-}
-
 // ===========================================================================
 // Server adapters (in-process handle -> gRPC server trait)
 // ===========================================================================
@@ -456,7 +394,11 @@ impl consensus_learner_server::ConsensusLearner for LearnerGrpcServer {
         request: tonic::Request<ProtoHeadRequest>,
     ) -> Result<tonic::Response<ProtoHeadResponse>, tonic::Status> {
         let req = request.into_inner();
-        let response = self.handle.head(req.key).await.map_err(tonic::Status::from)?;
+        let response = self
+            .handle
+            .head(req.key)
+            .await
+            .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(response))
     }
 
@@ -492,37 +434,6 @@ impl consensus_learner_server::ConsensusLearner for LearnerGrpcServer {
         Ok(tonic::Response::new(
             tokio_stream::wrappers::ReceiverStream::new(rx),
         ))
-    }
-
-    async fn get_retractions(
-        &self,
-        request: tonic::Request<ProtoGetRetractionsRequest>,
-    ) -> Result<
-        tonic::Response<mz_persist::generated::consensus_service::ProtoGetRetractionsResponse>,
-        tonic::Status,
-    > {
-        use mz_persist::generated::consensus_service::{
-            ProtoGetRetractionsResponse, ProtoRetractionEntry,
-        };
-
-        let req = request.into_inner();
-        let retractions = self
-            .handle
-            .get_retractions(req.through_upper)
-            .await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-
-        let entries: Vec<ProtoRetractionEntry> = retractions
-            .into_iter()
-            .map(|(key, proposal)| ProtoRetractionEntry {
-                batch_id: key.batch_id,
-                position: key.position,
-                shard: key.shard,
-                proposal: proposal.encoded.to_vec(),
-            })
-            .collect();
-
-        Ok(tonic::Response::new(ProtoGetRetractionsResponse { entries }))
     }
 }
 
@@ -597,9 +508,7 @@ impl mz_persist::generated::consensus_service::consensus_metashard_server::Conse
 
     async fn reconfigure(
         &self,
-        request: tonic::Request<
-            mz_persist::generated::consensus_service::ProtoReconfigureRequest,
-        >,
+        request: tonic::Request<mz_persist::generated::consensus_service::ProtoReconfigureRequest>,
     ) -> Result<
         tonic::Response<mz_persist::generated::consensus_service::ProtoReconfigureResponse>,
         tonic::Status,
@@ -609,7 +518,9 @@ impl mz_persist::generated::consensus_service::consensus_metashard_server::Conse
         let req = request.into_inner();
         let num_shards = usize::try_from(req.num_shards).expect("num_shards fits usize");
         if num_shards == 0 {
-            return Err(tonic::Status::invalid_argument("num_shards must be at least 1"));
+            return Err(tonic::Status::invalid_argument(
+                "num_shards must be at least 1",
+            ));
         }
 
         let current_epoch = self

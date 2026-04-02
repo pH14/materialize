@@ -40,20 +40,17 @@ use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
 use tokio::sync::Mutex;
 
 use mz_ore::metrics::MetricsRegistry;
-use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
 
 use crate::factory::InProcessActorFactory;
-use mz_persist::generated::consensus_service::{
-    ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
-};
+use mz_persist::generated::consensus_service::ProtoVersionedData;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::{PersistClient, PersistLocation, ShardId};
 
 use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
 use crate::actors::meta::{MetaState, PersistMetaActor};
+use crate::actors::router::{Router, RoutingSnapshot};
 use crate::actors::{OrderedKeySchema, ProposalSchema};
-use crate::actors::router::Router;
 use crate::{AcceptorConfig, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 use super::scenario::{SharedLogObservation, SharedLogOp, SharedLogOracle, VersionedData};
@@ -99,8 +96,13 @@ async fn spawn_shard(
     let acceptor_metrics = crate::metrics::AcceptorMetrics::register(&registry);
     let learner_metrics = crate::metrics::LearnerMetrics::register(&registry);
 
-    let (acceptor, write, handle_a) =
-        PersistAcceptor::new(AcceptorConfig::default(), write, acceptor_metrics, shard_id, 0);
+    let (acceptor, handle_a) = PersistAcceptor::new(
+        AcceptorConfig::default(),
+        acceptor_metrics,
+        shard_id,
+        0,
+        Box::new(crate::NoOpRetractionSource),
+    );
     let _atask =
         mz_ore::task::spawn(|| "sharded-sim-acceptor", acceptor.run(write)).abort_on_drop();
 
@@ -116,22 +118,6 @@ async fn spawn_shard(
     std::mem::forget(_ltask);
 
     (handle_a, handle_l)
-}
-
-fn cas_request(
-    key: &str,
-    expected: Option<u64>,
-    new_seqno: u64,
-    data: &[u8],
-) -> tonic::Request<ProtoCompareAndSetRequest> {
-    tonic::Request::new(ProtoCompareAndSetRequest {
-        key: key.to_string(),
-        expected,
-        new: Some(ProtoVersionedData {
-            seqno: new_seqno,
-            data: data.to_vec(),
-        }),
-    })
 }
 
 fn cas_observation(
@@ -185,9 +171,11 @@ async fn sharded_sim_concurrent_linearizability() {
     let mut acceptors = BTreeMap::new();
     acceptors.insert(shard, acc);
     let mut learners = BTreeMap::new();
-    learners.insert(shard, lrn);
+    learners.insert(shard, vec![lrn]);
 
-    let router = Arc::new(Router::new(partition_map, acceptors, learners));
+    let snapshot = RoutingSnapshot::new(partition_map, acceptors, learners);
+    let (router, router_handle, _routing_tx) = Router::with_routing(4096, snapshot);
+    mz_ore::task::spawn(|| "test-router", router.run());
 
     let oracle = SharedLogOracle::new();
     let harness = Arc::new(Mutex::new(ConcurrentHarness {
@@ -207,7 +195,7 @@ async fn sharded_sim_concurrent_linearizability() {
     let mut tasks = Vec::new();
 
     for client_id in 0..num_clients {
-        let router = Arc::clone(&router);
+        let router_handle = router_handle.clone();
         let harness = Arc::clone(&harness);
         let thread = SimThread::Client(client_id);
         // Each client alternates between two keys to create contention.
@@ -244,17 +232,23 @@ async fn sharded_sim_concurrent_linearizability() {
                         // Mutex released — other tasks can interleave here.
 
                         // Execute the operation.
-                        let result = router
-                            .compare_and_set(cas_request(&key, expected, new_seqno, &data))
+                        let result = router_handle
+                            .compare_and_set(
+                                key.clone(),
+                                expected,
+                                ProtoVersionedData {
+                                    seqno: new_seqno,
+                                    data: data.clone(),
+                                },
+                            )
                             .await;
 
                         let observation = match result {
                             Ok(resp) => {
-                                let inner = resp.into_inner();
-                                if inner.committed {
+                                if resp.committed {
                                     my_seqno = Some(new_seqno);
                                 }
-                                cas_observation(&inner)
+                                cas_observation(&resp)
                             }
                             Err(status) => {
                                 // Transport errors should not occur in in-memory
@@ -279,9 +273,7 @@ async fn sharded_sim_concurrent_linearizability() {
                         }
                     } else {
                         // Head operation
-                        let op = SharedLogOp::Head {
-                            shard: key.clone(),
-                        };
+                        let op = SharedLogOp::Head { shard: key.clone() };
 
                         {
                             let mut h = harness.lock().await;
@@ -291,14 +283,9 @@ async fn sharded_sim_concurrent_linearizability() {
                             h.step += 1;
                         }
 
-                        let resp = router
-                            .head(tonic::Request::new(ProtoHeadRequest {
-                                key: key.clone(),
-                            }))
-                            .await
-                            .unwrap();
+                        let resp = router_handle.head(key.clone()).await.unwrap();
 
-                        let observation = head_observation(&resp.into_inner());
+                        let observation = head_observation(&resp);
 
                         // Update our snapshot from the read result.
                         if let SharedLogObservation::Head {
@@ -363,9 +350,11 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
         let mut acceptors = BTreeMap::new();
         acceptors.insert(shard, acc);
         let mut learners = BTreeMap::new();
-        learners.insert(shard, lrn);
+        learners.insert(shard, vec![lrn]);
 
-        let router = Arc::new(Router::new(partition_map, acceptors, learners));
+        let snapshot = RoutingSnapshot::new(partition_map, acceptors, learners);
+        let (router, router_handle, _routing_tx) = Router::with_routing(4096, snapshot);
+        mz_ore::task::spawn(|| "test-router", router.run());
 
         let oracle = SharedLogOracle::new();
         let harness = Arc::new(Mutex::new(ConcurrentHarness {
@@ -383,11 +372,13 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
         let mut tasks = Vec::new();
 
         for client_id in 0..num_clients {
-            let router = Arc::clone(&router);
+            let router_handle = router_handle.clone();
             let harness = Arc::clone(&harness);
             let thread = SimThread::Client(client_id);
             let key = keys[client_id % keys.len()].to_string();
-            let mut rng = SmallRng::seed_from_u64(seed * 1000 + u64::try_from(client_id).expect("client_id fits u64"));
+            let mut rng = SmallRng::seed_from_u64(
+                seed * 1000 + u64::try_from(client_id).expect("client_id fits u64"),
+            );
 
             tasks.push(mz_ore::task::spawn(
                 || format!("seed{}-client{}", seed, client_id),
@@ -405,14 +396,9 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
                                 h.step += 1;
                             }
 
-                            let resp = router
-                                .head(tonic::Request::new(ProtoHeadRequest {
-                                    key: key.clone(),
-                                }))
-                                .await
-                                .unwrap();
+                            let resp = router_handle.head(key.clone()).await.unwrap();
 
-                            let observation = head_observation(&resp.into_inner());
+                            let observation = head_observation(&resp);
                             if let SharedLogObservation::Head {
                                 data: Some(ref vd), ..
                             } = observation
@@ -448,23 +434,26 @@ async fn sharded_sim_concurrent_linearizability_multi_seed() {
                                 h.step += 1;
                             }
 
-                            let result = router
-                                .compare_and_set(cas_request(&key, expected, new_seqno, &data))
+                            let result = router_handle
+                                .compare_and_set(
+                                    key.clone(),
+                                    expected,
+                                    ProtoVersionedData {
+                                        seqno: new_seqno,
+                                        data: data.clone(),
+                                    },
+                                )
                                 .await;
 
                             let observation = match result {
                                 Ok(resp) => {
-                                    let inner = resp.into_inner();
-                                    if inner.committed {
+                                    if resp.committed {
                                         my_seqno = Some(new_seqno);
                                     }
-                                    cas_observation(&inner)
+                                    cas_observation(&resp)
                                 }
                                 Err(status) => {
-                                    panic!(
-                                        "seed={}: unexpected transport error: {}",
-                                        seed, status
-                                    );
+                                    panic!("seed={}: unexpected transport error: {}", seed, status);
                                 }
                             };
 
@@ -510,13 +499,14 @@ async fn sharded_sim_linearizability_across_reconfig() {
     let mut acceptors = BTreeMap::new();
     acceptors.insert(shard_old, acc);
     let mut learners = BTreeMap::new();
-    learners.insert(shard_old, lrn);
+    learners.insert(shard_old, vec![lrn]);
 
-    let router = Arc::new(Router::new(partition_map, acceptors, learners));
-
+    let snapshot = RoutingSnapshot::new(partition_map, acceptors, learners);
+    let (router, router_handle, _routing_tx) = Router::with_routing(4096, snapshot);
+    mz_ore::task::spawn(|| "test-router", router.run());
 
     let metashard_state = MetaState::single(shard_old);
-    let (metashard_handle, _metashard_task) = PersistMetaActor::spawn(
+    let (metashard_handle, _, _metashard_task) = PersistMetaActor::spawn(
         metashard_state,
         256,
         client.clone(),
@@ -542,7 +532,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
     let mut tasks = Vec::new();
 
     for client_id in 0..num_clients {
-        let router = Arc::clone(&router);
+        let router_handle = router_handle.clone();
         let harness = Arc::clone(&harness);
         let thread = SimThread::Client(client_id);
         let key = keys[client_id % keys.len()].to_string();
@@ -573,17 +563,23 @@ async fn sharded_sim_linearizability_across_reconfig() {
                             h.step += 1;
                         }
 
-                        let result = router
-                            .compare_and_set(cas_request(&key, expected, new_seqno, &data))
+                        let result = router_handle
+                            .compare_and_set(
+                                key.clone(),
+                                expected,
+                                ProtoVersionedData {
+                                    seqno: new_seqno,
+                                    data: data.clone(),
+                                },
+                            )
                             .await;
 
                         match result {
                             Ok(resp) => {
-                                let inner = resp.into_inner();
-                                if inner.committed {
+                                if resp.committed {
                                     my_seqno = Some(new_seqno);
                                 }
-                                let observation = cas_observation(&inner);
+                                let observation = cas_observation(&resp);
                                 let mut h = harness.lock().await;
                                 h.checker.on_return(thread, observation).expect("return");
                                 h.step += 1;
@@ -610,9 +606,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
                             }
                         }
                     } else {
-                        let op = SharedLogOp::Head {
-                            shard: key.clone(),
-                        };
+                        let op = SharedLogOp::Head { shard: key.clone() };
 
                         {
                             let mut h = harness.lock().await;
@@ -620,14 +614,9 @@ async fn sharded_sim_linearizability_across_reconfig() {
                             h.step += 1;
                         }
 
-                        let resp = router
-                            .head(tonic::Request::new(ProtoHeadRequest {
-                                key: key.clone(),
-                            }))
-                            .await
-                            .unwrap();
+                        let resp = router_handle.head(key.clone()).await.unwrap();
 
-                        let observation = head_observation(&resp.into_inner());
+                        let observation = head_observation(&resp);
 
                         if let SharedLogObservation::Head {
                             data: Some(ref vd), ..

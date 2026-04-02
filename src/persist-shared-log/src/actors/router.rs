@@ -7,67 +7,60 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Router: routes client gRPC requests to the correct acceptor/learner based on
-//! the partition map.
+//! Router actor: routes client requests to the correct acceptor/learner based
+//! on the partition map.
 //!
-//! For each incoming request, the router extracts the client shard key, looks up
-//! the owning log shard in the partition map, and routes to the corresponding
-//! acceptor and learner.
+//! Follows the same actor pattern as acceptor, learner, and meta: a passive
+//! state machine driven by command channels, with a handle type for sending
+//! commands. Uses two channels (like the learner's event source + command
+//! channel pattern):
+//!
+//! - **`cmd_rx`**: client commands (Head, Scan, ListKeys, CAS, Truncate)
+//! - **`routing_rx`**: routing snapshots from the routing task
+//!
+//! A biased `tokio::select!` ensures routing updates take priority, so parked
+//! commands are retried promptly after reconfiguration.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use prost::Message;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
 use mz_persist::generated::consensus_service::{
     ProtoCompareAndSetRequest, ProtoCompareAndSetResponse, ProtoHeadRequest, ProtoHeadResponse,
     ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal, ProtoMetashardState,
-    ProtoReconfigureRequest, ProtoReconfigureResponse, ProtoScanRequest, ProtoScanResponse,
-    ProtoTruncateRequest, ProtoTruncateResponse, proto_log_proposal,
+    ProtoScanRequest, ProtoScanResponse, ProtoTruncateRequest, ProtoTruncateResponse,
+    ProtoVersionedData, proto_log_proposal,
 };
 use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
-use crate::factory::ActorFactory;
-use crate::actors::meta::PersistMetaHandle;
 use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
-use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
+use crate::{Acceptor, Learner, PartitionMap, RangeAssignment};
 
 // ---------------------------------------------------------------------------
-// ShardedRetractionSource
+// HandleResolver
 // ---------------------------------------------------------------------------
 
-/// Implements [`RetractionSource`] by fanning out to learner replicas and
-/// returning the first response.
-pub struct ShardedRetractionSource {
-    learners: Vec<crate::actors::learner::PersistLearnerHandle>,
-}
-
-impl ShardedRetractionSource {
-    pub fn new(learners: Vec<crate::actors::learner::PersistLearnerHandle>) -> Self {
-        ShardedRetractionSource { learners }
-    }
-}
-
+/// Resolves shard IDs to acceptor and learner handles.
+///
+/// Used by the routing task to connect to existing actors discovered via the
+/// partition map. Unlike `ActorFactory`, this does not create actors — it
+/// finds handles to actors that already exist.
 #[async_trait::async_trait]
-impl crate::RetractionSource for ShardedRetractionSource {
-    async fn get_retractions(
-        &self,
-        frontier: u64,
-    ) -> Vec<(OrderedKey, Proposal)> {
-        for learner in &self.learners {
-            match learner.get_retractions(frontier).await {
-                Ok(retractions) => return retractions,
-                Err(_) => continue,
-            }
-        }
-        Vec::new()
-    }
+pub trait HandleResolver: Send + Sync + 'static {
+    type A: Acceptor;
+    type L: Learner;
+
+    /// Get a handle to the acceptor for the given shard.
+    async fn resolve_acceptor(&self, shard_id: ShardId) -> Result<Self::A, String>;
+
+    /// Get handles to all learner replicas for the given shard.
+    async fn resolve_learners(&self, shard_id: ShardId) -> Result<Vec<Self::L>, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -79,14 +72,14 @@ impl crate::RetractionSource for ShardedRetractionSource {
 pub struct RoutingSnapshot<A: Acceptor, L: Learner> {
     pub partition_map: PartitionMap,
     pub acceptors: Arc<BTreeMap<ShardId, A>>,
-    pub learners: Arc<BTreeMap<ShardId, L>>,
+    pub learners: Arc<BTreeMap<ShardId, Vec<L>>>,
 }
 
 impl<A: Acceptor, L: Learner> RoutingSnapshot<A, L> {
     pub fn new(
         partition_map: PartitionMap,
         acceptors: BTreeMap<ShardId, A>,
-        learners: BTreeMap<ShardId, L>,
+        learners: BTreeMap<ShardId, Vec<L>>,
     ) -> Self {
         for range in &partition_map.ranges {
             assert!(
@@ -95,8 +88,10 @@ impl<A: Acceptor, L: Learner> RoutingSnapshot<A, L> {
                 range.log_shard
             );
             assert!(
-                learners.contains_key(&range.log_shard),
-                "missing learner for log shard {}",
+                learners
+                    .get(&range.log_shard)
+                    .map_or(false, |v| !v.is_empty()),
+                "missing learner(s) for log shard {}",
                 range.log_shard
             );
         }
@@ -106,101 +101,523 @@ impl<A: Acceptor, L: Learner> RoutingSnapshot<A, L> {
             learners: Arc::new(learners),
         }
     }
+}
 
-    pub fn empty() -> Self {
-        RoutingSnapshot {
-            partition_map: PartitionMap { epoch: 0, ranges: vec![] },
-            acceptors: Arc::new(BTreeMap::new()),
-            learners: Arc::new(BTreeMap::new()),
-        }
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+/// Commands dispatched to the router actor from clients.
+pub enum RouterCommand {
+    Head {
+        key: String,
+        reply: oneshot::Sender<Result<ProtoHeadResponse, tonic::Status>>,
+    },
+    Scan {
+        key: String,
+        from: u64,
+        limit: u64,
+        reply: oneshot::Sender<Result<ProtoScanResponse, tonic::Status>>,
+    },
+    ListKeys {
+        reply: oneshot::Sender<Result<Vec<String>, tonic::Status>>,
+    },
+    CompareAndSet {
+        key: String,
+        expected: Option<u64>,
+        new: ProtoVersionedData,
+        reply: oneshot::Sender<Result<ProtoCompareAndSetResponse, tonic::Status>>,
+    },
+    Truncate {
+        key: String,
+        seqno: u64,
+        reply: oneshot::Sender<Result<ProtoTruncateResponse, tonic::Status>>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Handle
+// ---------------------------------------------------------------------------
+
+/// A typed handle to the router actor's command channel.
+#[derive(Debug, Clone)]
+pub struct RouterHandle {
+    tx: mpsc::Sender<RouterCommand>,
+}
+
+impl RouterHandle {
+    pub fn new(tx: mpsc::Sender<RouterCommand>) -> Self {
+        RouterHandle { tx }
+    }
+
+    pub async fn head(&self, key: String) -> Result<ProtoHeadResponse, tonic::Status> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RouterCommand::Head {
+                key,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| tonic::Status::unavailable("router shut down"))?;
+        reply_rx
+            .await
+            .map_err(|_| tonic::Status::unavailable("router dropped reply"))?
+    }
+
+    pub async fn scan(
+        &self,
+        key: String,
+        from: u64,
+        limit: u64,
+    ) -> Result<ProtoScanResponse, tonic::Status> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RouterCommand::Scan {
+                key,
+                from,
+                limit,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| tonic::Status::unavailable("router shut down"))?;
+        reply_rx
+            .await
+            .map_err(|_| tonic::Status::unavailable("router dropped reply"))?
+    }
+
+    pub async fn list_keys(&self) -> Result<Vec<String>, tonic::Status> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RouterCommand::ListKeys { reply: reply_tx })
+            .await
+            .map_err(|_| tonic::Status::unavailable("router shut down"))?;
+        reply_rx
+            .await
+            .map_err(|_| tonic::Status::unavailable("router dropped reply"))?
+    }
+
+    pub async fn compare_and_set(
+        &self,
+        key: String,
+        expected: Option<u64>,
+        new: ProtoVersionedData,
+    ) -> Result<ProtoCompareAndSetResponse, tonic::Status> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RouterCommand::CompareAndSet {
+                key,
+                expected,
+                new,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| tonic::Status::unavailable("router shut down"))?;
+        reply_rx
+            .await
+            .map_err(|_| tonic::Status::unavailable("router dropped reply"))?
+    }
+
+    pub async fn truncate(
+        &self,
+        key: String,
+        seqno: u64,
+    ) -> Result<ProtoTruncateResponse, tonic::Status> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RouterCommand::Truncate {
+                key,
+                seqno,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| tonic::Status::unavailable("router shut down"))?;
+        reply_rx
+            .await
+            .map_err(|_| tonic::Status::unavailable("router dropped reply"))?
     }
 }
 
+// ---------------------------------------------------------------------------
+// gRPC service implementation on the handle
+// ---------------------------------------------------------------------------
+
+#[tonic::async_trait]
+impl PersistSharedLog for RouterHandle {
+    async fn head(
+        &self,
+        request: tonic::Request<ProtoHeadRequest>,
+    ) -> Result<tonic::Response<ProtoHeadResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let resp = RouterHandle::head(self, req.key).await?;
+        Ok(tonic::Response::new(resp))
+    }
+
+    async fn scan(
+        &self,
+        request: tonic::Request<ProtoScanRequest>,
+    ) -> Result<tonic::Response<ProtoScanResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let resp = RouterHandle::scan(self, req.key, req.from, req.limit).await?;
+        Ok(tonic::Response::new(resp))
+    }
+
+    type ListKeysStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ProtoListKeysResponse, tonic::Status>>;
+
+    async fn list_keys(
+        &self,
+        _request: tonic::Request<ProtoListKeysRequest>,
+    ) -> Result<tonic::Response<Self::ListKeysStream>, tonic::Status> {
+        let keys = RouterHandle::list_keys(self).await?;
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(64);
+        mz_ore::task::spawn(|| "sharded-list-keys-stream", async move {
+            for key in keys {
+                if stream_tx
+                    .send(Ok(ProtoListKeysResponse { key }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(tonic::Response::new(
+            tokio_stream::wrappers::ReceiverStream::new(stream_rx),
+        ))
+    }
+
+    async fn compare_and_set(
+        &self,
+        request: tonic::Request<ProtoCompareAndSetRequest>,
+    ) -> Result<tonic::Response<ProtoCompareAndSetResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let new = req
+            .new
+            .ok_or_else(|| tonic::Status::invalid_argument("missing new"))?;
+        let resp = RouterHandle::compare_and_set(self, req.key, req.expected, new).await?;
+        Ok(tonic::Response::new(resp))
+    }
+
+    async fn truncate(
+        &self,
+        request: tonic::Request<ProtoTruncateRequest>,
+    ) -> Result<tonic::Response<ProtoTruncateResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let resp = RouterHandle::truncate(self, req.key, req.seqno).await?;
+        Ok(tonic::Response::new(resp))
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Router
+// Router actor
 // ---------------------------------------------------------------------------
 
-/// A sharded gRPC service that routes requests by partition key.
+/// Router actor: owns routing state and processes client commands.
+///
+/// Two input channels (biased select, routing updates take priority):
+/// - `routing_rx`: routing snapshots from the routing task
+/// - `cmd_rx`: client commands from the handle
+///
+/// Commands that arrive before routing is available, or that hit a sealed
+/// acceptor, are parked in `pending` and retried on the next routing update.
 pub struct Router<A: Acceptor, L: Learner> {
-    routing: Arc<RwLock<RoutingSnapshot<A, L>>>,
-    /// Signaled when routing changes (e.g., after reconfiguration).
-    routing_notify: Arc<tokio::sync::Notify>,
-    metashard: Option<PersistMetaHandle>,
-}
-
-impl<A: Acceptor, L: Learner> std::fmt::Debug for Router<A, L> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Router").finish_non_exhaustive()
-    }
+    cmd_rx: mpsc::Receiver<RouterCommand>,
+    routing_rx: mpsc::Receiver<RoutingSnapshot<A, L>>,
+    /// Commands that arrived before routing, retried on first routing update.
+    pending: Vec<RouterCommand>,
+    /// Commands parked due to sealed acceptors, retried on routing updates.
+    retry_rx: mpsc::Receiver<RouterCommand>,
+    retry_tx: mpsc::Sender<RouterCommand>,
+    routing: Option<RoutingSnapshot<A, L>>,
+    /// Round-robin counter for distributing reads across learner replicas.
+    learner_counter: usize,
 }
 
 impl<A: Acceptor, L: Learner> Router<A, L> {
-    pub fn new(
-        partition_map: PartitionMap,
-        acceptors: BTreeMap<ShardId, A>,
-        learners: BTreeMap<ShardId, L>,
-    ) -> Self {
-        let snapshot = RoutingSnapshot::new(partition_map, acceptors, learners);
-        Router {
-            routing: Arc::new(RwLock::new(snapshot)),
-            routing_notify: Arc::new(tokio::sync::Notify::new()),
-            metashard: None,
-        }
+    /// Create a new router with no initial routing.
+    ///
+    /// Returns `(actor, handle, routing_tx)`. Pass `routing_tx` to
+    /// [`spawn_routing_task`] so it can push partition map updates.
+    pub fn new(queue_depth: usize) -> (Self, RouterHandle, mpsc::Sender<RoutingSnapshot<A, L>>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(queue_depth);
+        let (routing_tx, routing_rx) = mpsc::channel(4);
+        let (retry_tx, retry_rx) = mpsc::channel(queue_depth);
+        let router = Router {
+            cmd_rx,
+            routing_rx,
+            pending: Vec::new(),
+            retry_rx,
+            retry_tx,
+            routing: None,
+            learner_counter: 0,
+        };
+        let handle = RouterHandle::new(cmd_tx);
+        (router, handle, routing_tx)
     }
 
-    pub fn from_routing(routing: Arc<RwLock<RoutingSnapshot<A, L>>>) -> Self {
-        Router {
-            routing,
-            routing_notify: Arc::new(tokio::sync::Notify::new()),
-            metashard: None,
-        }
+    /// Create a router with pre-populated routing (for tests).
+    pub fn with_routing(
+        queue_depth: usize,
+        snapshot: RoutingSnapshot<A, L>,
+    ) -> (Self, RouterHandle, mpsc::Sender<RoutingSnapshot<A, L>>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(queue_depth);
+        let (routing_tx, routing_rx) = mpsc::channel(4);
+        let (retry_tx, retry_rx) = mpsc::channel(queue_depth);
+        let router = Router {
+            cmd_rx,
+            routing_rx,
+            pending: Vec::new(),
+            retry_rx,
+            retry_tx,
+            routing: Some(snapshot),
+            learner_counter: 0,
+        };
+        let handle = RouterHandle::new(cmd_tx);
+        (router, handle, routing_tx)
     }
 
-    pub fn routing_handle(&self) -> Arc<RwLock<RoutingSnapshot<A, L>>> {
-        Arc::clone(&self.routing)
-    }
-
-    pub fn routing_notify(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.routing_notify)
-    }
-
-    /// Wait until the routing has at least one range (i.e., is non-empty).
-    /// Used by tests to ensure the routing task has delivered the initial
-    /// partition map before making requests.
-    pub async fn wait_for_routing(&self) {
+    /// Run the actor until all senders are dropped.
+    pub async fn run(mut self) {
         loop {
-            {
-                let routing = self.routing.read().await;
-                if !routing.partition_map.ranges.is_empty() {
-                    return;
-                }
+            // TODO: This sleep is a workaround for tokio's paused-time tests
+            // and turmoil sims. With paused time, persist's Subscribe needs
+            // time to advance to deliver events; without a sleep here, parked
+            // commands block indefinitely because the routing task's subscribe
+            // never fires. In production (real time), this is unnecessary.
+            if !self.pending.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_nanos(1)).await;
             }
-            // Use sleep(1ms) instead of yield_now — turmoil needs time to
-            // advance for the routing task's subscribe to deliver events.
-            tokio::time::sleep(Duration::from_millis(1)).await;
+
+            tokio::select! {
+                biased;
+                Some(snapshot) = self.routing_rx.recv() => {
+                    self.on_routing_update(snapshot);
+                }
+                Some(cmd) = self.retry_rx.recv() => {
+                    self.dispatch(cmd);
+                }
+                Some(cmd) = self.cmd_rx.recv() => {
+                    self.dispatch(cmd);
+                }
+                else => break,
+            }
         }
     }
 
-    pub fn with_metashard(mut self, handle: PersistMetaHandle) -> Self {
-        self.metashard = Some(handle);
-        self
+    fn on_routing_update(&mut self, snapshot: RoutingSnapshot<A, L>) {
+        info!(
+            epoch = snapshot.partition_map.epoch,
+            num_ranges = snapshot.partition_map.ranges.len(),
+            "router: applied routing update"
+        );
+        self.routing = Some(snapshot);
+
+        // Retry all parked commands with the new routing.
+        let pending = std::mem::take(&mut self.pending);
+        for cmd in pending {
+            self.dispatch(cmd);
+        }
+    }
+
+    /// Route a command and spawn a task to execute it. Returns immediately.
+    fn dispatch(&mut self, cmd: RouterCommand) {
+        let routing = match &self.routing {
+            Some(r) => r.clone(),
+            None => {
+                self.pending.push(cmd);
+                return;
+            }
+        };
+
+        match cmd {
+            RouterCommand::Head { key, reply } => {
+                let learner = self.pick_learner(&routing, &key);
+                let retry_tx = self.retry_tx.clone();
+                mz_ore::task::spawn(|| "router-head", async move {
+                    match learner.head(key.clone()).await {
+                        Ok(resp) => {
+                            let _ = reply.send(Ok(resp));
+                        }
+                        Err(_) => {
+                            debug!(%key, "learner failed, parking read for routing update");
+                            let _ = retry_tx.send(RouterCommand::Head { key, reply }).await;
+                        }
+                    }
+                });
+            }
+            RouterCommand::Scan {
+                key,
+                from,
+                limit,
+                reply,
+            } => {
+                let learner = self.pick_learner(&routing, &key);
+                let retry_tx = self.retry_tx.clone();
+                mz_ore::task::spawn(|| "router-scan", async move {
+                    match learner.scan(key.clone(), from, limit).await {
+                        Ok(resp) => {
+                            let _ = reply.send(Ok(resp));
+                        }
+                        Err(_) => {
+                            debug!(%key, "learner failed, parking scan for routing update");
+                            let _ = retry_tx
+                                .send(RouterCommand::Scan { key, from, limit, reply })
+                                .await;
+                        }
+                    }
+                });
+            }
+            RouterCommand::ListKeys { reply } => {
+                let learners: Vec<L> = routing
+                    .learners
+                    .values()
+                    .map(|replicas| replicas[0].clone())
+                    .collect();
+                mz_ore::task::spawn(|| "router-list-keys", async move {
+                    let mut all_keys = std::collections::BTreeSet::new();
+                    for learner in &learners {
+                        match learner.list_keys().await {
+                            Ok(keys) => all_keys.extend(keys),
+                            Err(e) => {
+                                let _ = reply.send(Err(tonic::Status::from(e)));
+                                return;
+                            }
+                        }
+                    }
+                    let _ = reply.send(Ok(all_keys.into_iter().collect()));
+                });
+            }
+            RouterCommand::CompareAndSet {
+                key,
+                expected,
+                new,
+                reply,
+            } => {
+                let acceptor = self.pick_acceptor(&routing, &key);
+                let learner = self.pick_learner(&routing, &key);
+                let retry_tx = self.retry_tx.clone();
+                mz_ore::task::spawn(|| "router-cas", async move {
+                    let proposal = ProtoLogProposal {
+                        op: Some(proto_log_proposal::Op::Cas(
+                            mz_persist::generated::consensus_service::ProtoCasProposal {
+                                key: key.clone(),
+                                expected,
+                                new_seqno: new.seqno,
+                                data: new.data.clone(),
+                            },
+                        )),
+                    };
+                    match acceptor.append(proposal).await {
+                        Ok(receipt) => {
+                            let result = learner
+                                .await_cas_result(receipt.batch_number, receipt.position)
+                                .await
+                                .map_err(tonic::Status::from);
+                            let _ = reply.send(result);
+                        }
+                        Err(
+                            crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown,
+                        ) => {
+                            debug!(
+                                %key,
+                                "acceptor sealed/shutdown, parking CAS for routing update"
+                            );
+                            let _ = retry_tx
+                                .send(RouterCommand::CompareAndSet {
+                                    key,
+                                    expected,
+                                    new,
+                                    reply,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(tonic::Status::from(e)));
+                        }
+                    }
+                });
+            }
+            RouterCommand::Truncate { key, seqno, reply } => {
+                let acceptor = self.pick_acceptor(&routing, &key);
+                let learner = self.pick_learner(&routing, &key);
+                let retry_tx = self.retry_tx.clone();
+                mz_ore::task::spawn(|| "router-truncate", async move {
+                    let proposal = ProtoLogProposal {
+                        op: Some(proto_log_proposal::Op::Truncate(
+                            mz_persist::generated::consensus_service::ProtoTruncateProposal {
+                                key: key.clone(),
+                                seqno,
+                            },
+                        )),
+                    };
+                    match acceptor.append(proposal).await {
+                        Ok(receipt) => {
+                            let result = learner
+                                .await_truncate_result(receipt.batch_number, receipt.position)
+                                .await
+                                .map_err(tonic::Status::from);
+                            let _ = reply.send(result);
+                        }
+                        Err(
+                            crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown,
+                        ) => {
+                            debug!(
+                                %key,
+                                "acceptor sealed/shutdown, parking truncate for routing update"
+                            );
+                            let _ = retry_tx
+                                .send(RouterCommand::Truncate { key, seqno, reply })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(tonic::Status::from(e)));
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn pick_acceptor(&self, routing: &RoutingSnapshot<A, L>, key: &str) -> A {
+        let log_shard = routing.partition_map.route(key);
+        routing
+            .acceptors
+            .get(&log_shard)
+            .expect("partition map routes to known log shard")
+            .clone()
+    }
+
+    fn pick_learner(&mut self, routing: &RoutingSnapshot<A, L>, key: &str) -> L {
+        let log_shard = routing.partition_map.route(key);
+        let replicas = routing
+            .learners
+            .get(&log_shard)
+            .expect("partition map routes to known log shard");
+        let idx = self.learner_counter % replicas.len();
+        self.learner_counter = self.learner_counter.wrapping_add(1);
+        replicas[idx].clone()
     }
 }
 
+// ---------------------------------------------------------------------------
+// Routing task
+// ---------------------------------------------------------------------------
+
 /// Spawn a background task that subscribes to the metashard persist shard and
-/// updates the Router's routing state when the partition map changes.
+/// pushes routing updates to the router actor.
 ///
 /// This decouples the Router from the metashard actor — they communicate
-/// only through the persist shard. The task uses the `ActorFactory` to create
-/// handles for new shards (idempotent — returns cached handles if already created).
-pub async fn spawn_routing_task<F: ActorFactory>(
+/// only through the persist shard. The task uses a [`HandleResolver`] to
+/// connect to existing actors discovered via the partition map.
+pub async fn spawn_routing_task<R: HandleResolver>(
     persist_client: &PersistClient,
     metashard_shard_id: ShardId,
-    factory: F,
-    routing: Arc<RwLock<RoutingSnapshot<F::A, F::L>>>,
-    routing_notify: Arc<tokio::sync::Notify>,
+    resolver: R,
+    routing_tx: mpsc::Sender<RoutingSnapshot<R::A, R::L>>,
 ) {
+    // The metashard shard reuses the same (OrderedKey, Proposal) schema as log
+    // shards. Its state is stored as a single key "__metashard" with a serialized
+    // ProtoMetashardState as the proposal payload.
     let key_schema = Arc::new(OrderedKeySchema);
     let val_schema = Arc::new(ProposalSchema);
 
@@ -221,9 +638,6 @@ pub async fn spawn_routing_task<F: ActorFactory>(
         .await
         .expect("subscribe to metashard shard");
 
-    // The subscribe is handed to the background task which processes all
-    // events (initial catchup + ongoing updates). The Router starts
-    // with empty routing and updates when the metashard writes its state.
     mz_ore::task::spawn(|| "routing-task", async move {
         let mut subscribe = subscribe;
         loop {
@@ -242,30 +656,27 @@ pub async fn spawn_routing_task<F: ActorFactory>(
                 }
             }
             if let Some(data) = new_data {
-                if let Some(snapshot) = decode_and_build_snapshot(&data, &factory).await {
-                    let epoch = snapshot.partition_map.epoch;
-                    let ranges = snapshot.partition_map.ranges
-                        .iter()
-                        .map(|r| format!(
-                            "  [0x{:02x}, 0x{:03x}) -> {}",
-                            r.lo, r.hi_exclusive, r.log_shard
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    *routing.write().await = snapshot;
-                    routing_notify.notify_waiters();
-                    info!(epoch, "routing task: applied partition map update\n{ranges}");
+                if let Some(snapshot) = decode_and_build_snapshot(&data, &resolver).await {
+                    let map = &snapshot.partition_map;
+                    info!("routing task: new partition map\n{map}");
+                    if routing_tx.send(snapshot).await.is_err() {
+                        info!("routing task: router shut down, exiting");
+                        return;
+                    }
                 }
             }
         }
     });
 }
 
-/// Decode a `ProtoMetashardState` and build a `RoutingSnapshot` using the factory.
-async fn decode_and_build_snapshot<F: ActorFactory>(
+/// Decode a `ProtoMetashardState` and build a `RoutingSnapshot` using the
+/// resolver to connect to existing actors.
+async fn decode_and_build_snapshot<R: HandleResolver>(
     data: &[u8],
-    factory: &F,
-) -> Option<RoutingSnapshot<F::A, F::L>> {
+    resolver: &R,
+) -> Option<RoutingSnapshot<R::A, R::L>> {
+    use super::meta::parse_proto_range;
+
     let proto = match ProtoMetashardState::decode(data) {
         Ok(p) => p,
         Err(e) => {
@@ -274,17 +685,7 @@ async fn decode_and_build_snapshot<F: ActorFactory>(
         }
     };
 
-    let ranges: Vec<RangeAssignment> = proto
-        .ranges
-        .iter()
-        .filter_map(|r| {
-            Some(RangeAssignment {
-                lo: u8::try_from(r.lo).ok()?,
-                hi_exclusive: u16::try_from(r.hi_exclusive).ok()?,
-                log_shard: r.log_shard.parse().ok()?,
-            })
-        })
-        .collect();
+    let ranges: Vec<RangeAssignment> = proto.ranges.iter().filter_map(parse_proto_range).collect();
 
     if ranges.is_empty() {
         return None;
@@ -302,23 +703,23 @@ async fn decode_and_build_snapshot<F: ActorFactory>(
     let mut acceptors = BTreeMap::new();
     let mut learners = BTreeMap::new();
 
-    // Create acceptors first (setup batches advance upper), then learners.
     for range in &ranges {
         let shard_id = range.log_shard;
-        match factory.create_acceptor(shard_id, proto.epoch, vec![], range.clone()).await {
-            Ok(a) => { acceptors.insert(shard_id, a); }
+        match resolver.resolve_acceptor(shard_id).await {
+            Ok(a) => {
+                acceptors.insert(shard_id, a);
+            }
             Err(e) => {
-                warn!(%shard_id, "failed to create acceptor: {e}");
+                warn!(%shard_id, "failed to resolve acceptor: {e}");
                 return None;
             }
         }
-    }
-    for range in &ranges {
-        let shard_id = range.log_shard;
-        match factory.create_learner(shard_id).await {
-            Ok(l) => { learners.insert(shard_id, l); }
+        match resolver.resolve_learners(shard_id).await {
+            Ok(replicas) => {
+                learners.insert(shard_id, replicas);
+            }
             Err(e) => {
-                warn!(%shard_id, "failed to create learner: {e}");
+                warn!(%shard_id, "failed to resolve learners: {e}");
                 return None;
             }
         }
@@ -329,281 +730,4 @@ async fn decode_and_build_snapshot<F: ActorFactory>(
         acceptors: Arc::new(acceptors),
         learners: Arc::new(learners),
     })
-}
-
-// ---------------------------------------------------------------------------
-// PersistSharedLog gRPC implementation
-// ---------------------------------------------------------------------------
-
-#[tonic::async_trait]
-impl<A: Acceptor, L: Learner> PersistSharedLog for Router<A, L> {
-    async fn head(
-        &self,
-        request: tonic::Request<ProtoHeadRequest>,
-    ) -> Result<tonic::Response<ProtoHeadResponse>, tonic::Status> {
-        let req = request.into_inner();
-        debug!(key = %req.key, "sharded head");
-        let routing = self.routing.read().await;
-        let log_shard = routing.partition_map.route(&req.key);
-        let learner = routing
-            .learners
-            .get(&log_shard)
-            .expect("partition map routes to known log shard");
-        let resp = learner.head(req.key).await?;
-        Ok(tonic::Response::new(resp))
-    }
-
-    async fn scan(
-        &self,
-        request: tonic::Request<ProtoScanRequest>,
-    ) -> Result<tonic::Response<ProtoScanResponse>, tonic::Status> {
-        let req = request.into_inner();
-        debug!(key = %req.key, from = req.from, limit = req.limit, "sharded scan");
-        let routing = self.routing.read().await;
-        let log_shard = routing.partition_map.route(&req.key);
-        let learner = routing
-            .learners
-            .get(&log_shard)
-            .expect("partition map routes to known log shard");
-        let resp = learner.scan(req.key, req.from, req.limit).await?;
-        Ok(tonic::Response::new(resp))
-    }
-
-    type ListKeysStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ProtoListKeysResponse, tonic::Status>>;
-
-    async fn list_keys(
-        &self,
-        _request: tonic::Request<ProtoListKeysRequest>,
-    ) -> Result<tonic::Response<Self::ListKeysStream>, tonic::Status> {
-        debug!("sharded list_keys");
-        let routing = self.routing.read().await;
-        let mut all_keys = std::collections::BTreeSet::new();
-        for learner in routing.learners.values() {
-            match learner.list_keys().await {
-                Ok(keys) => {
-                    all_keys.extend(keys);
-                }
-                Err(e) => return Err(tonic::Status::from(e)),
-            }
-        }
-        drop(routing);
-
-        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(64);
-        mz_ore::task::spawn(|| "sharded-list-keys-stream", async move {
-            for key in all_keys {
-                if stream_tx
-                    .send(Ok(ProtoListKeysResponse { key }))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        Ok(tonic::Response::new(
-            tokio_stream::wrappers::ReceiverStream::new(stream_rx),
-        ))
-    }
-
-    async fn compare_and_set(
-        &self,
-        request: tonic::Request<ProtoCompareAndSetRequest>,
-    ) -> Result<tonic::Response<ProtoCompareAndSetResponse>, tonic::Status> {
-        let req = request.into_inner();
-        debug!(key = %req.key, "sharded compare_and_set");
-
-        let new = req
-            .new
-            .ok_or_else(|| tonic::Status::invalid_argument("missing new"))?;
-
-        loop {
-            let proposal = ProtoLogProposal {
-                op: Some(proto_log_proposal::Op::Cas(
-                    mz_persist::generated::consensus_service::ProtoCasProposal {
-                        key: req.key.clone(),
-                        expected: req.expected,
-                        new_seqno: new.seqno,
-                        data: new.data.clone(),
-                    },
-                )),
-            };
-
-            let (acceptor, learner) = {
-                let routing = self.routing.read().await;
-                let log_shard = routing.partition_map.route(&req.key);
-                let a = routing
-                    .acceptors
-                    .get(&log_shard)
-                    .expect("partition map routes to known log shard")
-                    .clone();
-                let l = routing
-                    .learners
-                    .get(&log_shard)
-                    .expect("partition map routes to known log shard")
-                    .clone();
-                (a, l)
-            };
-
-            match acceptor.append(proposal).await {
-                Ok(receipt) => {
-                    let result = learner
-                        .await_cas_result(receipt.batch_number, receipt.position)
-                        .await?;
-                    return Ok(tonic::Response::new(result));
-                }
-                Err(crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown) => {
-                    debug!(
-                        key = %req.key,
-                        "acceptor sealed/shutdown, waiting for routing update"
-                    );
-                    // Wait for a routing update notification, with timeout.
-                    match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        self.routing_notify.notified(),
-                    )
-                    .await
-                    {
-                        Ok(()) => continue,
-                        Err(_) => {
-                            return Err(tonic::Status::unavailable(
-                                "acceptor sealed and no routing update received within timeout",
-                            ));
-                        }
-                    }
-                }
-                Err(e) => return Err(tonic::Status::from(e)),
-            }
-        }
-    }
-
-    async fn truncate(
-        &self,
-        request: tonic::Request<ProtoTruncateRequest>,
-    ) -> Result<tonic::Response<ProtoTruncateResponse>, tonic::Status> {
-        let req = request.into_inner();
-        debug!(key = %req.key, seqno = req.seqno, "sharded truncate");
-
-        loop {
-            let proposal = ProtoLogProposal {
-                op: Some(proto_log_proposal::Op::Truncate(
-                    mz_persist::generated::consensus_service::ProtoTruncateProposal {
-                        key: req.key.clone(),
-                        seqno: req.seqno,
-                    },
-                )),
-            };
-
-            let (acceptor, learner) = {
-                let routing = self.routing.read().await;
-                let log_shard = routing.partition_map.route(&req.key);
-                let a = routing
-                    .acceptors
-                    .get(&log_shard)
-                    .expect("partition map routes to known log shard")
-                    .clone();
-                let l = routing
-                    .learners
-                    .get(&log_shard)
-                    .expect("partition map routes to known log shard")
-                    .clone();
-                (a, l)
-            };
-
-            match acceptor.append(proposal).await {
-                Ok(receipt) => {
-                    let result = learner
-                        .await_truncate_result(receipt.batch_number, receipt.position)
-                        .await?;
-                    return Ok(tonic::Response::new(result));
-                }
-                Err(crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown) => {
-                    debug!(
-                        key = %req.key,
-                        "acceptor sealed/shutdown during truncate, waiting for routing update"
-                    );
-                    match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        self.routing_notify.notified(),
-                    )
-                    .await
-                    {
-                        Ok(()) => continue,
-                        Err(_) => {
-                            return Err(tonic::Status::unavailable(
-                                "acceptor sealed and no routing update received within timeout",
-                            ));
-                        }
-                    }
-                }
-                Err(e) => return Err(tonic::Status::from(e)),
-            }
-        }
-    }
-
-    async fn reconfigure(
-        &self,
-        request: tonic::Request<ProtoReconfigureRequest>,
-    ) -> Result<tonic::Response<ProtoReconfigureResponse>, tonic::Status> {
-        let req = request.into_inner();
-        let num_shards = usize::try_from(req.num_shards).expect("num_shards fits usize");
-        if num_shards == 0 {
-            return Err(tonic::Status::invalid_argument(
-                "num_shards must be at least 1",
-            ));
-        }
-
-        let metashard = self
-            .metashard
-            .as_ref()
-            .ok_or_else(|| {
-                tonic::Status::unimplemented("reconfiguration not available (no metashard)")
-            })?;
-
-        let current_epoch = metashard
-            .current_epoch()
-            .await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-
-        let range_size = 256 / num_shards;
-        let mut ranges = Vec::with_capacity(num_shards);
-        for i in 0..num_shards {
-            let lo = u8::try_from(i * range_size).expect("range start fits u8");
-            let hi_exclusive = if i == num_shards - 1 {
-                0x100u16
-            } else {
-                u16::try_from((i + 1) * range_size).expect("range end fits u16")
-            };
-            ranges.push(RangeAssignment {
-                lo,
-                hi_exclusive,
-                log_shard: ShardId::new(),
-            });
-        }
-
-        let new_map = PartitionMap {
-            epoch: current_epoch + 1,
-            ranges,
-        };
-
-        info!(
-            current_epoch,
-            num_shards,
-            "Reconfigure RPC: splitting to {} shards",
-            num_shards
-        );
-
-        let new_epoch = metashard
-            .reconfigure(ReconfigurationPlan {
-                expected_epoch: current_epoch,
-                new_partition_map: new_map,
-            })
-            .await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-
-        Ok(tonic::Response::new(ProtoReconfigureResponse {
-            new_epoch,
-            num_shards: u32::try_from(num_shards).expect("num_shards fits u32"),
-        }))
-    }
 }

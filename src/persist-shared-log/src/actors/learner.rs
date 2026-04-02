@@ -753,9 +753,19 @@ impl<E: EventSource> PersistLearner<E> {
     /// Moves all pending reads into the linearizing set with the given upper
     /// as their target, then checks whether any can already be served.
     pub fn on_upper(&mut self, upper: Antichain<u64>) {
+        let target = match upper.as_option().copied() {
+            Some(t) => t,
+            None => {
+                // Upper is [] (sealed). The shard is closed — no more writes
+                // will arrive. Drop all pending reads without replying; the
+                // handle interprets a dropped reply as LearnerError::DroppedReply,
+                // and the router retries against the new shard's learners.
+                self.pending_reads.clear();
+                return;
+            }
+        };
         // Assign the fetched upper as the linearization target for all pending
         // reads, then check if any can be served immediately.
-        let target = upper.as_option().copied().unwrap_or(u64::MAX);
         let pending = std::mem::take(&mut self.pending_reads);
         self.linearizing_reads
             .entry(target)
@@ -1120,10 +1130,7 @@ impl<E: EventSource> PersistLearner<E> {
                         received_at,
                     });
             }
-            PersistLearnerCommand::GetRetractions {
-                frontier,
-                reply,
-            } => {
+            PersistLearnerCommand::GetRetractions { frontier, reply } => {
                 let listen_frontier = self
                     .log_shard
                     .listen_frontier

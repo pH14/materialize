@@ -39,10 +39,10 @@ pub mod bench_client;
 pub mod directory;
 pub mod factory;
 
+pub mod actors;
 pub mod fault;
 pub mod latency_blob;
 pub mod metrics;
-pub mod actors;
 pub mod process_factory;
 pub mod rpc;
 pub mod uds;
@@ -96,6 +96,20 @@ pub struct PartitionMap {
     pub ranges: Vec<RangeAssignment>,
 }
 
+impl std::fmt::Display for PartitionMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "epoch={}", self.epoch)?;
+        for r in &self.ranges {
+            write!(
+                f,
+                "\n  [0x{:02x}, 0x{:03x}) -> {}",
+                r.lo, r.hi_exclusive, r.log_shard
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// A single range in the partition map.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RangeAssignment {
@@ -105,6 +119,18 @@ pub struct RangeAssignment {
     pub hi_exclusive: u16,
     /// Log shard that accepts writes for this range.
     pub log_shard: ShardId,
+}
+
+impl RangeAssignment {
+    /// Returns true if the given partition key byte falls within this range.
+    pub fn contains_key(&self, pk: u8) -> bool {
+        pk >= self.lo && u16::from(pk) < self.hi_exclusive
+    }
+
+    /// Returns true if a shard key's partition falls within this range.
+    pub fn contains_partition_key(&self, shard_key: &str) -> bool {
+        self.contains_key(partition_key(shard_key))
+    }
 }
 
 impl PartitionMap {
@@ -130,7 +156,7 @@ impl PartitionMap {
     /// Route a partition key byte to its log shard.
     pub fn route_key(&self, key: u8) -> ShardId {
         for r in &self.ranges {
-            if key >= r.lo && u16::from(key) < r.hi_exclusive {
+            if r.contains_key(key) {
                 return r.log_shard;
             }
         }
@@ -270,6 +296,11 @@ pub enum MetaError {
     ReconfigurationInProgress,
     /// The expected epoch did not match the current epoch.
     EpochMismatch { expected: u64, actual: u64 },
+    /// This meta actor was fenced by another writer on the metashard persist shard.
+    Fenced {
+        stale_epoch: u64,
+        current_epoch: u64,
+    },
 }
 
 impl std::fmt::Display for MetaError {
@@ -282,7 +313,21 @@ impl std::fmt::Display for MetaError {
                 write!(f, "reconfiguration already in progress")
             }
             MetaError::EpochMismatch { expected, actual } => {
-                write!(f, "epoch mismatch: expected {}, actual {}", expected, actual)
+                write!(
+                    f,
+                    "epoch mismatch: expected {}, actual {}",
+                    expected, actual
+                )
+            }
+            MetaError::Fenced {
+                stale_epoch,
+                current_epoch,
+            } => {
+                write!(
+                    f,
+                    "meta actor fenced: our epoch {} is stale, current epoch {}",
+                    stale_epoch, current_epoch
+                )
             }
         }
     }
@@ -329,9 +374,6 @@ pub trait Learner: Clone + std::fmt::Debug + Send + Sync + 'static {
 /// pre-hydrate → seal → commit → finalize.
 #[async_trait::async_trait]
 pub trait Metashard: Clone + std::fmt::Debug + Send + Sync + 'static {
-    /// Look up which log shard owns a client shard.
-    async fn lookup(&self, client_shard: &str) -> Result<ShardId, MetaError>;
-
     /// Return the current partition map.
     async fn partition_map(&self) -> Result<PartitionMap, MetaError>;
 
@@ -362,10 +404,7 @@ pub trait RetractionSource: Send + Sync + 'static {
     /// Returns a read-only snapshot — the learner retains entries in
     /// `pending_retractions` until it sees the -1 diffs arrive via the
     /// subscription (confirming the acceptor flushed them).
-    async fn get_retractions(
-        &self,
-        frontier: u64,
-    ) -> Vec<(actors::OrderedKey, actors::Proposal)>;
+    async fn get_retractions(&self, frontier: u64) -> Vec<(actors::OrderedKey, actors::Proposal)>;
 }
 
 /// A no-op retraction source that always returns an empty list.
@@ -376,10 +415,7 @@ pub struct NoOpRetractionSource;
 
 #[async_trait::async_trait]
 impl RetractionSource for NoOpRetractionSource {
-    async fn get_retractions(
-        &self,
-        _frontier: u64,
-    ) -> Vec<(actors::OrderedKey, actors::Proposal)> {
+    async fn get_retractions(&self, _frontier: u64) -> Vec<(actors::OrderedKey, actors::Proposal)> {
         Vec::new()
     }
 }
@@ -403,9 +439,7 @@ mod partition_map_tests {
 
     fn test_shard(suffix: &str) -> ShardId {
         // ShardId::new() generates random IDs; for deterministic tests, parse a known one.
-        format!("s{:0>32}", suffix)
-            .parse()
-            .expect("valid shard id")
+        format!("s{:0>32}", suffix).parse().expect("valid shard id")
     }
 
     #[test]
@@ -511,10 +545,26 @@ mod partition_map_tests {
         let map1 = PartitionMap {
             epoch: 1,
             ranges: vec![
-                RangeAssignment { lo: 0x00, hi_exclusive: 0x40, log_shard: s1 },
-                RangeAssignment { lo: 0x40, hi_exclusive: 0x80, log_shard: s2 },
-                RangeAssignment { lo: 0x80, hi_exclusive: 0xC0, log_shard: s3 },
-                RangeAssignment { lo: 0xC0, hi_exclusive: 0x100, log_shard: s4 },
+                RangeAssignment {
+                    lo: 0x00,
+                    hi_exclusive: 0x40,
+                    log_shard: s1,
+                },
+                RangeAssignment {
+                    lo: 0x40,
+                    hi_exclusive: 0x80,
+                    log_shard: s2,
+                },
+                RangeAssignment {
+                    lo: 0x80,
+                    hi_exclusive: 0xC0,
+                    log_shard: s3,
+                },
+                RangeAssignment {
+                    lo: 0xC0,
+                    hi_exclusive: 0x100,
+                    log_shard: s4,
+                },
             ],
         };
         assert!(map1.validate().is_ok());
@@ -542,9 +592,21 @@ mod partition_map_tests {
         let map = PartitionMap {
             epoch: 0,
             ranges: vec![
-                RangeAssignment { lo: 0x00, hi_exclusive: 0x55, log_shard: s1 },
-                RangeAssignment { lo: 0x55, hi_exclusive: 0xAA, log_shard: s2 },
-                RangeAssignment { lo: 0xAA, hi_exclusive: 0x100, log_shard: s3 },
+                RangeAssignment {
+                    lo: 0x00,
+                    hi_exclusive: 0x55,
+                    log_shard: s1,
+                },
+                RangeAssignment {
+                    lo: 0x55,
+                    hi_exclusive: 0xAA,
+                    log_shard: s2,
+                },
+                RangeAssignment {
+                    lo: 0xAA,
+                    hi_exclusive: 0x100,
+                    log_shard: s3,
+                },
             ],
         };
         assert!(map.validate().is_ok());

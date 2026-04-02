@@ -24,12 +24,11 @@ use timely::progress::Antichain;
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist_client::{PersistClient, ShardId};
 
-use crate::directory::ServiceDirectory;
-use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
+use crate::directory::ServiceDirectory;
+use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::rpc::{GrpcAcceptorHandle, GrpcLearnerHandle};
-use crate::actors::router::ShardedRetractionSource;
 use crate::{Acceptor, AcceptorConfig, Learner, RangeAssignment};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +67,23 @@ pub trait ActorFactory: Send + Sync + 'static {
     async fn stop_shard(&self, _shard_id: ShardId) {}
 }
 
+/// Blanket impl: `Arc<R>` delegates to `R`.
+#[async_trait::async_trait]
+impl<R: crate::actors::router::HandleResolver> crate::actors::router::HandleResolver
+    for std::sync::Arc<R>
+{
+    type A = R::A;
+    type L = R::L;
+
+    async fn resolve_acceptor(&self, shard_id: ShardId) -> Result<Self::A, String> {
+        (**self).resolve_acceptor(shard_id).await
+    }
+
+    async fn resolve_learners(&self, shard_id: ShardId) -> Result<Vec<Self::L>, String> {
+        (**self).resolve_learners(shard_id).await
+    }
+}
+
 /// Blanket impl: `Arc<F>` delegates to `F`.
 #[async_trait::async_trait]
 impl<F: ActorFactory> ActorFactory for std::sync::Arc<F> {
@@ -81,7 +97,9 @@ impl<F: ActorFactory> ActorFactory for std::sync::Arc<F> {
         predecessors: Vec<(ShardId, Antichain<u64>)>,
         range: RangeAssignment,
     ) -> Result<Self::A, String> {
-        (**self).create_acceptor(shard_id, epoch, predecessors, range).await
+        (**self)
+            .create_acceptor(shard_id, epoch, predecessors, range)
+            .await
     }
 
     async fn create_learner(&self, shard_id: ShardId) -> Result<Self::L, String> {
@@ -116,22 +134,6 @@ impl InProcessActorFactory {
             learners: Mutex::new(BTreeMap::new()),
         }
     }
-
-    /// Wire the acceptor's retraction source to query the learner for the
-    /// given shard, if both exist in the cache.
-    async fn maybe_wire_retractions(&self, shard_id: ShardId) {
-        let (acceptor, learner) = {
-            let acceptors = self.acceptors.lock().unwrap();
-            let learners = self.learners.lock().unwrap();
-            match (acceptors.get(&shard_id), learners.get(&shard_id)) {
-                (Some(a), Some(l)) => (a.clone(), l.clone()),
-                _ => return,
-            }
-        };
-        let source: Box<dyn crate::RetractionSource> =
-            Box::new(ShardedRetractionSource::new(vec![learner]));
-        let _ = acceptor.set_retraction_source(source).await;
-    }
 }
 
 #[async_trait::async_trait]
@@ -160,15 +162,17 @@ impl ActorFactory for InProcessActorFactory {
             shard_id,
             acceptor_metrics,
             epoch,
+            // REVIEW: STOP DOING THIS THIS NEEDS TO BE A REAL SOURCE
             Box::new(crate::NoOpRetractionSource),
             predecessors,
             range,
         )
         .await;
 
-        self.acceptors.lock().unwrap().insert(shard_id, handle.clone());
-        // Wire retractions if the learner was already created.
-        self.maybe_wire_retractions(shard_id).await;
+        self.acceptors
+            .lock()
+            .unwrap()
+            .insert(shard_id, handle.clone());
         Ok(handle)
     }
 
@@ -189,9 +193,10 @@ impl ActorFactory for InProcessActorFactory {
         )
         .await;
 
-        self.learners.lock().unwrap().insert(shard_id, handle.clone());
-        // Wire retractions if the acceptor was already created.
-        self.maybe_wire_retractions(shard_id).await;
+        self.learners
+            .lock()
+            .unwrap()
+            .insert(shard_id, handle.clone());
         Ok(handle)
     }
 
@@ -200,6 +205,34 @@ impl ActorFactory for InProcessActorFactory {
         // shuts down the actor tasks.
         self.acceptors.lock().unwrap().remove(&shard_id);
         self.learners.lock().unwrap().remove(&shard_id);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::actors::router::HandleResolver for InProcessActorFactory {
+    type A = PersistAcceptorHandle;
+    type L = PersistLearnerHandle;
+
+    async fn resolve_acceptor(&self, shard_id: ShardId) -> Result<PersistAcceptorHandle, String> {
+        self.acceptors
+            .lock()
+            .unwrap()
+            .get(&shard_id)
+            .cloned()
+            .ok_or_else(|| format!("no acceptor for shard {shard_id}"))
+    }
+
+    async fn resolve_learners(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Vec<PersistLearnerHandle>, String> {
+        self.learners
+            .lock()
+            .unwrap()
+            .get(&shard_id)
+            .cloned()
+            .map(|h| vec![h])
+            .ok_or_else(|| format!("no learner for shard {shard_id}"))
     }
 }
 
@@ -251,7 +284,10 @@ impl<D: ServiceDirectory<Addr = String>> ActorFactory for GrpcActorFactory<D> {
 
         let addr = self.directory.acceptor_addr(shard_id);
         let handle = GrpcAcceptorHandle::connect_with_retry(addr, self.connect_timeout).await?;
-        self.acceptors.lock().unwrap().insert(shard_id, handle.clone());
+        self.acceptors
+            .lock()
+            .unwrap()
+            .insert(shard_id, handle.clone());
         Ok(handle)
     }
 
@@ -261,11 +297,57 @@ impl<D: ServiceDirectory<Addr = String>> ActorFactory for GrpcActorFactory<D> {
         }
 
         let addrs = self.directory.learner_addrs(shard_id);
-        let addr = addrs.into_iter().next().ok_or_else(|| {
-            format!("no learner address for shard {shard_id}")
-        })?;
+        let addr = addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no learner address for shard {shard_id}"))?;
         let handle = GrpcLearnerHandle::connect_with_retry(addr, self.connect_timeout).await?;
-        self.learners.lock().unwrap().insert(shard_id, handle.clone());
+        self.learners
+            .lock()
+            .unwrap()
+            .insert(shard_id, handle.clone());
         Ok(handle)
+    }
+}
+
+#[async_trait::async_trait]
+impl<D: ServiceDirectory<Addr = String>> crate::actors::router::HandleResolver
+    for GrpcActorFactory<D>
+{
+    type A = GrpcAcceptorHandle;
+    type L = GrpcLearnerHandle;
+
+    async fn resolve_acceptor(&self, shard_id: ShardId) -> Result<GrpcAcceptorHandle, String> {
+        // Reuse the factory's caching connect logic.
+        // HandleResolver doesn't create actors — it connects to existing ones.
+        // In gRPC mode, "resolve" and "connect" are the same operation.
+        let addr = self.directory.acceptor_addr(shard_id);
+        if let Some(handle) = self.acceptors.lock().unwrap().get(&shard_id) {
+            return Ok(handle.clone());
+        }
+        let handle =
+            GrpcAcceptorHandle::connect_with_retry(addr, self.connect_timeout).await?;
+        self.acceptors
+            .lock()
+            .unwrap()
+            .insert(shard_id, handle.clone());
+        Ok(handle)
+    }
+
+    async fn resolve_learners(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Vec<GrpcLearnerHandle>, String> {
+        let addrs = self.directory.learner_addrs(shard_id);
+        if addrs.is_empty() {
+            return Err(format!("no learner address for shard {shard_id}"));
+        }
+        let mut handles = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let handle =
+                GrpcLearnerHandle::connect_with_retry(addr, self.connect_timeout).await?;
+            handles.push(handle);
+        }
+        Ok(handles)
     }
 }

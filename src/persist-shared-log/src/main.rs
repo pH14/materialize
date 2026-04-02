@@ -36,12 +36,12 @@ use mz_persist_client::rpc::{
     GrpcPubSubClient, PersistGrpcPubSubServer, PersistPubSubClient, PersistPubSubClientConfig,
 };
 use mz_persist_client::{PersistClient, ShardId};
-use mz_persist_shared_log::factory::InProcessActorFactory;
 use mz_persist_shared_log::actors::meta::{MetaState, PersistMetaActor};
+use mz_persist_shared_log::actors::router::Router;
+use mz_persist_shared_log::factory::InProcessActorFactory;
 use mz_persist_shared_log::rpc::{
     AcceptorGrpcServer, ConsensusAcceptorServer, ConsensusLearnerServer, LearnerGrpcServer,
 };
-use mz_persist_shared_log::actors::router::Router;
 use mz_persist_shared_log::{AcceptorConfig, PartitionMap, RangeAssignment};
 
 /// Persist shared log service.
@@ -172,7 +172,10 @@ async fn open_persist_client_with_local_pubsub(
     );
     let location = mz_persist_types::PersistLocation {
         blob_uri: storage.blob_url.parse().expect("invalid --blob-url"),
-        consensus_uri: storage.consensus_url.parse().expect("invalid --consensus-url"),
+        consensus_uri: storage
+            .consensus_url
+            .parse()
+            .expect("invalid --consensus-url"),
     };
     cache
         .open(location)
@@ -199,7 +202,10 @@ async fn open_persist_client_hosting_pubsub(
     );
     let location = mz_persist_types::PersistLocation {
         blob_uri: storage.blob_url.parse().expect("invalid --blob-url"),
-        consensus_uri: storage.consensus_url.parse().expect("invalid --consensus-url"),
+        consensus_uri: storage
+            .consensus_url
+            .parse()
+            .expect("invalid --consensus-url"),
     };
     let client = cache
         .open(location)
@@ -239,7 +245,10 @@ async fn open_persist_client_with_remote_pubsub(
     );
     let location = mz_persist_types::PersistLocation {
         blob_uri: storage.blob_url.parse().expect("invalid --blob-url"),
-        consensus_uri: storage.consensus_url.parse().expect("invalid --consensus-url"),
+        consensus_uri: storage
+            .consensus_url
+            .parse()
+            .expect("invalid --consensus-url"),
     };
     cache
         .open(location)
@@ -583,7 +592,7 @@ async fn run_monolith(args: MonolithArgs) {
 
     let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
 
-    let (metashard_actor, metashard_handle) = PersistMetaActor::new(
+    let (_metashard_handle, recover_result, _metashard_task) = PersistMetaActor::spawn(
         bootstrap_state,
         256,
         persist_client.clone(),
@@ -592,9 +601,8 @@ async fn run_monolith(args: MonolithArgs) {
     )
     .await;
 
-    // --- Step 2: Read the (possibly recovered) partition map ---
-    let partition_map = metashard_actor.state().partition_map.clone();
-    let epoch = metashard_actor.state().epoch;
+    let partition_map = recover_result.partition_map;
+    let epoch = recover_result.epoch;
     info!(
         epoch,
         num_ranges = partition_map.ranges.len(),
@@ -609,31 +617,20 @@ async fn run_monolith(args: MonolithArgs) {
             .collect::<Vec<_>>()
     );
 
-    // --- Step 3: Start metashard actor ---
-    let _metashard_task = mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
-
     // --- Step 4: Build Router ---
-    let router = Router::new(
-        PartitionMap {
-            epoch: 0,
-            ranges: vec![],
-        },
-        BTreeMap::new(),
-        BTreeMap::new(),
-    );
+    let (router, router_handle, routing_tx) = Router::new(4096);
     mz_persist_shared_log::actors::router::spawn_routing_task(
         &persist_client,
         metashard_shard_id,
         Arc::clone(&factory),
-        router.routing_handle(),
-        router.routing_notify(),
+        routing_tx,
     )
     .await;
-    let router = router.with_metashard(metashard_handle);
+    mz_ore::task::spawn(|| "router", router.run());
 
     info!(addr = %args.listen_addr, "starting gRPC server");
     Server::builder()
-        .add_service(PersistSharedLogServer::new(router))
+        .add_service(PersistSharedLogServer::new(router_handle))
         .serve(args.listen_addr)
         .await
         .expect("gRPC server failed");
@@ -650,8 +647,14 @@ async fn run_acceptor(args: AcceptorArgs) {
     let shard_id: ShardId = args.shard_id.parse().expect("invalid --shard-id");
 
     // Derive socket paths from ProcessDirectory convention.
-    let acceptor_sock = args.run_dir.join(format!("acceptor-{shard_id}")).join("grpc.sock");
-    let pubsub_sock = args.run_dir.join(format!("pubsub-{shard_id}")).join("grpc.sock");
+    let acceptor_sock = args
+        .run_dir
+        .join(format!("acceptor-{shard_id}"))
+        .join("grpc.sock");
+    let pubsub_sock = args
+        .run_dir
+        .join(format!("pubsub-{shard_id}"))
+        .join("grpc.sock");
     info!(%shard_id, epoch = args.epoch, ?acceptor_sock, ?pubsub_sock, "starting standalone acceptor");
 
     // Create PersistClient with same-process pubsub and get the server handle
@@ -662,7 +665,10 @@ async fn run_acceptor(args: AcceptorArgs) {
     // Serve pubsub on a Unix socket for remote learners.
     let pubsub_path = pubsub_sock.clone();
     mz_ore::task::spawn(|| "persist-pubsub-server", async move {
-        info!(?pubsub_path, "starting persist pubsub server on Unix socket");
+        info!(
+            ?pubsub_path,
+            "starting persist pubsub server on Unix socket"
+        );
         let uds = {
             if let Some(parent) = pubsub_path.parent() {
                 std::fs::create_dir_all(parent).expect("create pubsub socket dir");
@@ -690,7 +696,9 @@ async fn run_acceptor(args: AcceptorArgs) {
         .predecessors
         .iter()
         .map(|(shard_str, since)| {
-            let pred_shard: ShardId = shard_str.parse().expect("predecessor shard ID validated at parse time");
+            let pred_shard: ShardId = shard_str
+                .parse()
+                .expect("predecessor shard ID validated at parse time");
             (pred_shard, timely::progress::Antichain::from_elem(*since))
         })
         .collect();
@@ -707,7 +715,10 @@ async fn run_acceptor(args: AcceptorArgs) {
     )
     .await;
 
-    info!(?acceptor_sock, "starting acceptor gRPC server on Unix socket");
+    info!(
+        ?acceptor_sock,
+        "starting acceptor gRPC server on Unix socket"
+    );
     let router = Server::builder().add_service(ConsensusAcceptorServer::new(
         AcceptorGrpcServer::new(handle),
     ));
@@ -732,7 +743,10 @@ async fn run_learner(args: LearnerArgs) {
         .run_dir
         .join(format!("learner-{shard_id}-{replica_id}"))
         .join("grpc.sock");
-    let pubsub_sock = args.run_dir.join(format!("pubsub-{shard_id}")).join("grpc.sock");
+    let pubsub_sock = args
+        .run_dir
+        .join(format!("pubsub-{shard_id}"))
+        .join("grpc.sock");
     let pubsub_path = pubsub_sock.to_string_lossy().to_string();
     info!(%shard_id, replica_id, ?learner_sock, pubsub = %pubsub_path, "starting standalone learner");
 
@@ -746,8 +760,7 @@ async fn run_learner(args: LearnerArgs) {
     .await;
 
     let shard_registry = MetricsRegistry::new();
-    let learner_metrics =
-        mz_persist_shared_log::metrics::LearnerMetrics::register(&shard_registry);
+    let learner_metrics = mz_persist_shared_log::metrics::LearnerMetrics::register(&shard_registry);
 
     let (handle, _task) = mz_persist_shared_log::actors::learner::PersistLearner::spawn(
         mz_persist_shared_log::actors::learner::PersistLearnerConfig::default(),
@@ -758,9 +771,8 @@ async fn run_learner(args: LearnerArgs) {
     .await;
 
     info!(?learner_sock, "starting learner gRPC server on Unix socket");
-    let router = Server::builder().add_service(ConsensusLearnerServer::new(
-        LearnerGrpcServer::new(handle),
-    ));
+    let router =
+        Server::builder().add_service(ConsensusLearnerServer::new(LearnerGrpcServer::new(handle)));
     mz_persist_shared_log::uds::serve_uds(&learner_sock, router)
         .await
         .expect("learner gRPC server failed");
@@ -801,7 +813,10 @@ async fn run_metashard(args: MetashardArgs) {
         .join("pubsub.sock");
     let pubsub_path = pubsub_sock.clone();
     mz_ore::task::spawn(|| "metashard-pubsub-server", async move {
-        info!(?pubsub_path, "starting metashard pubsub server on Unix socket");
+        info!(
+            ?pubsub_path,
+            "starting metashard pubsub server on Unix socket"
+        );
         let uds = {
             if let Some(parent) = pubsub_path.parent() {
                 std::fs::create_dir_all(parent).expect("create pubsub socket dir");
@@ -848,7 +863,7 @@ async fn run_metashard(args: MetashardArgs) {
         ),
     );
 
-    let (metashard_actor, metashard_handle) = PersistMetaActor::new(
+    let (metashard_handle, recover_result, _metashard_task) = PersistMetaActor::spawn(
         bootstrap_state,
         256,
         persist_client,
@@ -857,8 +872,8 @@ async fn run_metashard(args: MetashardArgs) {
     )
     .await;
 
-    let partition_map = metashard_actor.state().partition_map.clone();
-    let epoch = metashard_actor.state().epoch;
+    let partition_map = recover_result.partition_map;
+    let epoch = recover_result.epoch;
     info!(
         epoch,
         num_ranges = partition_map.ranges.len(),
@@ -873,11 +888,11 @@ async fn run_metashard(args: MetashardArgs) {
             .collect::<Vec<_>>()
     );
 
-    // Start the metashard actor on a background task.
-    mz_ore::task::spawn(|| "persist-metashard", metashard_actor.run());
-
     // Serve the ConsensusMetashard gRPC service on a Unix socket (grpcurl-able).
-    info!(?metashard_sock, "starting metashard gRPC server on Unix socket");
+    info!(
+        ?metashard_sock,
+        "starting metashard gRPC server on Unix socket"
+    );
     let router = Server::builder().add_service(ConsensusMetashardServer::new(
         MetashardGrpcServer::new(metashard_handle),
     ));
@@ -904,10 +919,8 @@ async fn run_router(args: RouterArgs) {
         .to_string_lossy()
         .to_string();
 
-    let directory = mz_persist_shared_log::directory::ProcessDirectory::new(
-        args.run_dir,
-        metashard_shard_id,
-    );
+    let directory =
+        mz_persist_shared_log::directory::ProcessDirectory::new(args.run_dir, metashard_shard_id);
     info!(
         %metashard_shard_id,
         metashard_pubsub = %metashard_pubsub_path,
@@ -931,23 +944,19 @@ async fn run_router(args: RouterArgs) {
 
     // Start with empty routing — the routing task populates it from the
     // metashard persist shard.
-    let router = Router::from_routing(Arc::new(
-        tokio::sync::RwLock::new(
-            mz_persist_shared_log::actors::router::RoutingSnapshot::empty(),
-        ),
-    ));
+    let (router, router_handle, routing_tx) = Router::new(4096);
     mz_persist_shared_log::actors::router::spawn_routing_task(
         &persist_client,
         metashard_shard_id,
         Arc::clone(&factory),
-        router.routing_handle(),
-        router.routing_notify(),
+        routing_tx,
     )
     .await;
+    mz_ore::task::spawn(|| "router", router.run());
 
     info!(addr = %args.listen_addr, "starting router gRPC server");
     Server::builder()
-        .add_service(PersistSharedLogServer::new(router))
+        .add_service(PersistSharedLogServer::new(router_handle))
         .serve(args.listen_addr)
         .await
         .expect("router gRPC server failed");

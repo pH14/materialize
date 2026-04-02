@@ -31,11 +31,9 @@ use mz_persist_client::critical::{CriticalReaderId, Opaque, SinceHandle};
 use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
-use crate::factory::ActorFactory;
 use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
-use crate::{
-    MetaError, PartitionMap, RangeAssignment, ReconfigurationPlan,
-};
+use crate::factory::ActorFactory;
+use crate::{MetaError, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 // ---------------------------------------------------------------------------
 // Metashard state
@@ -131,16 +129,177 @@ impl MetaState {
 }
 
 // ---------------------------------------------------------------------------
+// Proto encode / decode helpers
+// ---------------------------------------------------------------------------
+
+use mz_persist::generated::consensus_service::{
+    ProtoLogShardPredecessor, ProtoMetashardState, ProtoRangeAssignment, ProtoReconfigurationIntent,
+};
+
+/// Parse a `ProtoRangeAssignment` into a `RangeAssignment`.
+pub fn parse_proto_range(r: &ProtoRangeAssignment) -> Option<RangeAssignment> {
+    Some(RangeAssignment {
+        lo: u8::try_from(r.lo).ok()?,
+        hi_exclusive: u16::try_from(r.hi_exclusive).ok()?,
+        log_shard: r.log_shard.parse().ok()?,
+    })
+}
+
+/// Encode `MetaState` into protobuf bytes for durable storage.
+pub fn encode_meta_state(state: &MetaState) -> Bytes {
+    let proto = ProtoMetashardState {
+        epoch: state.epoch,
+        ranges: state
+            .partition_map
+            .ranges
+            .iter()
+            .map(|r| ProtoRangeAssignment {
+                lo: u32::from(r.lo),
+                hi_exclusive: u32::from(r.hi_exclusive),
+                log_shard: r.log_shard.to_string(),
+            })
+            .collect(),
+        predecessors: state
+            .log_shards
+            .iter()
+            .filter(|(_, info)| !info.predecessors.is_empty())
+            .map(|(shard_id, info)| ProtoLogShardPredecessor {
+                shard: shard_id.to_string(),
+                predecessors: info.predecessors.iter().map(|p| p.to_string()).collect(),
+            })
+            .collect(),
+        intent: state
+            .pending_intent
+            .as_ref()
+            .map(|intent| ProtoReconfigurationIntent {
+                status: format!("{:?}", intent.status),
+                epoch: intent.epoch,
+                new_ranges: intent
+                    .plan
+                    .new_partition_map
+                    .ranges
+                    .iter()
+                    .map(|r| ProtoRangeAssignment {
+                        lo: u32::from(r.lo),
+                        hi_exclusive: u32::from(r.hi_exclusive),
+                        log_shard: r.log_shard.to_string(),
+                    })
+                    .collect(),
+            }),
+    };
+    Bytes::from(proto.encode_to_vec())
+}
+
+/// Decode protobuf bytes into updates applied to a `MetaState`.
+///
+/// Restores the partition map, predecessor chains, and any pending
+/// reconfiguration intent from the durable representation.
+pub fn decode_meta_state(data: &[u8], state: &mut MetaState) -> Result<(), String> {
+    let proto = ProtoMetashardState::decode(data)
+        .map_err(|e| format!("failed to decode metashard proto: {e}"))?;
+
+    // Restore predecessors.
+    for pred_entry in &proto.predecessors {
+        if let Ok(shard) = pred_entry.shard.parse::<ShardId>() {
+            let preds: Vec<ShardId> = pred_entry
+                .predecessors
+                .iter()
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            if !preds.is_empty() {
+                state
+                    .log_shards
+                    .entry(shard)
+                    .or_insert_with(|| LogShardInfo {
+                        status: LogShardStatus::Active,
+                        epoch_created: 0,
+                        epoch_sealed: None,
+                        range: RangeAssignment {
+                            lo: 0,
+                            hi_exclusive: 0,
+                            log_shard: shard,
+                        },
+                        predecessors: Vec::new(),
+                        has_snapshot: false,
+                    })
+                    .predecessors = preds;
+            }
+        }
+    }
+
+    // Restore intent.
+    if let Some(intent_proto) = &proto.intent {
+        let status = match intent_proto.status.as_str() {
+            "Preparing" => IntentStatus::Preparing,
+            "Sealed" => IntentStatus::Sealed,
+            "Committed" => IntentStatus::Committed,
+            _ => IntentStatus::Preparing,
+        };
+        let intent_ranges: Vec<RangeAssignment> = intent_proto
+            .new_ranges
+            .iter()
+            .filter_map(parse_proto_range)
+            .collect();
+        if !intent_ranges.is_empty() {
+            let plan = ReconfigurationPlan {
+                expected_epoch: intent_proto.epoch.saturating_sub(1),
+                new_partition_map: PartitionMap {
+                    epoch: intent_proto.epoch,
+                    ranges: intent_ranges,
+                },
+            };
+            state.pending_intent = Some(ReconfigurationIntent {
+                epoch: intent_proto.epoch,
+                plan,
+                status,
+            });
+            info!(
+                epoch = intent_proto.epoch,
+                "recovered pending reconfiguration intent"
+            );
+        }
+    }
+
+    // Restore partition map.
+    let persisted_ranges: Vec<RangeAssignment> =
+        proto.ranges.iter().filter_map(parse_proto_range).collect();
+    if !persisted_ranges.is_empty() {
+        let map = PartitionMap {
+            epoch: proto.epoch,
+            ranges: persisted_ranges,
+        };
+        if map.validate().is_ok() {
+            info!(
+                epoch = proto.epoch,
+                num_ranges = map.ranges.len(),
+                "restored partition map from durable state"
+            );
+            state.epoch = proto.epoch;
+            state.partition_map = map;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
+/// Result of the `Recover` command, providing the recovered state to callers.
+#[derive(Debug, Clone)]
+pub struct RecoverResult {
+    pub epoch: u64,
+    pub partition_map: PartitionMap,
+}
+
 /// Commands dispatched to the metashard actor.
 pub enum MetaCommand {
-    /// Look up which log shard owns a client shard.
-    // TODO: Consider removing — callers can use `PartitionMap::route` directly.
-    Lookup {
-        client_shard: String,
-        reply: oneshot::Sender<Result<ShardId, MetaError>>,
+    /// Recover durable state from the metashard persist shard, resume pending
+    /// intents, and create actors for all shards. Injected as the first
+    /// command after actor startup.
+    Recover {
+        reply: oneshot::Sender<Result<RecoverResult, MetaError>>,
     },
     /// Return the current partition map.
     GetPartitionMap {
@@ -171,22 +330,21 @@ impl PersistMetaHandle {
     pub fn new(tx: mpsc::Sender<MetaCommand>) -> Self {
         PersistMetaHandle { tx }
     }
-}
 
-#[async_trait::async_trait]
-impl crate::Metashard for PersistMetaHandle {
-    async fn lookup(&self, client_shard: &str) -> Result<ShardId, MetaError> {
+    /// Recover durable state and create actors. Sent as the first command
+    /// after actor startup.
+    pub async fn recover(&self) -> Result<RecoverResult, MetaError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(MetaCommand::Lookup {
-                client_shard: client_shard.to_string(),
-                reply: reply_tx,
-            })
+            .send(MetaCommand::Recover { reply: reply_tx })
             .await
             .map_err(|_| MetaError::Shutdown)?;
         reply_rx.await.map_err(|_| MetaError::DroppedReply)?
     }
+}
 
+#[async_trait::async_trait]
+impl crate::Metashard for PersistMetaHandle {
     async fn partition_map(&self) -> Result<PartitionMap, MetaError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -246,10 +404,11 @@ pub struct PersistMetaActor<F: ActorFactory> {
 }
 
 impl<F: ActorFactory> PersistMetaActor<F> {
-    /// Create a new metashard actor. Opens the durable state persist shard
-    /// eagerly and recovers any persisted state (partition map, pending intents).
+    /// Create a new metashard actor. Opens the metashard persist shard write
+    /// handle but does NOT recover durable state — recovery is performed by
+    /// the `Recover` command, injected as the first command after actor startup.
     pub async fn new(
-        mut state: MetaState,
+        state: MetaState,
         queue_depth: usize,
         persist_client: PersistClient,
         factory: F,
@@ -257,168 +416,22 @@ impl<F: ActorFactory> PersistMetaActor<F> {
     ) -> (Self, PersistMetaHandle) {
         let (tx, rx) = mpsc::channel(queue_depth);
 
-        let key_schema = Arc::new(OrderedKeySchema);
-        let val_schema = Arc::new(ProposalSchema);
-
         let mut metashard_write = persist_client
             .open_writer::<OrderedKey, Proposal, u64, i64>(
                 metashard_shard_id,
-                Arc::clone(&key_schema),
-                Arc::clone(&val_schema),
+                Arc::new(OrderedKeySchema),
+                Arc::new(ProposalSchema),
                 Diagnostics::from_purpose("metashard-durable-state"),
             )
             .await
             .expect("open metashard persist shard writer");
 
+        // Advance upper past T=0 so subscribers can distinguish "no data" from
+        // "initial state". This is a one-time bootstrap, cheap and idempotent.
         if metashard_write.upper().as_option() == Some(&0) {
             metashard_write
                 .advance_upper(&Antichain::from_elem(1))
                 .await;
-        }
-
-        // Recover persisted state (partition map, predecessors, pending intent).
-        let (_, read) = persist_client
-            .open::<OrderedKey, Proposal, u64, i64>(
-                metashard_shard_id,
-                key_schema,
-                val_schema,
-                Diagnostics::from_purpose("metashard-durable-state-read"),
-                false,
-            )
-            .await
-            .expect("open metashard persist shard reader");
-
-        let since = read.since().clone();
-        let mut subscribe = read
-            .subscribe(since)
-            .await
-            .expect("subscribe to metashard shard");
-
-        let mut latest_data: Option<Bytes> = None;
-        loop {
-            let events = subscribe.fetch_next().await;
-            let mut done = false;
-            for event in &events {
-                match event {
-                    ListenEvent::Progress(frontier) => {
-                        if frontier.as_option().copied()
-                            >= metashard_write.upper().as_option().copied()
-                        {
-                            done = true;
-                        }
-                    }
-                    ListenEvent::Updates(updates) => {
-                        for ((key, proposal), _ts, diff) in updates {
-                            if *diff == 1 && key.shard == "__metashard" {
-                                latest_data = Some(proposal.encoded.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            if done {
-                break;
-            }
-        }
-
-        if let Some(data) = latest_data {
-            use mz_persist::generated::consensus_service::ProtoMetashardState;
-
-            let parse_range = |r: &mz_persist::generated::consensus_service::ProtoRangeAssignment| -> Option<RangeAssignment> {
-                Some(RangeAssignment {
-                    lo: u8::try_from(r.lo).ok()?,
-                    hi_exclusive: u16::try_from(r.hi_exclusive).ok()?,
-                    log_shard: r.log_shard.parse().ok()?,
-                })
-            };
-
-            match ProtoMetashardState::decode(data.as_ref()) {
-                Ok(proto) => {
-                    // Restore predecessors.
-                    for pred_entry in &proto.predecessors {
-                        if let Ok(shard) = pred_entry.shard.parse::<ShardId>() {
-                            let preds: Vec<ShardId> = pred_entry
-                                .predecessors
-                                .iter()
-                                .filter_map(|p| p.parse().ok())
-                                .collect();
-                            if !preds.is_empty() {
-                                state
-                                    .log_shards
-                                    .entry(shard)
-                                    .or_insert_with(|| LogShardInfo {
-                                        status: LogShardStatus::Active,
-                                        epoch_created: 0,
-                                        epoch_sealed: None,
-                                        range: RangeAssignment {
-                                            lo: 0,
-                                            hi_exclusive: 0,
-                                            log_shard: shard,
-                                        },
-                                        predecessors: Vec::new(),
-                                        has_snapshot: false,
-                                    })
-                                    .predecessors = preds;
-                            }
-                        }
-                    }
-
-                    // Restore intent.
-                    if let Some(intent_proto) = &proto.intent {
-                        let status = match intent_proto.status.as_str() {
-                            "Preparing" => IntentStatus::Preparing,
-                            "Sealed" => IntentStatus::Sealed,
-                            "Committed" => IntentStatus::Committed,
-                            _ => IntentStatus::Preparing,
-                        };
-                        let intent_ranges: Vec<RangeAssignment> = intent_proto
-                            .new_ranges
-                            .iter()
-                            .filter_map(parse_range)
-                            .collect();
-                        if !intent_ranges.is_empty() {
-                            let plan = ReconfigurationPlan {
-                                expected_epoch: intent_proto.epoch.saturating_sub(1),
-                                new_partition_map: PartitionMap {
-                                    epoch: intent_proto.epoch,
-                                    ranges: intent_ranges,
-                                },
-                            };
-                            state.pending_intent = Some(ReconfigurationIntent {
-                                epoch: intent_proto.epoch,
-                                plan,
-                                status,
-                            });
-                            info!(
-                                epoch = intent_proto.epoch,
-                                "recovered pending reconfiguration intent"
-                            );
-                        }
-                    }
-
-                    // Restore partition map.
-                    let persisted_ranges: Vec<RangeAssignment> =
-                        proto.ranges.iter().filter_map(parse_range).collect();
-                    if !persisted_ranges.is_empty() {
-                        let map = PartitionMap {
-                            epoch: proto.epoch,
-                            ranges: persisted_ranges,
-                        };
-                        if map.validate().is_ok() {
-                            info!(
-                                epoch = proto.epoch,
-                                num_ranges = map.ranges.len(),
-                                "restored partition map from durable state"
-                            );
-                            state.epoch = proto.epoch;
-                            state.partition_map = map;
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("failed to decode metashard proto, ignoring durable state: {e}");
-                }
-            }
         }
 
         let actor = PersistMetaActor {
@@ -434,59 +447,157 @@ impl<F: ActorFactory> PersistMetaActor<F> {
         (actor, handle)
     }
 
-    /// Persist the current metashard state to the durable shard.
-    async fn persist_state(&mut self) {
-        use mz_persist::generated::consensus_service::{
-            ProtoLogShardPredecessor, ProtoMetashardState, ProtoRangeAssignment,
-            ProtoReconfigurationIntent,
-        };
+    /// Recover durable state from the metashard persist shard, resume any
+    /// pending reconfiguration intent, and create actors for all shards in
+    /// the partition map.
+    async fn do_recover(&mut self) -> Result<RecoverResult, MetaError> {
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
 
-        let write = &mut self.metashard_write;
+        // Read persisted state (partition map, predecessors, pending intent).
+        let (_, read) = self
+            .persist_client
+            .open::<OrderedKey, Proposal, u64, i64>(
+                self.metashard_shard_id,
+                key_schema,
+                val_schema,
+                Diagnostics::from_purpose("metashard-durable-state-read"),
+                false,
+            )
+            .await
+            .expect("open metashard persist shard reader");
 
-        let proto =
-            ProtoMetashardState {
-                epoch: self.state.epoch,
-                ranges: self
-                    .state
-                    .partition_map
-                    .ranges
-                    .iter()
-                    .map(|r| ProtoRangeAssignment {
-                        lo: u32::from(r.lo),
-                        hi_exclusive: u32::from(r.hi_exclusive),
-                        log_shard: r.log_shard.to_string(),
-                    })
-                    .collect(),
-                predecessors: self
-                    .state
-                    .log_shards
-                    .iter()
-                    .filter(|(_, info)| !info.predecessors.is_empty())
-                    .map(|(shard_id, info)| ProtoLogShardPredecessor {
-                        shard: shard_id.to_string(),
-                        predecessors: info.predecessors.iter().map(|p| p.to_string()).collect(),
-                    })
-                    .collect(),
-                intent: self.state.pending_intent.as_ref().map(|intent| {
-                    ProtoReconfigurationIntent {
-                        status: format!("{:?}", intent.status),
-                        epoch: intent.epoch,
-                        new_ranges: intent
-                            .plan
-                            .new_partition_map
-                            .ranges
-                            .iter()
-                            .map(|r| ProtoRangeAssignment {
-                                lo: u32::from(r.lo),
-                                hi_exclusive: u32::from(r.hi_exclusive),
-                                log_shard: r.log_shard.to_string(),
-                            })
-                            .collect(),
+        let since = read.since().clone();
+        let mut subscribe = read
+            .subscribe(since)
+            .await
+            .expect("subscribe to metashard shard");
+
+        let mut latest_data: Option<Bytes> = None;
+        let upper = self.metashard_write.upper().clone();
+        'outer: loop {
+            let events = subscribe.fetch_next().await;
+            for event in &events {
+                match event {
+                    ListenEvent::Progress(frontier) => {
+                        if frontier.as_option().copied() >= upper.as_option().copied() {
+                            break 'outer;
+                        }
                     }
-                }),
-            };
+                    ListenEvent::Updates(updates) => {
+                        for ((key, proposal), _ts, diff) in updates {
+                            if *diff == 1 && key.shard == "__metashard" {
+                                latest_data = Some(proposal.encoded.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-        let data = Bytes::from(proto.encode_to_vec());
+        if let Some(data) = latest_data {
+            if let Err(e) = decode_meta_state(data.as_ref(), &mut self.state) {
+                warn!("{e}, ignoring durable state");
+            }
+        }
+
+        // Persist state so subscribers (routing task) can discover the partition map.
+        self.persist_state().await;
+
+        // Resume pending reconfiguration intent from a previous crash.
+        if let Some(intent) = self.state.pending_intent.take() {
+            info!(
+                epoch = intent.epoch,
+                status = ?intent.status,
+                "found pending reconfiguration intent — resuming"
+            );
+            match intent.status {
+                IntentStatus::Committed => {
+                    info!(epoch = intent.epoch, "intent already committed, clearing");
+                }
+                IntentStatus::Preparing | IntentStatus::Sealed => {
+                    info!(
+                        epoch = intent.epoch,
+                        "resuming reconfiguration from {:?}", intent.status
+                    );
+                    match self.do_reconfigure(intent.plan).await {
+                        Ok(new_epoch) => {
+                            info!(new_epoch, "crash recovery reconfiguration completed");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "crash recovery reconfiguration failed: {} — \
+                                 manual intervention may be required",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create actors for all shards in the partition map. The factory is
+        // idempotent — if actors were already created during crash recovery
+        // reconfiguration above, this returns cached handles.
+        for range in self.state.partition_map.ranges.clone() {
+            let shard_id = range.log_shard;
+            // Pass predecessors from recovered state (not empty vec).
+            let pred_specs: Vec<_> = self
+                .state
+                .log_shards
+                .get(&shard_id)
+                .map(|info| {
+                    info.predecessors
+                        .iter()
+                        .map(|p| (*p, Antichain::from_elem(0u64)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Err(e) = self
+                .factory
+                .create_acceptor(shard_id, self.state.epoch, pred_specs, range)
+                .await
+            {
+                tracing::error!(%shard_id, "failed to create acceptor at startup: {e}");
+            }
+            if let Err(e) = self.factory.create_learner(shard_id).await {
+                tracing::error!(%shard_id, "failed to create learner at startup: {e}");
+            }
+        }
+        info!(
+            num_shards = self.state.partition_map.ranges.len(),
+            "created actors for all shards in partition map"
+        );
+
+        Ok(RecoverResult {
+            epoch: self.state.epoch,
+            partition_map: self.state.partition_map.clone(),
+        })
+    }
+
+    /// Persist the current metashard state to the durable shard.
+    ///
+    /// Used during recovery where fencing is not yet relevant. For
+    /// reconfiguration, use `persist_state_value` directly to handle
+    /// `Fenced` errors.
+    async fn persist_state(&mut self) {
+        if let Err(e) = self.persist_state_value(&self.state.clone()).await {
+            tracing::error!("persist_state failed: {e}");
+        }
+    }
+
+    /// Persist an arbitrary metashard state to the durable shard.
+    ///
+    /// Used by `do_reconfigure` to persist a new state value before swapping
+    /// it into `self.state`, ensuring the durable state is always consistent
+    /// with the in-memory state.
+    ///
+    /// Returns `Err(MetaError::Fenced)` if another meta actor has written to
+    /// the shard (upper mismatch). In that case, `self.state` is refreshed
+    /// from the durable state so the caller can see what the current state is.
+    async fn persist_state_value(&mut self, state: &MetaState) -> Result<(), MetaError> {
+        let write = &mut self.metashard_write;
+        let data = encode_meta_state(state);
 
         let batch_number = write.upper().as_option().copied().unwrap_or(1).max(1);
 
@@ -504,93 +615,90 @@ impl<F: ActorFactory> PersistMetaActor<F> {
             .await
         {
             Ok(Ok(())) => {
-                debug!(epoch = self.state.epoch, "persisted metashard state");
+                debug!(epoch = state.epoch, "persisted metashard state");
+                Ok(())
             }
-            Ok(Err(_)) => {
-                debug!("metashard state persist upper mismatch (concurrent writer)");
+            Ok(Err(_upper_mismatch)) => {
+                warn!(
+                    epoch = state.epoch,
+                    "metashard CAS failed: another writer advanced the upper"
+                );
+                // Re-read durable state to learn the current epoch.
+                self.refresh_from_durable_state().await;
+                Err(MetaError::Fenced {
+                    stale_epoch: state.epoch,
+                    current_epoch: self.state.epoch,
+                })
             }
-            Err(e) => {
-                tracing::error!("metashard state persist error: {e}");
-            }
+            Err(e) => Err(MetaError::Command(format!("metashard persist error: {e}"))),
         }
     }
 
-    /// Access the actor's current state. Used by main.rs to read the
-    /// (possibly recovered) partition map before spawning log shard actors.
-    pub fn state(&self) -> &MetaState {
-        &self.state
-    }
+    /// Re-read the metashard persist shard and update `self.state` with the
+    /// current durable state. Used after a CAS failure to learn what the
+    /// winning writer committed.
+    async fn refresh_from_durable_state(&mut self) {
+        let key_schema = Arc::new(OrderedKeySchema);
+        let val_schema = Arc::new(ProposalSchema);
 
-    /// Public wrapper for transitive predecessor lookup, used by main.rs
-    /// to determine which predecessors to replay at startup.
-    pub fn transitive_predecessors_for(&self, shard_id: ShardId) -> Vec<ShardId> {
-        self.transitive_predecessors(shard_id)
-    }
+        let (_, read) = self
+            .persist_client
+            .open::<OrderedKey, Proposal, u64, i64>(
+                self.metashard_shard_id,
+                key_schema,
+                val_schema,
+                Diagnostics::from_purpose("metashard-refresh"),
+                false,
+            )
+            .await
+            .expect("open metashard reader for refresh");
 
-    /// Walk the predecessor chain transitively for a shard, returning all
-    /// ancestors in replay order (oldest first).
-    ///
-    /// For example, if L4's predecessor is L2 and L2's predecessor is L1,
-    /// this returns [L1, L2].
-    fn transitive_predecessors(&self, shard_id: ShardId) -> Vec<ShardId> {
-        let mut visited = std::collections::BTreeSet::new();
-        let preds = self
-            .state
-            .log_shards
-            .get(&shard_id)
-            .map(|info| info.predecessors.clone())
-            .unwrap_or_default();
-        let mut chain = Vec::new();
-        for pred in &preds {
-            if visited.insert(*pred) {
-                // Recurse: get this predecessor's own ancestors first (older→newer).
-                chain.extend(self.transitive_predecessors_inner(*pred, &mut visited));
-                chain.push(*pred);
+        let since = read.since().clone();
+        let mut subscribe = read
+            .subscribe(since)
+            .await
+            .expect("subscribe to metashard shard for refresh");
+
+        let mut latest_data: Option<Bytes> = None;
+        let upper = self.metashard_write.upper().clone();
+        'outer: loop {
+            let events = subscribe.fetch_next().await;
+            for event in &events {
+                match event {
+                    ListenEvent::Progress(frontier) => {
+                        if frontier.as_option().copied() >= upper.as_option().copied() {
+                            break 'outer;
+                        }
+                    }
+                    ListenEvent::Updates(updates) => {
+                        for ((key, proposal), _ts, diff) in updates {
+                            if *diff == 1 && key.shard == "__metashard" {
+                                latest_data = Some(proposal.encoded.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
-        chain
-    }
 
-    /// Recursive helper for transitive_predecessors.
-    fn transitive_predecessors_inner(
-        &self,
-        shard_id: ShardId,
-        visited: &mut std::collections::BTreeSet<ShardId>,
-    ) -> Vec<ShardId> {
-        let preds = self
-            .state
-            .log_shards
-            .get(&shard_id)
-            .map(|info| info.predecessors.clone())
-            .unwrap_or_default();
-        let mut chain = Vec::new();
-        for pred in &preds {
-            if visited.insert(*pred) {
-                chain.extend(self.transitive_predecessors_inner(*pred, visited));
-                chain.push(*pred);
+        if let Some(data) = latest_data {
+            if let Err(e) = decode_meta_state(data.as_ref(), &mut self.state) {
+                warn!("refresh_from_durable_state: {e}");
             }
         }
-        chain
     }
 
     /// Handle a non-reconfigure command (fast, synchronous).
     fn on_query(&self, cmd: MetaCommand) {
         match cmd {
-            MetaCommand::Lookup {
-                client_shard,
-                reply,
-            } => {
-                let result = Ok(self.state.partition_map.route(&client_shard));
-                let _ = reply.send(result);
-            }
             MetaCommand::GetPartitionMap { reply } => {
                 let _ = reply.send(Ok(self.state.partition_map.clone()));
             }
             MetaCommand::GetEpoch { reply } => {
                 let _ = reply.send(Ok(self.state.epoch));
             }
-            MetaCommand::Reconfigure { .. } => {
-                unreachable!("Reconfigure handled separately in run loop")
+            MetaCommand::Reconfigure { .. } | MetaCommand::Recover { .. } => {
+                unreachable!("Reconfigure and Recover handled separately in run loop")
             }
         }
     }
@@ -645,12 +753,15 @@ impl<F: ActorFactory> PersistMetaActor<F> {
         );
 
         // Phase 0: Write ReconfigurationIntent (durable crash recovery marker).
-        self.state.pending_intent = Some(ReconfigurationIntent {
+        // Build a new state with the intent set, persist it, then swap.
+        let mut intent_state = self.state.clone();
+        intent_state.pending_intent = Some(ReconfigurationIntent {
             epoch: new_epoch,
             plan: plan.clone(),
             status: IntentStatus::Preparing,
         });
-        self.persist_state().await;
+        self.persist_state_value(&intent_state).await?;
+        self.state = intent_state;
 
         // BUGGIFY: crash after intent is persisted but before seal.
         crate::fault::maybe_fail("after_intent_persist").map_err(MetaError::Command)?;
@@ -766,6 +877,40 @@ impl<F: ActorFactory> PersistMetaActor<F> {
         // fresh actors are spawned and replay restarts.
         crate::fault::maybe_fail("after_actor_spawn").map_err(MetaError::Command)?;
 
+        // Phase 2.25: Wait for bulk snapshots to complete on all new shards.
+        //
+        // Each new acceptor writes its bulk snapshot at BULK_SNAPSHOT_BATCH_ID
+        // and advances the shard upper to DELTA_SNAPSHOT_BATCH_ID when done.
+        // We open a listen on each new shard and block until the frontier
+        // advances past that point. This ensures all predecessor data at the
+        // CriticalSince is captured before we seal, minimizing the window
+        // where old shards accept writes after new shards are ready.
+        {
+            use crate::actors::acceptor::BULK_SNAPSHOT_BATCH_ID;
+            let key_schema = Arc::new(OrderedKeySchema);
+            let val_schema = Arc::new(ProposalSchema);
+            for &shard_id in &added {
+                let (_, read) = self
+                    .persist_client
+                    .open::<OrderedKey, Proposal, u64, i64>(
+                        shard_id,
+                        Arc::clone(&key_schema),
+                        Arc::clone(&val_schema),
+                        Diagnostics::from_purpose("metashard-bulk-snapshot-wait"),
+                        false,
+                    )
+                    .await
+                    .expect("open reader for bulk snapshot wait");
+                let mut listen = read
+                    .listen(Antichain::from_elem(BULK_SNAPSHOT_BATCH_ID))
+                    .await
+                    .expect("listen for bulk snapshot progress");
+                // Blocks until the acceptor advances upper past BULK_SNAPSHOT_BATCH_ID.
+                let _ = listen.fetch_next().await;
+                info!(%shard_id, "bulk snapshot complete");
+            }
+        }
+
         // Phase 2.5: Seal retiring log shards.
         //
         // The new learners are already subscribed and catching up. Sealing
@@ -788,34 +933,30 @@ impl<F: ActorFactory> PersistMetaActor<F> {
 
             write.advance_upper(&Antichain::new()).await;
             info!(%shard_id, epoch = new_epoch, "sealed log shard");
-
-            if let Some(info) = self.state.log_shards.get_mut(&shard_id) {
-                info.status = LogShardStatus::Sealed;
-                info.epoch_sealed = Some(new_epoch);
-            }
-        }
-
-        // Update intent: sealed.
-        if let Some(ref mut intent) = self.state.pending_intent {
-            intent.status = IntentStatus::Sealed;
         }
 
         // BUGGIFY: crash after seal but before persist.
         crate::fault::maybe_fail("after_seal").map_err(MetaError::Command)?;
 
-        // Phase 4: Build new partition map.
-        // The Router discovers the new routing by subscribing to the
-        // metashard persist shard — no direct routing swap needed.
-        let new_partition_map = PartitionMap {
-            epoch: new_epoch,
-            ranges: new_map.ranges.clone(),
-        };
+        // Phase 4: Build the final state atomically, persist, then swap.
+        //
+        // All state mutations (sealed shards, new shards, epoch, partition map,
+        // cleared intent) are accumulated in a new MetaState value. self.state
+        // is only updated after the persist succeeds, ensuring consistency
+        // between durable and in-memory state.
+        let mut new_state = self.state.clone();
 
-        // Track new log shards in metashard state.
+        // Mark sealed shards.
+        for &shard_id in &retiring {
+            if let Some(info) = new_state.log_shards.get_mut(&shard_id) {
+                info.status = LogShardStatus::Sealed;
+                info.epoch_sealed = Some(new_epoch);
+            }
+        }
+
+        // Add new log shards with predecessor chains.
         for range in &new_map.ranges {
             if added.contains(&range.log_shard) {
-                // Find ALL old shards this range overlaps with (predecessors).
-                // A merge reconfiguration can have multiple predecessors.
                 let predecessors: Vec<ShardId> = old_map
                     .ranges
                     .iter()
@@ -825,7 +966,7 @@ impl<F: ActorFactory> PersistMetaActor<F> {
                     .map(|r| r.log_shard)
                     .collect();
 
-                self.state.log_shards.insert(
+                new_state.log_shards.insert(
                     range.log_shard,
                     LogShardInfo {
                         status: LogShardStatus::Active,
@@ -839,18 +980,21 @@ impl<F: ActorFactory> PersistMetaActor<F> {
             }
         }
 
-        self.state.epoch = new_epoch;
-        self.state.partition_map = new_partition_map;
-        // Clear the intent — reconfiguration committed successfully.
-        self.state.pending_intent = None;
+        new_state.epoch = new_epoch;
+        new_state.partition_map = PartitionMap {
+            epoch: new_epoch,
+            ranges: new_map.ranges.clone(),
+        };
+        new_state.pending_intent = None;
 
-        // BUGGIFY: crash after routing swap but before durable persist.
+        // BUGGIFY: crash after building new state but before durable persist.
         // On recovery, the durable state still has the old epoch and intent,
         // but the old shards are sealed. do_reconfigure re-runs idempotently.
         crate::fault::maybe_fail("after_routing_swap").map_err(MetaError::Command)?;
 
-        // Persist the updated state durably.
-        self.persist_state().await;
+        // Persist the new state, then swap into self.state.
+        self.persist_state_value(&new_state).await?;
+        self.state = new_state;
 
         // BUGGIFY: crash after commit persist but before hold release.
         // Holds leak but correctness is preserved — old shards just keep
@@ -904,69 +1048,12 @@ impl<F: ActorFactory> PersistMetaActor<F> {
             "metashard actor starting"
         );
 
-        // Persist the initial state so that subscribers (e.g., the routing task)
-        // can discover the partition map.
-        self.persist_state().await;
-
-        // Check for a pending reconfiguration intent from a previous crash.
-        // Resume the reconfiguration from the last completed phase.
-        if let Some(intent) = self.state.pending_intent.take() {
-            info!(
-                epoch = intent.epoch,
-                status = ?intent.status,
-                "found pending reconfiguration intent — resuming"
-            );
-            match intent.status {
-                IntentStatus::Committed => {
-                    // Already committed — just clear the intent.
-                    info!(epoch = intent.epoch, "intent already committed, clearing");
-                }
-                IntentStatus::Preparing | IntentStatus::Sealed => {
-                    // Need to re-run the reconfiguration. The plan tells us
-                    // what the target partition map should be.
-                    info!(
-                        epoch = intent.epoch,
-                        "resuming reconfiguration from {:?}", intent.status
-                    );
-                    match self.do_reconfigure(intent.plan).await {
-                        Ok(new_epoch) => {
-                            info!(new_epoch, "crash recovery reconfiguration completed");
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "crash recovery reconfiguration failed: {} — \
-                                 manual intervention may be required",
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Create actors for all shards in the partition map. The factory is
-        // idempotent — if actors were already created during crash recovery
-        // reconfiguration above, this returns cached handles.
-        for range in self.state.partition_map.ranges.clone() {
-            let shard_id = range.log_shard;
-            if let Err(e) = self
-                .factory
-                .create_acceptor(shard_id, self.state.epoch, vec![], range)
-                .await
-            {
-                tracing::error!(%shard_id, "failed to create acceptor at startup: {e}");
-            }
-            if let Err(e) = self.factory.create_learner(shard_id).await {
-                tracing::error!(%shard_id, "failed to create learner at startup: {e}");
-            }
-        }
-        info!(
-            num_shards = self.state.partition_map.ranges.len(),
-            "created actors for all shards in partition map"
-        );
-
         loop {
             match self.rx.recv().await {
+                Some(MetaCommand::Recover { reply }) => {
+                    let result = self.do_recover().await;
+                    let _ = reply.send(result);
+                }
                 Some(MetaCommand::Reconfigure { plan, reply }) => {
                     if self.reconfiguring {
                         let _ = reply.send(Err(MetaError::ReconfigurationInProgress));
@@ -990,13 +1077,21 @@ impl<F: ActorFactory> PersistMetaActor<F> {
     }
 
     /// Spawn the metashard actor as a tokio task.
+    ///
+    /// Injects a `Recover` command as the first message, which reads durable
+    /// state, resumes pending intents, and creates actors for all shards.
+    /// Returns the recovered state so callers can log/use the partition map.
     pub async fn spawn(
         state: MetaState,
         queue_depth: usize,
         persist_client: PersistClient,
         factory: F,
         metashard_shard_id: ShardId,
-    ) -> (PersistMetaHandle, mz_ore::task::JoinHandle<()>) {
+    ) -> (
+        PersistMetaHandle,
+        RecoverResult,
+        mz_ore::task::JoinHandle<()>,
+    ) {
         let (actor, handle) = Self::new(
             state,
             queue_depth,
@@ -1006,7 +1101,11 @@ impl<F: ActorFactory> PersistMetaActor<F> {
         )
         .await;
         let task = mz_ore::task::spawn(|| "persist-metashard", actor.run());
-        (handle, task)
+
+        // Inject recovery as the first command.
+        let result = handle.recover().await.expect("meta recovery failed");
+
+        (handle, result, task)
     }
 }
 
@@ -1019,83 +1118,31 @@ mod tests {
         format!("s{:0>32}", suffix).parse().expect("valid shard id")
     }
 
-    /// Test that requires a full PersistClient — uses the spawn_for_test helper.
-    /// For unit tests of the static query path, we skip the full actor and test
-    /// the handle directly via the simple new() + spawn pattern.
-    #[tokio::test]
-    async fn metashard_lookup_routes_correctly() {
-        // For this test we use a lightweight approach: create the actor without
-        // a PersistClient (won't reconfigure, just serves queries).
+    #[mz_ore::test]
+    fn partition_map_routes_correctly() {
         let s1 = test_shard("1");
         let s2 = test_shard("2");
-        let state = MetaState {
+        let map = PartitionMap {
             epoch: 1,
-            partition_map: PartitionMap {
-                epoch: 1,
-                ranges: vec![
-                    RangeAssignment {
-                        lo: 0x00,
-                        hi_exclusive: 0x80,
-                        log_shard: s1,
-                    },
-                    RangeAssignment {
-                        lo: 0x80,
-                        hi_exclusive: 0x100,
-                        log_shard: s2,
-                    },
-                ],
-            },
-            log_shards: BTreeMap::new(),
-            pending_intent: None,
+            ranges: vec![
+                RangeAssignment {
+                    lo: 0x00,
+                    hi_exclusive: 0x80,
+                    log_shard: s1,
+                },
+                RangeAssignment {
+                    lo: 0x80,
+                    hi_exclusive: 0x100,
+                    log_shard: s2,
+                },
+            ],
         };
 
-        // Create a minimal actor (query-only, no reconfiguration capability).
-        let (tx, rx) = mpsc::channel(64);
-        let handle = PersistMetaHandle::new(tx);
-
-        // Spawn a minimal query-only loop.
-        let actor_state = state.clone();
-        mz_ore::task::spawn(|| "test-metashard", async move {
-            let mut rx = rx;
-            loop {
-                match rx.recv().await {
-                    Some(MetaCommand::Lookup {
-                        client_shard,
-                        reply,
-                    }) => {
-                        let _ = reply.send(Ok(actor_state.partition_map.route(&client_shard)));
-                    }
-                    Some(MetaCommand::GetEpoch { reply }) => {
-                        let _ = reply.send(Ok(actor_state.epoch));
-                    }
-                    Some(MetaCommand::GetPartitionMap { reply }) => {
-                        let _ = reply.send(Ok(actor_state.partition_map.clone()));
-                    }
-                    Some(MetaCommand::Reconfigure { reply, .. }) => {
-                        let _ = reply
-                            .send(Err(MetaError::Command("not supported in test".into())));
-                    }
-                    None => break,
-                }
-            }
-        });
-
         // "s0a..." → partition key 0x0a → first range → s1
-        let result = handle
-            .lookup("s0a000000-0000-0000-0000-000000000000")
-            .await
-            .unwrap();
-        assert_eq!(result, s1);
+        assert_eq!(map.route("s0a000000-0000-0000-0000-000000000000"), s1);
 
         // "sff..." → partition key 0xff → second range → s2
-        let result = handle
-            .lookup("sff000000-0000-0000-0000-000000000000")
-            .await
-            .unwrap();
-        assert_eq!(result, s2);
-
-        // Verify epoch
-        assert_eq!(handle.current_epoch().await.unwrap(), 1);
+        assert_eq!(map.route("sff000000-0000-0000-0000-000000000000"), s2);
     }
 
     #[tokio::test]
@@ -1223,14 +1270,9 @@ mod tests {
         // --- Persist the state ---
         let factory = crate::factory::InProcessActorFactory::new(client.clone());
 
-        let (mut actor, _handle) = PersistMetaActor::new(
-            state.clone(),
-            64,
-            client.clone(),
-            factory,
-            metashard_shard,
-        )
-        .await;
+        let (mut actor, _handle) =
+            PersistMetaActor::new(state.clone(), 64, client.clone(), factory, metashard_shard)
+                .await;
 
         // Force a persist (normally happens during do_reconfigure).
         actor.persist_state().await;
@@ -1241,14 +1283,11 @@ mod tests {
         let bootstrap = MetaState::single(test_shard("eee"));
         let factory2 = crate::factory::InProcessActorFactory::new(client.clone());
 
-        let (recovered_actor, _handle2) = PersistMetaActor::new(
-            bootstrap,
-            64,
-            client.clone(),
-            factory2,
-            metashard_shard,
-        )
-        .await;
+        let (mut recovered_actor, _handle2) =
+            PersistMetaActor::new(bootstrap, 64, client.clone(), factory2, metashard_shard).await;
+
+        // Trigger recovery (previously happened inside new()).
+        recovered_actor.do_recover().await.expect("recovery failed");
 
         let recovered = &recovered_actor.state;
 

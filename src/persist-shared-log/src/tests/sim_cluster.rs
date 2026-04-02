@@ -38,33 +38,30 @@
 //! - Client retry across network partitions
 //! - Deterministic scheduling with seeded turmoil
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::actors::meta::{MetaState, PersistMetaActor};
+use crate::actors::router::Router;
+use crate::factory::InProcessActorFactory;
+use crate::{PartitionMap, RangeAssignment, ReconfigurationPlan};
 use mz_ore::metrics::MetricsRegistry;
+use mz_persist::generated::consensus_service::ProtoVersionedData;
 use mz_persist::turmoil::{BlobState, ConsensusState, serve_blob, serve_consensus};
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::rpc::PubSubClientConnection;
 use mz_persist_client::{PersistClient, PersistLocation, ShardId};
-use crate::actors::meta::{MetaState, PersistMetaActor};
-use crate::actors::router::Router;
-use crate::factory::InProcessActorFactory;
-use crate::{PartitionMap, RangeAssignment, ReconfigurationPlan};
 
 /// Port for consensus and blob turmoil servers.
 const PERSIST_PORT: u16 = 7000;
 
 /// Create a PersistClient that connects to turmoil consensus/blob hosts.
 async fn new_turmoil_persist_client() -> PersistClient {
-    let persist_config =
-        PersistConfig::new_for_tests();
+    let persist_config = PersistConfig::new_for_tests();
     let registry = MetricsRegistry::new();
-    let cache = PersistClientCache::new(
-        persist_config,
-        &registry,
-        |_, _| PubSubClientConnection::noop(),
-    );
+    let cache = PersistClientCache::new(persist_config, &registry, |_, _| {
+        PubSubClientConnection::noop()
+    });
     let location = PersistLocation {
         blob_uri: format!("turmoil://blob:{PERSIST_PORT}")
             .parse()
@@ -114,69 +111,51 @@ fn sim_cluster_smoke() {
     sim.host("service", move || {
         let shard_ids = shard_ids.clone();
         async move {
-        let client = new_turmoil_persist_client().await;
+            let client = new_turmoil_persist_client().await;
 
-        let router = Router::new(
-            PartitionMap { epoch: 0, ranges: vec![] },
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
+            let (router, router_handle, routing_tx) = Router::new(4096);
+            mz_ore::task::spawn(|| "test-router", router.run());
 
-        let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-        let metashard_state = MetaState::single(shard_ids[0]);
-        let (_ms_handle, _ms_task) = PersistMetaActor::spawn(
-            metashard_state,
-            256,
-            client.clone(),
-            std::sync::Arc::clone(&factory),
-            ms_shard,
-        )
-        .await;
+            let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
+            let metashard_state = MetaState::single(shard_ids[0]);
+            let (_ms_handle, _, _ms_task) = PersistMetaActor::spawn(
+                metashard_state,
+                256,
+                client.clone(),
+                std::sync::Arc::clone(&factory),
+                ms_shard,
+            )
+            .await;
 
-        crate::actors::router::spawn_routing_task(
-            &client,
-            ms_shard,
-            factory,
-            router.routing_handle(),
-            router.routing_notify(),
-        ).await;
-        router.wait_for_routing().await;
+            crate::actors::router::spawn_routing_task(&client, ms_shard, factory, routing_tx).await;
 
-        // Run the router. In a real turmoil test, we'd serve RPC here.
-        // For the smoke test, write and read directly through the router.
-        use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
-        use mz_persist::generated::consensus_service::{
-            ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
-        };
+            // Write and read directly through the router handle.
+            let key = "s30000000-0000-0000-0000-000000000000";
 
-        let key = "s30000000-0000-0000-0000-000000000000";
+            // Write.
+            let resp = router_handle
+                .compare_and_set(
+                    key.to_string(),
+                    None,
+                    ProtoVersionedData {
+                        seqno: 1,
+                        data: b"hello from turmoil".to_vec(),
+                    },
+                )
+                .await
+                .expect("CAS should succeed");
+            assert!(resp.committed, "first CAS should commit");
 
-        // Write.
-        let resp = router
-            .compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                key: key.to_string(),
-                expected: None,
-                new: Some(ProtoVersionedData {
-                    seqno: 1,
-                    data: b"hello from turmoil".to_vec(),
-                }),
-            }))
-            .await
-            .expect("CAS should succeed");
-        assert!(resp.into_inner().committed, "first CAS should commit");
+            // Read.
+            let resp = router_handle
+                .head(key.to_string())
+                .await
+                .expect("head should succeed");
+            let data = resp.data.expect("should have data");
+            assert_eq!(data.seqno, 1);
+            assert_eq!(data.data, b"hello from turmoil");
 
-        // Read.
-        let resp = router
-            .head(tonic::Request::new(ProtoHeadRequest {
-                key: key.to_string(),
-            }))
-            .await
-            .expect("head should succeed");
-        let data = resp.into_inner().data.expect("should have data");
-        assert_eq!(data.seqno, 1);
-        assert_eq!(data.data, b"hello from turmoil");
-
-        Ok(())
+            Ok(())
         }
     });
 
@@ -214,43 +193,44 @@ fn sim_cluster_crash_restart() {
     sim.client("phase1", {
         let shard_ids = shard_ids.clone();
         async move {
-            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
-            use mz_persist::generated::consensus_service::{
-                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
-            };
-
             let client = new_turmoil_persist_client().await;
 
-            let router = Router::new(
-                PartitionMap { epoch: 0, ranges: vec![] },
-                BTreeMap::new(),
-                BTreeMap::new(),
-            );
+            let (router, router_handle, routing_tx) = Router::new(4096);
+            mz_ore::task::spawn(|| "test-router", router.run());
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetaState::single(shard_ids[0]);
-            let (_ms_handle, _) = PersistMetaActor::spawn(
-                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
-            ).await;
+            let (_ms_handle, _, _) = PersistMetaActor::spawn(
+                metashard_state,
+                256,
+                client.clone(),
+                std::sync::Arc::clone(&factory),
+                ms_shard,
+            )
+            .await;
 
-            crate::actors::router::spawn_routing_task(
-                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
-            ).await;
-            router.wait_for_routing().await;
+            crate::actors::router::spawn_routing_task(&client, ms_shard, factory, routing_tx).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
-            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                key: key.to_string(),
-                expected: None,
-                new: Some(ProtoVersionedData { seqno: 1, data: b"survive crash".to_vec() }),
-            })).await.expect("CAS should succeed");
-            assert!(resp.into_inner().committed);
+            let resp = router_handle
+                .compare_and_set(
+                    key.to_string(),
+                    None,
+                    ProtoVersionedData {
+                        seqno: 1,
+                        data: b"survive crash".to_vec(),
+                    },
+                )
+                .await
+                .expect("CAS should succeed");
+            assert!(resp.committed);
 
-            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
-                key: key.to_string(),
-            })).await.expect("head should succeed");
-            assert_eq!(resp.into_inner().data.unwrap().seqno, 1);
+            let resp = router_handle
+                .head(key.to_string())
+                .await
+                .expect("head should succeed");
+            assert_eq!(resp.data.unwrap().seqno, 1);
 
             Ok(())
         }
@@ -263,47 +243,48 @@ fn sim_cluster_crash_restart() {
     sim.client("phase2", {
         let shard_ids = shard_ids.clone();
         async move {
-            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
-            use mz_persist::generated::consensus_service::{
-                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
-            };
-
             let client = new_turmoil_persist_client().await;
 
-            let router = Router::new(
-                PartitionMap { epoch: 0, ranges: vec![] },
-                BTreeMap::new(),
-                BTreeMap::new(),
-            );
+            let (router, router_handle, routing_tx) = Router::new(4096);
+            mz_ore::task::spawn(|| "test-router", router.run());
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetaState::single(shard_ids[0]);
-            let (_ms_handle, _) = PersistMetaActor::spawn(
-                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
-            ).await;
+            let (_ms_handle, _, _) = PersistMetaActor::spawn(
+                metashard_state,
+                256,
+                client.clone(),
+                std::sync::Arc::clone(&factory),
+                ms_shard,
+            )
+            .await;
 
-            crate::actors::router::spawn_routing_task(
-                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
-            ).await;
-            router.wait_for_routing().await;
+            crate::actors::router::spawn_routing_task(&client, ms_shard, factory, routing_tx).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
             // Data from before the "crash" should be readable.
-            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
-                key: key.to_string(),
-            })).await.expect("head after restart should succeed");
-            let data = resp.into_inner().data;
+            let resp = router_handle
+                .head(key.to_string())
+                .await
+                .expect("head after restart should succeed");
+            let data = resp.data;
             assert!(data.is_some(), "data should survive restart");
             assert_eq!(data.unwrap().seqno, 1);
 
             // New writes should work with carried-forward expected seqno.
-            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                key: key.to_string(),
-                expected: Some(1),
-                new: Some(ProtoVersionedData { seqno: 2, data: b"after restart".to_vec() }),
-            })).await.expect("CAS after restart should succeed");
-            assert!(resp.into_inner().committed, "CAS with pre-crash expected should commit");
+            let resp = router_handle
+                .compare_and_set(
+                    key.to_string(),
+                    Some(1),
+                    ProtoVersionedData {
+                        seqno: 2,
+                        data: b"after restart".to_vec(),
+                    },
+                )
+                .await
+                .expect("CAS after restart should succeed");
+            assert!(resp.committed, "CAS with pre-crash expected should commit");
 
             Ok(())
         }
@@ -345,37 +326,37 @@ fn sim_cluster_persist_partition() {
     sim.client("phase1", {
         let shard_ids = shard_ids.clone();
         async move {
-            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
-            use mz_persist::generated::consensus_service::{
-                ProtoCompareAndSetRequest, ProtoVersionedData,
-            };
-
             let client = new_turmoil_persist_client().await;
 
-            let router = Router::new(
-                PartitionMap { epoch: 0, ranges: vec![] },
-                BTreeMap::new(),
-                BTreeMap::new(),
-            );
+            let (router, router_handle, routing_tx) = Router::new(4096);
+            mz_ore::task::spawn(|| "test-router", router.run());
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetaState::single(shard_ids[0]);
-            let (_, _) = PersistMetaActor::spawn(
-                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
-            ).await;
+            let (_, _, _) = PersistMetaActor::spawn(
+                metashard_state,
+                256,
+                client.clone(),
+                std::sync::Arc::clone(&factory),
+                ms_shard,
+            )
+            .await;
 
-            crate::actors::router::spawn_routing_task(
-                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
-            ).await;
-            router.wait_for_routing().await;
+            crate::actors::router::spawn_routing_task(&client, ms_shard, factory, routing_tx).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
-            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                key: key.to_string(),
-                expected: None,
-                new: Some(ProtoVersionedData { seqno: 1, data: b"before partition".to_vec() }),
-            })).await.expect("CAS should succeed");
-            assert!(resp.into_inner().committed);
+            let resp = router_handle
+                .compare_and_set(
+                    key.to_string(),
+                    None,
+                    ProtoVersionedData {
+                        seqno: 1,
+                        data: b"before partition".to_vec(),
+                    },
+                )
+                .await
+                .expect("CAS should succeed");
+            assert!(resp.committed);
 
             Ok(())
         }
@@ -393,38 +374,33 @@ fn sim_cluster_persist_partition() {
     sim.client("phase2", {
         let shard_ids = shard_ids.clone();
         async move {
-            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
-            use mz_persist::generated::consensus_service::{
-                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
-            };
-
             let client = new_turmoil_persist_client().await;
 
-            let router = Router::new(
-                PartitionMap { epoch: 0, ranges: vec![] },
-                BTreeMap::new(),
-                BTreeMap::new(),
-            );
+            let (router, router_handle, routing_tx) = Router::new(4096);
+            mz_ore::task::spawn(|| "test-router", router.run());
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetaState::single(shard_ids[0]);
-            let (_, _) = PersistMetaActor::spawn(
-                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
-            ).await;
+            let (_, _, _) = PersistMetaActor::spawn(
+                metashard_state,
+                256,
+                client.clone(),
+                std::sync::Arc::clone(&factory),
+                ms_shard,
+            )
+            .await;
 
-            crate::actors::router::spawn_routing_task(
-                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
-            ).await;
-            router.wait_for_routing().await;
+            crate::actors::router::spawn_routing_task(&client, ms_shard, factory, routing_tx).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
             // Verify pre-partition data is readable from the learner
             // (learner subscribed and caught up during boot, before partition).
-            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
-                key: key.to_string(),
-            })).await.expect("head should succeed (learner has local state)");
-            let data = resp.into_inner().data;
+            let resp = router_handle
+                .head(key.to_string())
+                .await
+                .expect("head should succeed (learner has local state)");
+            let data = resp.data;
             assert!(data.is_some(), "phase 1 data should be readable");
             assert_eq!(data.unwrap().seqno, 1);
 
@@ -437,12 +413,16 @@ fn sim_cluster_persist_partition() {
             // detect the hang and move on.
             let partitioned_result = tokio::time::timeout(
                 Duration::from_secs(5),
-                router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                    key: key.to_string(),
-                    expected: Some(1),
-                    new: Some(ProtoVersionedData { seqno: 2, data: b"during partition".to_vec() }),
-                })),
-            ).await;
+                router_handle.compare_and_set(
+                    key.to_string(),
+                    Some(1),
+                    ProtoVersionedData {
+                        seqno: 2,
+                        data: b"during partition".to_vec(),
+                    },
+                ),
+            )
+            .await;
 
             assert!(
                 partitioned_result.is_err(),
@@ -461,33 +441,41 @@ fn sim_cluster_persist_partition() {
             // Give the background retry a moment to resolve.
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
-                key: key.to_string(),
-            })).await.expect("head should succeed after partition heals");
-            let head = resp.into_inner().data.expect("should have data");
+            // The previously timed-out CAS may still be in-flight (the
+            // spawned task outlives the caller's timeout). After the partition
+            // heals it may commit at any moment. Read-then-CAS in a retry
+            // loop to handle this race.
+            loop {
+                let resp = router_handle
+                    .head(key.to_string())
+                    .await
+                    .expect("head should succeed after partition heals");
+                let head = resp.data.expect("should have data");
 
-            // The head is either seqno 1 (partitioned CAS didn't commit)
-            // or seqno 2 (partitioned CAS committed via background retry).
-            assert!(
-                head.seqno == 1 || head.seqno == 2,
-                "head seqno should be 1 (no commit) or 2 (ambiguous commit), got {}",
-                head.seqno,
-            );
+                assert!(
+                    head.seqno == 1 || head.seqno == 2,
+                    "head seqno should be 1 or 2, got {}",
+                    head.seqno,
+                );
 
-            // Write from the actual head — this must succeed.
-            let next_seqno = head.seqno + 1;
-            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                key: key.to_string(),
-                expected: Some(head.seqno),
-                new: Some(ProtoVersionedData {
-                    seqno: next_seqno,
-                    data: b"after partition".to_vec(),
-                }),
-            })).await.expect("CAS should succeed after partition heals");
-            assert!(
-                resp.into_inner().committed,
-                "CAS with correct expected after partition heal should commit"
-            );
+                let next_seqno = head.seqno + 1;
+                let resp = router_handle
+                    .compare_and_set(
+                        key.to_string(),
+                        Some(head.seqno),
+                        ProtoVersionedData {
+                            seqno: next_seqno,
+                            data: b"after partition".to_vec(),
+                        },
+                    )
+                    .await
+                    .expect("CAS should succeed after partition heals");
+                if resp.committed {
+                    break;
+                }
+                // The in-flight CAS committed between our head and CAS.
+                // Re-read and retry.
+            }
 
             Ok(())
         }
@@ -527,83 +515,95 @@ fn sim_cluster_split_with_writes() {
     sim.client("split-test", {
         let shard_ids = shard_ids.clone();
         async move {
-            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
-            use mz_persist::generated::consensus_service::{
-                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
-            };
-
             let client = new_turmoil_persist_client().await;
 
-            let router = Router::new(
-                PartitionMap { epoch: 0, ranges: vec![] },
-                BTreeMap::new(),
-                BTreeMap::new(),
-            );
+            let (router, router_handle, routing_tx) = Router::new(4096);
+            mz_ore::task::spawn(|| "test-router", router.run());
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetaState::single(shard_ids[0]);
-            let (ms_handle, _) = PersistMetaActor::spawn(
-                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
-            ).await;
+            let (ms_handle, _, _) = PersistMetaActor::spawn(
+                metashard_state,
+                256,
+                client.clone(),
+                std::sync::Arc::clone(&factory),
+                ms_shard,
+            )
+            .await;
 
-            crate::actors::router::spawn_routing_task(
-                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
-            ).await;
-            router.wait_for_routing().await;
+            crate::actors::router::spawn_routing_task(&client, ms_shard, factory, routing_tx).await;
 
             let key_lo = "s10000000-0000-0000-0000-000000000000"; // 0x10 → [0x00, 0x80)
             let key_hi = "s90000000-0000-0000-0000-000000000000"; // 0x90 → [0x80, 0x100)
 
             // Write to both keys on the single shard.
             for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
-                let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                    key: key.to_string(),
-                    expected: None,
-                    new: Some(ProtoVersionedData {
-                        seqno: 1,
-                        data: format!("{}_pre_split", label).into_bytes(),
-                    }),
-                })).await.expect("pre-split CAS");
-                assert!(resp.into_inner().committed, "{} pre-split write", label);
+                let resp = router_handle
+                    .compare_and_set(
+                        key.to_string(),
+                        None,
+                        ProtoVersionedData {
+                            seqno: 1,
+                            data: format!("{}_pre_split", label).into_bytes(),
+                        },
+                    )
+                    .await
+                    .expect("pre-split CAS");
+                assert!(resp.committed, "{} pre-split write", label);
             }
 
             // Split.
             use crate::Metashard;
-            let new_epoch = ms_handle.reconfigure(ReconfigurationPlan {
-                expected_epoch: 0,
-                new_partition_map: PartitionMap {
-                    epoch: 1,
-                    ranges: vec![
-                        RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
-                        RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
-                    ],
-                },
-            }).await.expect("split should succeed");
+            let new_epoch = ms_handle
+                .reconfigure(ReconfigurationPlan {
+                    expected_epoch: 0,
+                    new_partition_map: PartitionMap {
+                        epoch: 1,
+                        ranges: vec![
+                            RangeAssignment {
+                                lo: 0x00,
+                                hi_exclusive: 0x80,
+                                log_shard: shard_a,
+                            },
+                            RangeAssignment {
+                                lo: 0x80,
+                                hi_exclusive: 0x100,
+                                log_shard: shard_b,
+                            },
+                        ],
+                    },
+                })
+                .await
+                .expect("split should succeed");
             assert_eq!(new_epoch, 1);
 
             tokio::time::sleep(Duration::from_millis(200)).await;
 
             // Verify carried-forward data.
             for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
-                let resp = router.head(tonic::Request::new(ProtoHeadRequest {
-                    key: key.to_string(),
-                })).await.expect("head after split");
-                let data = resp.into_inner().data;
+                let resp = router_handle
+                    .head(key.to_string())
+                    .await
+                    .expect("head after split");
+                let data = resp.data;
                 assert!(data.is_some(), "{} should have data after split", label);
                 assert_eq!(data.unwrap().seqno, 1, "{} seqno carried forward", label);
             }
 
             // Post-split writes to both new shards.
             for (key, label) in [(key_lo, "lo"), (key_hi, "hi")] {
-                let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                    key: key.to_string(),
-                    expected: Some(1),
-                    new: Some(ProtoVersionedData {
-                        seqno: 2,
-                        data: format!("{}_post_split", label).into_bytes(),
-                    }),
-                })).await.expect("post-split CAS");
-                assert!(resp.into_inner().committed, "{} post-split write", label);
+                let resp = router_handle
+                    .compare_and_set(
+                        key.to_string(),
+                        Some(1),
+                        ProtoVersionedData {
+                            seqno: 2,
+                            data: format!("{}_post_split", label).into_bytes(),
+                        },
+                    )
+                    .await
+                    .expect("post-split CAS");
+                assert!(resp.committed, "{} post-split write", label);
             }
 
             Ok(())
@@ -644,46 +644,55 @@ fn sim_cluster_reconfig_with_buggify() {
         let shard_ids = shard_ids.clone();
         async move {
             use crate::fault::{self, FaultConfig};
-            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
-            use mz_persist::generated::consensus_service::{
-                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
-            };
 
             let client = new_turmoil_persist_client().await;
 
-            let router = Router::new(
-                PartitionMap { epoch: 0, ranges: vec![] },
-                BTreeMap::new(),
-                BTreeMap::new(),
-            );
+            let (router, router_handle, routing_tx) = Router::new(4096);
+            mz_ore::task::spawn(|| "test-router", router.run());
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetaState::single(shard_ids[0]);
-            let (ms_handle, _) = PersistMetaActor::spawn(
-                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
-            ).await;
+            let (ms_handle, _, _) = PersistMetaActor::spawn(
+                metashard_state,
+                256,
+                client.clone(),
+                std::sync::Arc::clone(&factory),
+                ms_shard,
+            )
+            .await;
 
-            crate::actors::router::spawn_routing_task(
-                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
-            ).await;
-            router.wait_for_routing().await;
+            crate::actors::router::spawn_routing_task(&client, ms_shard, factory, routing_tx).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
-            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                key: key.to_string(),
-                expected: None,
-                new: Some(ProtoVersionedData { seqno: 1, data: b"pre".to_vec() }),
-            })).await.unwrap();
-            assert!(resp.into_inner().committed);
+            let resp = router_handle
+                .compare_and_set(
+                    key.to_string(),
+                    None,
+                    ProtoVersionedData {
+                        seqno: 1,
+                        data: b"pre".to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(resp.committed);
 
             let plan = ReconfigurationPlan {
                 expected_epoch: 0,
                 new_partition_map: PartitionMap {
                     epoch: 1,
                     ranges: vec![
-                        RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
-                        RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
+                        RangeAssignment {
+                            lo: 0x00,
+                            hi_exclusive: 0x80,
+                            log_shard: shard_a,
+                        },
+                        RangeAssignment {
+                            lo: 0x80,
+                            hi_exclusive: 0x100,
+                            log_shard: shard_b,
+                        },
                     ],
                 },
             };
@@ -696,17 +705,20 @@ fn sim_cluster_reconfig_with_buggify() {
             assert!(result.is_err(), "should fail at after_seal");
 
             fault::clear();
-            let new_epoch = ms_handle.reconfigure(plan).await
+            let new_epoch = ms_handle
+                .reconfigure(plan)
+                .await
                 .expect("retry should succeed");
             assert_eq!(new_epoch, 1);
 
             tokio::time::sleep(Duration::from_millis(200)).await;
 
-            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
-                key: key.to_string(),
-            })).await.unwrap();
-            assert_eq!(resp.into_inner().data.unwrap().seqno, 1,
-                "pre-split data should survive buggify + turmoil");
+            let resp = router_handle.head(key.to_string()).await.unwrap();
+            assert_eq!(
+                resp.data.unwrap().seqno,
+                1,
+                "pre-split data should survive buggify + turmoil"
+            );
 
             fault::clear();
             Ok(())
@@ -745,38 +757,40 @@ fn sim_cluster_split_during_persist_partition() {
     sim.client("split-partition", {
         let shard_ids = shard_ids.clone();
         async move {
-            use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
-            use mz_persist::generated::consensus_service::{
-                ProtoCompareAndSetRequest, ProtoHeadRequest, ProtoVersionedData,
-            };
+            use mz_persist::generated::consensus_service::ProtoVersionedData;
 
             let client = new_turmoil_persist_client().await;
 
-            let router = Router::new(
-                PartitionMap { epoch: 0, ranges: vec![] },
-                BTreeMap::new(),
-                BTreeMap::new(),
-            );
+            let (router, router_handle, routing_tx) = Router::new(4096);
+            mz_ore::task::spawn(|| "test-router", router.run());
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
             let metashard_state = MetaState::single(shard_ids[0]);
-            let (ms_handle, _) = PersistMetaActor::spawn(
-                metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
-            ).await;
+            let (ms_handle, _, _) = PersistMetaActor::spawn(
+                metashard_state,
+                256,
+                client.clone(),
+                std::sync::Arc::clone(&factory),
+                ms_shard,
+            )
+            .await;
 
-            crate::actors::router::spawn_routing_task(
-                &client, ms_shard, factory, router.routing_handle(), router.routing_notify(),
-            ).await;
-            router.wait_for_routing().await;
+            crate::actors::router::spawn_routing_task(&client, ms_shard, factory, routing_tx).await;
 
             let key = "s30000000-0000-0000-0000-000000000000";
 
-            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                key: key.to_string(),
-                expected: None,
-                new: Some(ProtoVersionedData { seqno: 1, data: b"pre_split".to_vec() }),
-            })).await.unwrap();
-            assert!(resp.into_inner().committed);
+            let resp = router_handle
+                .compare_and_set(
+                    key.to_string(),
+                    None,
+                    ProtoVersionedData {
+                        seqno: 1,
+                        data: b"pre_split".to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(resp.committed);
 
             // Partition from consensus, then attempt split.
             turmoil::partition("split-partition", "consensus");
@@ -787,17 +801,24 @@ fn sim_cluster_split_during_persist_partition() {
                 new_partition_map: PartitionMap {
                     epoch: 1,
                     ranges: vec![
-                        RangeAssignment { lo: 0x00, hi_exclusive: 0x80, log_shard: shard_a },
-                        RangeAssignment { lo: 0x80, hi_exclusive: 0x100, log_shard: shard_b },
+                        RangeAssignment {
+                            lo: 0x00,
+                            hi_exclusive: 0x80,
+                            log_shard: shard_a,
+                        },
+                        RangeAssignment {
+                            lo: 0x80,
+                            hi_exclusive: 0x100,
+                            log_shard: shard_b,
+                        },
                     ],
                 },
             };
 
             // Reconfiguration hangs (persist can't seal or write intent).
-            let result = tokio::time::timeout(
-                Duration::from_secs(10),
-                ms_handle.reconfigure(plan.clone()),
-            ).await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(10), ms_handle.reconfigure(plan.clone()))
+                    .await;
             assert!(result.is_err(), "reconfig should time out during partition");
 
             // Repair and retry.
@@ -811,7 +832,9 @@ fn sim_cluster_split_during_persist_partition() {
             let current_epoch = ms_handle.current_epoch().await.unwrap();
             if current_epoch == 0 {
                 // Reconfig didn't complete — retry.
-                let new_epoch = ms_handle.reconfigure(plan).await
+                let new_epoch = ms_handle
+                    .reconfigure(plan)
+                    .await
                     .expect("retried reconfig should succeed");
                 assert_eq!(new_epoch, 1);
             } else {
@@ -822,22 +845,27 @@ fn sim_cluster_split_during_persist_partition() {
 
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            let resp = router.head(tonic::Request::new(ProtoHeadRequest {
-                key: key.to_string(),
-            })).await.unwrap();
-            let data = resp.into_inner().data;
+            let resp = router_handle.head(key.to_string()).await.unwrap();
+            let data = resp.data;
             assert!(data.is_some(), "pre-split data should survive");
             assert_eq!(data.unwrap().seqno, 1);
 
-            let resp = router.compare_and_set(tonic::Request::new(ProtoCompareAndSetRequest {
-                key: key.to_string(),
-                expected: Some(1),
-                new: Some(ProtoVersionedData { seqno: 2, data: b"post_split".to_vec() }),
-            })).await.unwrap();
-            assert!(resp.into_inner().committed, "post-split CAS should work");
+            let resp = router_handle
+                .compare_and_set(
+                    key.to_string(),
+                    Some(1),
+                    ProtoVersionedData {
+                        seqno: 2,
+                        data: b"post_split".to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(resp.committed, "post-split CAS should work");
 
             Ok(())
         }
     });
-    sim.run().expect("split-during-partition test should complete");
+    sim.run()
+        .expect("split-during-partition test should complete");
 }
