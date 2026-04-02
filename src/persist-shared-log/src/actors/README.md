@@ -50,30 +50,41 @@ updates via a background routing task.
 ## Actor relationships
 
 ```
-                  ┌──────────────────────┐
-                  │  Meta Persist Shard   │
-                  │  (partition map)      │
-                  └──────┬───────┬────────┘
-           writes to     │       │  subscribes to
-                ┌────────┘       └────────┐
-                ▼                         ▼
-         ┌─────────────┐          ┌──────────────┐
-         │  Metashard   │          │    Router     │
-         │  (authority) │          │  (routing)    │
-         └─────────────┘          └───┬──────┬────┘
-                                      │      │
-                 routes writes ───────┘      └──── routes reads
-                      │                               │
-                      ▼                               ▼
-         ┌────────────────────┐          ┌────────────────────┐
-         │     Acceptor       │          │      Learner       │
-         │  (blind commit)    │          │  (CAS evaluation)  │
-         └────────┬───────────┘          └────────┬───────────┘
-                  │                               │
-                  │    Log Persist Shard           │
-                  │    (proposals + diffs)         │
-                  └───────── writes to ────────────┘
-                             subscribes to ────────┘
+  ┌─ meta shard ──────────────────────────────────────────────┐
+  │                                                           │
+  │  ┌─────────────┐       ┌─────────────────────────────┐    │
+  │  │  Metashard   │       │     Meta Persist Shard      │    │
+  │  │  (authority) │──────▶│     (partition map)          │    │
+  │  └─────────────┘       └──────────────┬──────────────┘    │
+  │                                       │                   │
+  └───────────────────────────────────────│───────────────────┘
+                                          │ subscribes to
+                                          ▼
+                                   ┌─────────────┐
+                                   │   Router(s)  │
+                                   └──┬───────┬───┘
+                          writes      │       │     reads
+                       ┌──────────────┘       └──────────────┐
+                       ▼                                     ▼
+  ┌─ log shard 0 ──────────────────┐  ┌─ log shard 1 ──────────────────┐
+  │                                │  │                                │
+  │  ┌────────────────────┐        │  │  ┌────────────────────┐        │
+  │  │     Acceptor 0     │        │  │  │     Acceptor 1     │        │
+  │  │  (blind commit)    │        │  │  │  (blind commit)    │        │
+  │  └────────┬───────────┘        │  │  └────────┬───────────┘        │
+  │           │ writes to          │  │           │ writes to          │
+  │           ▼                    │  │           ▼                    │
+  │  ┌────────────────────┐        │  │  ┌────────────────────┐        │
+  │  │  Log Persist Shard │        │  │  │  Log Persist Shard │        │
+  │  └──┬─────────────┬───┘        │  │  └──┬─────────────┬───┘        │
+  │     │ subscribes  │ subscribes │  │     │ subscribes  │ subscribes │
+  │     ▼             ▼            │  │     ▼             ▼            │
+  │  ┌──────────┐ ┌──────────┐     │  │  ┌──────────┐ ┌──────────┐     │
+  │  │Learner 0 │ │Learner 1 │     │  │  │Learner 0 │ │Learner 1 │     │
+  │  │(replica) │ │(replica) │     │  │  │(replica) │ │(replica) │     │
+  │  └──────────┘ └──────────┘     │  │  └──────────┘ └──────────┘     │
+  │                                │  │                                │
+  └────────────────────────────────┘  └────────────────────────────────┘
 ```
 
 ## Persist pubsub groups
@@ -81,9 +92,9 @@ updates via a background routing task.
 Pubsub provides instant write notifications so that subscribers don't have to
 poll consensus (Postgres/CRDB). Two groups:
 
-- **Meta shard pubsub** — The metashard hosts a pubsub server. The router
-  connects as a client. When the metashard persists a new partition map, the
-  router's routing task sees it instantly via `Subscribe::fetch_next()`.
+- **Meta shard pubsub** — The metashard hosts a pubsub server. Routers connect
+  as clients. When the metashard persists a new partition map, each router's
+  routing task sees it instantly via `Subscribe::fetch_next()`.
 
 - **Per-shard pubsub** — Each acceptor hosts a pubsub server. Its learner(s)
   connect as clients. When the acceptor flushes a batch, the learner's
@@ -98,6 +109,8 @@ maps and routing.
 
 ## Data model
 
+### Log shards
+
 Each log persist shard stores proposals in differential format:
 
 - **K**: `OrderedKey` — `(batch_id, position, shard)` StructArray giving a
@@ -105,3 +118,12 @@ Each log persist shard stores proposals in differential format:
 - **V**: `Proposal` — serialized protobuf bytes
 - **T**: `u64` — incremented by 1 per batch, in lock-step with persist upper
 - **D**: `i64` — `+1` for proposals, `-1` for learner retractions
+
+### Meta shard
+
+The meta persist shard stores a single key (`__metashard`) whose value is a
+serialized `ProtoMetashardState` protobuf containing:
+
+- **epoch** — monotonically increasing configuration version
+- **ranges** — the partition map (`[lo, hi_exclusive) -> log_shard_id`)
+- **intent** — in-flight reconfiguration state for crash recovery
