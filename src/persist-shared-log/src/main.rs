@@ -37,7 +37,7 @@ use mz_persist_client::rpc::{
 };
 use mz_persist_client::{PersistClient, ShardId};
 use mz_persist_shared_log::factory::InProcessActorFactory;
-use mz_persist_shared_log::actors::metashard::{MetashardState, PersistMetashardActor};
+use mz_persist_shared_log::actors::meta::{MetaState, PersistMetaActor};
 use mz_persist_shared_log::rpc::{
     AcceptorGrpcServer, ConsensusAcceptorServer, ConsensusLearnerServer, LearnerGrpcServer,
 };
@@ -571,9 +571,9 @@ async fn run_monolith(args: MonolithArgs) {
     }
     let bootstrap_map = build_partition_map(&bootstrap_shard_ids);
     let bootstrap_state = if num_shards == 1 {
-        MetashardState::single(bootstrap_shard_ids[0])
+        MetaState::single(bootstrap_shard_ids[0])
     } else {
-        MetashardState {
+        MetaState {
             epoch: 0,
             partition_map: bootstrap_map,
             log_shards: BTreeMap::new(),
@@ -583,7 +583,7 @@ async fn run_monolith(args: MonolithArgs) {
 
     let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
 
-    let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
+    let (metashard_actor, metashard_handle) = PersistMetaActor::new(
         bootstrap_state,
         256,
         persist_client.clone(),
@@ -826,9 +826,9 @@ async fn run_metashard(args: MetashardArgs) {
     }
     let bootstrap_map = build_partition_map(&bootstrap_shard_ids);
     let bootstrap_state = if num_shards == 1 {
-        MetashardState::single(bootstrap_shard_ids[0])
+        MetaState::single(bootstrap_shard_ids[0])
     } else {
-        MetashardState {
+        MetaState {
             epoch: 0,
             partition_map: bootstrap_map,
             log_shards: BTreeMap::new(),
@@ -848,7 +848,7 @@ async fn run_metashard(args: MetashardArgs) {
         ),
     );
 
-    let (metashard_actor, metashard_handle) = PersistMetashardActor::new(
+    let (metashard_actor, metashard_handle) = PersistMetaActor::new(
         bootstrap_state,
         256,
         persist_client,

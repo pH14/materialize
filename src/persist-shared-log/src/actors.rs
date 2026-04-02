@@ -28,7 +28,7 @@
 //!
 //! # Actors
 //!
-//! - **[`metashard::PersistMetashardActor`]** — Partition map authority.
+//! - **[`meta::PersistMetaActor`]** — Partition map authority.
 //!   Manages the mapping from key ranges to log shards. Persists its state to
 //!   a dedicated persist shard (the "meta shard") for crash recovery. Drives
 //!   reconfiguration (split/merge). At startup, creates acceptor and learner
@@ -110,7 +110,7 @@
 
 pub mod acceptor;
 pub mod learner;
-pub mod metashard;
+pub mod meta;
 pub mod router;
 
 use std::sync::Arc;

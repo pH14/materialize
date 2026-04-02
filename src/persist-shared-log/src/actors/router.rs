@@ -34,7 +34,7 @@ use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 
 use crate::factory::ActorFactory;
-use crate::actors::metashard::PersistMetashardHandle;
+use crate::actors::meta::PersistMetaHandle;
 use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::{Acceptor, Learner, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
 
@@ -126,7 +126,7 @@ pub struct Router<A: Acceptor, L: Learner> {
     routing: Arc<RwLock<RoutingSnapshot<A, L>>>,
     /// Signaled when routing changes (e.g., after reconfiguration).
     routing_notify: Arc<tokio::sync::Notify>,
-    metashard: Option<PersistMetashardHandle>,
+    metashard: Option<PersistMetaHandle>,
 }
 
 impl<A: Acceptor, L: Learner> std::fmt::Debug for Router<A, L> {
@@ -182,7 +182,7 @@ impl<A: Acceptor, L: Learner> Router<A, L> {
         }
     }
 
-    pub fn with_metashard(mut self, handle: PersistMetashardHandle) -> Self {
+    pub fn with_metashard(mut self, handle: PersistMetaHandle) -> Self {
         self.metashard = Some(handle);
         self
     }

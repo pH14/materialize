@@ -17,7 +17,7 @@ identical traces. This is the foundation of the DST suite in `tests/`.
 
 ## The actors
 
-### Metashard (`metashard.rs`)
+### Meta (`meta.rs`)
 
 Partition map authority. Manages the mapping from key ranges to log shards.
 Persists its state to a dedicated persist shard (the "meta shard") for crash
@@ -52,7 +52,7 @@ Subscribes to the meta shard for partition map updates.
   ┌─ meta shard ──────────────────────────────────────────────┐
   │                                                           │
   │  ┌─────────────┐       ┌─────────────────────────────┐    │
-  │  │  Metashard   │       │     Meta Persist Shard     │    │
+  │  │    Meta      │       │     Meta Persist Shard     │    │
   │  │  (authority) │──────▶│     (partition map)        │    │
   │  └─────────────┘       └──────────────┬──────────────┘    │
   │                                       │                   │
@@ -91,20 +91,20 @@ Subscribes to the meta shard for partition map updates.
 Pubsub provides instant write notifications so that subscribers don't have to
 poll consensus (Postgres/CRDB). Two groups:
 
-- **Meta shard pubsub** — The metashard hosts a pubsub server. Routers connect
-  as clients. When the metashard persists a new partition map, each router's
-  routing task sees it instantly via `Subscribe::fetch_next()`.
+- **Meta shard pubsub** — The meta actor hosts a pubsub server. Routers connect
+  as clients. When the meta actor persists a new partition map, each router's
+  routing task sees it instantly.
 
 - **Per-shard pubsub** — Each acceptor hosts a pubsub server. Its learner(s)
-  connect as clients. When the acceptor flushes a batch, the learner's
-  `Subscribe::fetch_next()` returns instantly.
+  connect as clients. When the acceptor flushes a batch, the learner sees it
+  instantly.
 
 ## Boundaries
 
-The acceptor and learner know nothing about the metashard, partition maps, or
+The acceptor and learner know nothing about the meta actor, partition maps, or
 multi-shard coordination. They operate on a single persist shard identified by
-`ShardId`. The metashard and router are the only actors that deal with partition
-maps and routing.
+`ShardId`. The meta actor and router are the only actors that deal with
+partition maps and routing.
 
 ## Data model
 

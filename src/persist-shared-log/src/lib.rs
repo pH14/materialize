@@ -259,7 +259,7 @@ impl From<LearnerError> for tonic::Status {
 
 /// Error returned by metashard handle methods.
 #[derive(Debug)]
-pub enum MetashardError {
+pub enum MetaError {
     /// The metashard actor shut down.
     Shutdown,
     /// The metashard actor dropped the reply sender.
@@ -272,16 +272,16 @@ pub enum MetashardError {
     EpochMismatch { expected: u64, actual: u64 },
 }
 
-impl std::fmt::Display for MetashardError {
+impl std::fmt::Display for MetaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MetashardError::Shutdown => write!(f, "metashard shut down"),
-            MetashardError::DroppedReply => write!(f, "metashard dropped reply"),
-            MetashardError::Command(msg) => write!(f, "{}", msg),
-            MetashardError::ReconfigurationInProgress => {
+            MetaError::Shutdown => write!(f, "metashard shut down"),
+            MetaError::DroppedReply => write!(f, "metashard dropped reply"),
+            MetaError::Command(msg) => write!(f, "{}", msg),
+            MetaError::ReconfigurationInProgress => {
                 write!(f, "reconfiguration already in progress")
             }
-            MetashardError::EpochMismatch { expected, actual } => {
+            MetaError::EpochMismatch { expected, actual } => {
                 write!(f, "epoch mismatch: expected {}, actual {}", expected, actual)
             }
         }
@@ -330,17 +330,17 @@ pub trait Learner: Clone + std::fmt::Debug + Send + Sync + 'static {
 #[async_trait::async_trait]
 pub trait Metashard: Clone + std::fmt::Debug + Send + Sync + 'static {
     /// Look up which log shard owns a client shard.
-    async fn lookup(&self, client_shard: &str) -> Result<ShardId, MetashardError>;
+    async fn lookup(&self, client_shard: &str) -> Result<ShardId, MetaError>;
 
     /// Return the current partition map.
-    async fn partition_map(&self) -> Result<PartitionMap, MetashardError>;
+    async fn partition_map(&self) -> Result<PartitionMap, MetaError>;
 
     /// Current epoch.
-    async fn current_epoch(&self) -> Result<u64, MetashardError>;
+    async fn current_epoch(&self) -> Result<u64, MetaError>;
 
     /// Execute a reconfiguration: install a new partition map, spawning new
     /// actors and sealing old log shards. Returns the new epoch on success.
-    async fn reconfigure(&self, plan: ReconfigurationPlan) -> Result<u64, MetashardError>;
+    async fn reconfigure(&self, plan: ReconfigurationPlan) -> Result<u64, MetaError>;
 }
 
 /// A source of retraction entries for the acceptor.

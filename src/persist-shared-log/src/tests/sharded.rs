@@ -27,7 +27,7 @@ use crate::factory::InProcessActorFactory;
 use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
-use crate::actors::metashard::{MetashardState, PersistMetashardActor};
+use crate::actors::meta::{MetaState, PersistMetaActor};
 use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::actors::router::Router;
 use crate::{Acceptor, AcceptorConfig, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
@@ -118,7 +118,7 @@ async fn spawn_metashard_with_routing(
     client: &PersistClient,
     partition_map: PartitionMap,
     router: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
-) -> crate::actors::metashard::PersistMetashardHandle {
+) -> crate::actors::meta::PersistMetaHandle {
     spawn_metashard_with_routing_and_shard_id(client, partition_map, router, ShardId::new()).await
 }
 
@@ -130,15 +130,15 @@ async fn spawn_metashard_with_routing_and_shard_id(
     partition_map: PartitionMap,
     router: &Router<PersistAcceptorHandle, PersistLearnerHandle>,
     metashard_shard_id: ShardId,
-) -> crate::actors::metashard::PersistMetashardHandle {
+) -> crate::actors::meta::PersistMetaHandle {
     let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-    let metashard_state = MetashardState {
+    let metashard_state = MetaState {
         epoch: partition_map.epoch,
         partition_map,
         log_shards: BTreeMap::new(),
         pending_intent: None,
     };
-    let (_metashard_actor, metashard_handle) = PersistMetashardActor::new(
+    let (_metashard_actor, metashard_handle) = PersistMetaActor::new(
         metashard_state,
         256,
         client.clone(),
@@ -506,7 +506,7 @@ async fn test_reconfiguration_split() {
         .await;
     assert!(matches!(
         err,
-        Err(crate::MetashardError::EpochMismatch { .. })
+        Err(crate::MetaError::EpochMismatch { .. })
     ));
 }
 

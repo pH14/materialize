@@ -10,7 +10,7 @@
 //! Metashard actor: maintains the partition map, coordinates reconfigurations,
 //! and manages acceptor/learner lifecycle.
 //!
-//! The metashard actor holds a [`MetashardState`] in memory and serves lookups.
+//! The metashard actor holds a [`MetaState`] in memory and serves lookups.
 //! On reconfiguration, it orchestrates the full lifecycle: validate → spawn new
 //! actors → seal old shards → update partition map → swap routing.
 //!
@@ -34,7 +34,7 @@ use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 use crate::factory::ActorFactory;
 use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
 use crate::{
-    MetashardError, PartitionMap, RangeAssignment, ReconfigurationPlan,
+    MetaError, PartitionMap, RangeAssignment, ReconfigurationPlan,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ pub struct ReconfigurationIntent {
 
 /// The metashard actor's in-memory materialized state.
 #[derive(Debug, Clone)]
-pub struct MetashardState {
+pub struct MetaState {
     /// Current configuration epoch.
     pub epoch: u64,
     /// The authoritative partition map.
@@ -101,7 +101,7 @@ pub struct MetashardState {
     pub pending_intent: Option<ReconfigurationIntent>,
 }
 
-impl MetashardState {
+impl MetaState {
     /// Create initial state with a single log shard covering the entire range.
     pub fn single(log_shard: ShardId) -> Self {
         let range = RangeAssignment {
@@ -121,7 +121,7 @@ impl MetashardState {
                 has_snapshot: false,
             },
         );
-        MetashardState {
+        MetaState {
             epoch: 0,
             partition_map: PartitionMap::single(log_shard),
             log_shards,
@@ -135,25 +135,25 @@ impl MetashardState {
 // ---------------------------------------------------------------------------
 
 /// Commands dispatched to the metashard actor.
-pub enum MetashardCommand {
+pub enum MetaCommand {
     /// Look up which log shard owns a client shard.
     // TODO: Consider removing — callers can use `PartitionMap::route` directly.
     Lookup {
         client_shard: String,
-        reply: oneshot::Sender<Result<ShardId, MetashardError>>,
+        reply: oneshot::Sender<Result<ShardId, MetaError>>,
     },
     /// Return the current partition map.
     GetPartitionMap {
-        reply: oneshot::Sender<Result<PartitionMap, MetashardError>>,
+        reply: oneshot::Sender<Result<PartitionMap, MetaError>>,
     },
     /// Return the current epoch.
     GetEpoch {
-        reply: oneshot::Sender<Result<u64, MetashardError>>,
+        reply: oneshot::Sender<Result<u64, MetaError>>,
     },
     /// Execute a reconfiguration.
     Reconfigure {
         plan: ReconfigurationPlan,
-        reply: oneshot::Sender<Result<u64, MetashardError>>,
+        reply: oneshot::Sender<Result<u64, MetaError>>,
     },
 }
 
@@ -163,58 +163,58 @@ pub enum MetashardCommand {
 
 /// A typed handle to the metashard actor's command channel.
 #[derive(Debug, Clone)]
-pub struct PersistMetashardHandle {
-    tx: mpsc::Sender<MetashardCommand>,
+pub struct PersistMetaHandle {
+    tx: mpsc::Sender<MetaCommand>,
 }
 
-impl PersistMetashardHandle {
-    pub fn new(tx: mpsc::Sender<MetashardCommand>) -> Self {
-        PersistMetashardHandle { tx }
+impl PersistMetaHandle {
+    pub fn new(tx: mpsc::Sender<MetaCommand>) -> Self {
+        PersistMetaHandle { tx }
     }
 }
 
 #[async_trait::async_trait]
-impl crate::Metashard for PersistMetashardHandle {
-    async fn lookup(&self, client_shard: &str) -> Result<ShardId, MetashardError> {
+impl crate::Metashard for PersistMetaHandle {
+    async fn lookup(&self, client_shard: &str) -> Result<ShardId, MetaError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(MetashardCommand::Lookup {
+            .send(MetaCommand::Lookup {
                 client_shard: client_shard.to_string(),
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| MetashardError::Shutdown)?;
-        reply_rx.await.map_err(|_| MetashardError::DroppedReply)?
+            .map_err(|_| MetaError::Shutdown)?;
+        reply_rx.await.map_err(|_| MetaError::DroppedReply)?
     }
 
-    async fn partition_map(&self) -> Result<PartitionMap, MetashardError> {
+    async fn partition_map(&self) -> Result<PartitionMap, MetaError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(MetashardCommand::GetPartitionMap { reply: reply_tx })
+            .send(MetaCommand::GetPartitionMap { reply: reply_tx })
             .await
-            .map_err(|_| MetashardError::Shutdown)?;
-        reply_rx.await.map_err(|_| MetashardError::DroppedReply)?
+            .map_err(|_| MetaError::Shutdown)?;
+        reply_rx.await.map_err(|_| MetaError::DroppedReply)?
     }
 
-    async fn current_epoch(&self) -> Result<u64, MetashardError> {
+    async fn current_epoch(&self) -> Result<u64, MetaError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(MetashardCommand::GetEpoch { reply: reply_tx })
+            .send(MetaCommand::GetEpoch { reply: reply_tx })
             .await
-            .map_err(|_| MetashardError::Shutdown)?;
-        reply_rx.await.map_err(|_| MetashardError::DroppedReply)?
+            .map_err(|_| MetaError::Shutdown)?;
+        reply_rx.await.map_err(|_| MetaError::DroppedReply)?
     }
 
-    async fn reconfigure(&self, plan: ReconfigurationPlan) -> Result<u64, MetashardError> {
+    async fn reconfigure(&self, plan: ReconfigurationPlan) -> Result<u64, MetaError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(MetashardCommand::Reconfigure {
+            .send(MetaCommand::Reconfigure {
                 plan,
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| MetashardError::Shutdown)?;
-        reply_rx.await.map_err(|_| MetashardError::DroppedReply)?
+            .map_err(|_| MetaError::Shutdown)?;
+        reply_rx.await.map_err(|_| MetaError::DroppedReply)?
     }
 }
 
@@ -224,12 +224,12 @@ impl crate::Metashard for PersistMetashardHandle {
 
 /// The metashard actor.
 ///
-/// Maintains an in-memory [`MetashardState`] and serves commands from the
+/// Maintains an in-memory [`MetaState`] and serves commands from the
 /// handle. On reconfiguration, orchestrates: validate → spawn new actors →
 /// seal old shards → update partition map → swap routing state.
-pub struct PersistMetashardActor<F: ActorFactory> {
-    state: MetashardState,
-    rx: mpsc::Receiver<MetashardCommand>,
+pub struct PersistMetaActor<F: ActorFactory> {
+    state: MetaState,
+    rx: mpsc::Receiver<MetaCommand>,
     /// PersistClient for metashard's own durable state and sealing operations.
     persist_client: PersistClient,
     /// Factory for creating new acceptors and learners during reconfiguration.
@@ -245,16 +245,16 @@ pub struct PersistMetashardActor<F: ActorFactory> {
     metashard_write: mz_persist_client::write::WriteHandle<OrderedKey, Proposal, u64, i64>,
 }
 
-impl<F: ActorFactory> PersistMetashardActor<F> {
+impl<F: ActorFactory> PersistMetaActor<F> {
     /// Create a new metashard actor. Opens the durable state persist shard
     /// eagerly and recovers any persisted state (partition map, pending intents).
     pub async fn new(
-        mut state: MetashardState,
+        mut state: MetaState,
         queue_depth: usize,
         persist_client: PersistClient,
         factory: F,
         metashard_shard_id: ShardId,
-    ) -> (Self, PersistMetashardHandle) {
+    ) -> (Self, PersistMetaHandle) {
         let (tx, rx) = mpsc::channel(queue_depth);
 
         let key_schema = Arc::new(OrderedKeySchema);
@@ -421,7 +421,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             }
         }
 
-        let actor = PersistMetashardActor {
+        let actor = PersistMetaActor {
             state,
             rx,
             persist_client,
@@ -430,7 +430,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
             metashard_shard_id,
             metashard_write,
         };
-        let handle = PersistMetashardHandle::new(tx);
+        let handle = PersistMetaHandle::new(tx);
         (actor, handle)
     }
 
@@ -517,7 +517,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
 
     /// Access the actor's current state. Used by main.rs to read the
     /// (possibly recovered) partition map before spawning log shard actors.
-    pub fn state(&self) -> &MetashardState {
+    pub fn state(&self) -> &MetaState {
         &self.state
     }
 
@@ -574,22 +574,22 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
     }
 
     /// Handle a non-reconfigure command (fast, synchronous).
-    fn on_query(&self, cmd: MetashardCommand) {
+    fn on_query(&self, cmd: MetaCommand) {
         match cmd {
-            MetashardCommand::Lookup {
+            MetaCommand::Lookup {
                 client_shard,
                 reply,
             } => {
                 let result = Ok(self.state.partition_map.route(&client_shard));
                 let _ = reply.send(result);
             }
-            MetashardCommand::GetPartitionMap { reply } => {
+            MetaCommand::GetPartitionMap { reply } => {
                 let _ = reply.send(Ok(self.state.partition_map.clone()));
             }
-            MetashardCommand::GetEpoch { reply } => {
+            MetaCommand::GetEpoch { reply } => {
                 let _ = reply.send(Ok(self.state.epoch));
             }
-            MetashardCommand::Reconfigure { .. } => {
+            MetaCommand::Reconfigure { .. } => {
                 unreachable!("Reconfigure handled separately in run loop")
             }
         }
@@ -610,17 +610,17 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
     /// of writes between the subscribe point and the seal.
     ///
     /// See doc/reference/05_horizontal_sharding.md Section 12 for the full protocol.
-    async fn do_reconfigure(&mut self, plan: ReconfigurationPlan) -> Result<u64, MetashardError> {
+    async fn do_reconfigure(&mut self, plan: ReconfigurationPlan) -> Result<u64, MetaError> {
         // Phase 0: Validate.
         if plan.expected_epoch != self.state.epoch {
-            return Err(MetashardError::EpochMismatch {
+            return Err(MetaError::EpochMismatch {
                 expected: plan.expected_epoch,
                 actual: self.state.epoch,
             });
         }
         plan.new_partition_map
             .validate()
-            .map_err(|e| MetashardError::Command(format!("invalid partition map: {e}")))?;
+            .map_err(|e| MetaError::Command(format!("invalid partition map: {e}")))?;
 
         let old_map = self.state.partition_map.clone();
         let new_map = plan.new_partition_map.clone();
@@ -653,7 +653,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         self.persist_state().await;
 
         // BUGGIFY: crash after intent is persisted but before seal.
-        crate::fault::maybe_fail("after_intent_persist").map_err(MetashardError::Command)?;
+        crate::fault::maybe_fail("after_intent_persist").map_err(MetaError::Command)?;
 
         // Phase 0.5: Acquire CriticalSince on retiring shards to prevent
         // compaction during predecessor replay. Uses a deterministic reader ID
@@ -744,13 +744,13 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
                 .factory
                 .create_acceptor(shard_id, new_epoch, pred_specs, new_range.clone())
                 .await
-                .map_err(MetashardError::Command)?;
+                .map_err(MetaError::Command)?;
 
             let _ = self
                 .factory
                 .create_learner(shard_id)
                 .await
-                .map_err(MetashardError::Command)?;
+                .map_err(MetaError::Command)?;
 
             info!(
                 %shard_id,
@@ -764,7 +764,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         // BUGGIFY: crash after spawning new actors but before seal.
         // Actors are running and replaying live predecessors. On recovery,
         // fresh actors are spawned and replay restarts.
-        crate::fault::maybe_fail("after_actor_spawn").map_err(MetashardError::Command)?;
+        crate::fault::maybe_fail("after_actor_spawn").map_err(MetaError::Command)?;
 
         // Phase 2.5: Seal retiring log shards.
         //
@@ -801,7 +801,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         }
 
         // BUGGIFY: crash after seal but before persist.
-        crate::fault::maybe_fail("after_seal").map_err(MetashardError::Command)?;
+        crate::fault::maybe_fail("after_seal").map_err(MetaError::Command)?;
 
         // Phase 4: Build new partition map.
         // The Router discovers the new routing by subscribing to the
@@ -847,7 +847,7 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         // BUGGIFY: crash after routing swap but before durable persist.
         // On recovery, the durable state still has the old epoch and intent,
         // but the old shards are sealed. do_reconfigure re-runs idempotently.
-        crate::fault::maybe_fail("after_routing_swap").map_err(MetashardError::Command)?;
+        crate::fault::maybe_fail("after_routing_swap").map_err(MetaError::Command)?;
 
         // Persist the updated state durably.
         self.persist_state().await;
@@ -855,12 +855,12 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
         // BUGGIFY: crash after commit persist but before hold release.
         // Holds leak but correctness is preserved — old shards just keep
         // their CriticalSince longer than necessary.
-        crate::fault::maybe_fail("after_commit_persist").map_err(MetashardError::Command)?;
+        crate::fault::maybe_fail("after_commit_persist").map_err(MetaError::Command)?;
 
         // BUGGIFY: crash before releasing CriticalSince holds. Holds leak
         // but correctness is preserved — old shards keep their since longer
         // than necessary. Next reconfiguration or restart can release them.
-        crate::fault::maybe_fail("before_hold_release").map_err(MetashardError::Command)?;
+        crate::fault::maybe_fail("before_hold_release").map_err(MetaError::Command)?;
 
         // Phase 6: Release CriticalSince holds on retired shards.
         // Predecessor replays were confirmed complete in Phase 3, so the
@@ -967,9 +967,9 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
 
         loop {
             match self.rx.recv().await {
-                Some(MetashardCommand::Reconfigure { plan, reply }) => {
+                Some(MetaCommand::Reconfigure { plan, reply }) => {
                     if self.reconfiguring {
-                        let _ = reply.send(Err(MetashardError::ReconfigurationInProgress));
+                        let _ = reply.send(Err(MetaError::ReconfigurationInProgress));
                         continue;
                     }
                     self.reconfiguring = true;
@@ -991,12 +991,12 @@ impl<F: ActorFactory> PersistMetashardActor<F> {
 
     /// Spawn the metashard actor as a tokio task.
     pub async fn spawn(
-        state: MetashardState,
+        state: MetaState,
         queue_depth: usize,
         persist_client: PersistClient,
         factory: F,
         metashard_shard_id: ShardId,
-    ) -> (PersistMetashardHandle, mz_ore::task::JoinHandle<()>) {
+    ) -> (PersistMetaHandle, mz_ore::task::JoinHandle<()>) {
         let (actor, handle) = Self::new(
             state,
             queue_depth,
@@ -1028,7 +1028,7 @@ mod tests {
         // a PersistClient (won't reconfigure, just serves queries).
         let s1 = test_shard("1");
         let s2 = test_shard("2");
-        let state = MetashardState {
+        let state = MetaState {
             epoch: 1,
             partition_map: PartitionMap {
                 epoch: 1,
@@ -1051,7 +1051,7 @@ mod tests {
 
         // Create a minimal actor (query-only, no reconfiguration capability).
         let (tx, rx) = mpsc::channel(64);
-        let handle = PersistMetashardHandle::new(tx);
+        let handle = PersistMetaHandle::new(tx);
 
         // Spawn a minimal query-only loop.
         let actor_state = state.clone();
@@ -1059,21 +1059,21 @@ mod tests {
             let mut rx = rx;
             loop {
                 match rx.recv().await {
-                    Some(MetashardCommand::Lookup {
+                    Some(MetaCommand::Lookup {
                         client_shard,
                         reply,
                     }) => {
                         let _ = reply.send(Ok(actor_state.partition_map.route(&client_shard)));
                     }
-                    Some(MetashardCommand::GetEpoch { reply }) => {
+                    Some(MetaCommand::GetEpoch { reply }) => {
                         let _ = reply.send(Ok(actor_state.epoch));
                     }
-                    Some(MetashardCommand::GetPartitionMap { reply }) => {
+                    Some(MetaCommand::GetPartitionMap { reply }) => {
                         let _ = reply.send(Ok(actor_state.partition_map.clone()));
                     }
-                    Some(MetashardCommand::Reconfigure { reply, .. }) => {
+                    Some(MetaCommand::Reconfigure { reply, .. }) => {
                         let _ = reply
-                            .send(Err(MetashardError::Command("not supported in test".into())));
+                            .send(Err(MetaError::Command("not supported in test".into())));
                     }
                     None => break,
                 }
@@ -1101,16 +1101,16 @@ mod tests {
     #[tokio::test]
     async fn metashard_returns_partition_map() {
         let s1 = test_shard("1");
-        let state = MetashardState::single(s1);
+        let state = MetaState::single(s1);
 
         let (tx, rx) = mpsc::channel(64);
-        let handle = PersistMetashardHandle::new(tx);
+        let handle = PersistMetaHandle::new(tx);
         let actor_state = state.clone();
         mz_ore::task::spawn(|| "test-metashard", async move {
             let mut rx = rx;
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    MetashardCommand::GetPartitionMap { reply } => {
+                    MetaCommand::GetPartitionMap { reply } => {
                         let _ = reply.send(Ok(actor_state.partition_map.clone()));
                     }
                     _ => {}
@@ -1199,7 +1199,7 @@ mod tests {
             status: IntentStatus::Preparing,
         };
 
-        let state = MetashardState {
+        let state = MetaState {
             epoch: 1,
             partition_map: PartitionMap {
                 epoch: 1,
@@ -1223,7 +1223,7 @@ mod tests {
         // --- Persist the state ---
         let factory = crate::factory::InProcessActorFactory::new(client.clone());
 
-        let (mut actor, _handle) = PersistMetashardActor::new(
+        let (mut actor, _handle) = PersistMetaActor::new(
             state.clone(),
             64,
             client.clone(),
@@ -1238,10 +1238,10 @@ mod tests {
         drop(_handle);
 
         // --- Recover from the same shard ---
-        let bootstrap = MetashardState::single(test_shard("eee"));
+        let bootstrap = MetaState::single(test_shard("eee"));
         let factory2 = crate::factory::InProcessActorFactory::new(client.clone());
 
-        let (recovered_actor, _handle2) = PersistMetashardActor::new(
+        let (recovered_actor, _handle2) = PersistMetaActor::new(
             bootstrap,
             64,
             client.clone(),

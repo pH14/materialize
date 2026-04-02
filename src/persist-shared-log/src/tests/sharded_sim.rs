@@ -51,7 +51,7 @@ use mz_persist_client::{PersistClient, PersistLocation, ShardId};
 
 use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
-use crate::actors::metashard::{MetashardState, PersistMetashardActor};
+use crate::actors::meta::{MetaState, PersistMetaActor};
 use crate::actors::{OrderedKeySchema, ProposalSchema};
 use crate::actors::router::Router;
 use crate::{AcceptorConfig, Metashard, PartitionMap, RangeAssignment, ReconfigurationPlan};
@@ -515,8 +515,8 @@ async fn sharded_sim_linearizability_across_reconfig() {
     let router = Arc::new(Router::new(partition_map, acceptors, learners));
 
 
-    let metashard_state = MetashardState::single(shard_old);
-    let (metashard_handle, _metashard_task) = PersistMetashardActor::spawn(
+    let metashard_state = MetaState::single(shard_old);
+    let (metashard_handle, _metashard_task) = PersistMetaActor::spawn(
         metashard_state,
         256,
         client.clone(),

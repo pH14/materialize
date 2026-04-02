@@ -47,7 +47,7 @@ use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::rpc::PubSubClientConnection;
 use mz_persist_client::{PersistClient, PersistLocation, ShardId};
-use crate::actors::metashard::{MetashardState, PersistMetashardActor};
+use crate::actors::meta::{MetaState, PersistMetaActor};
 use crate::actors::router::Router;
 use crate::factory::InProcessActorFactory;
 use crate::{PartitionMap, RangeAssignment, ReconfigurationPlan};
@@ -123,8 +123,8 @@ fn sim_cluster_smoke() {
         );
 
         let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-        let metashard_state = MetashardState::single(shard_ids[0]);
-        let (_ms_handle, _ms_task) = PersistMetashardActor::spawn(
+        let metashard_state = MetaState::single(shard_ids[0]);
+        let (_ms_handle, _ms_task) = PersistMetaActor::spawn(
             metashard_state,
             256,
             client.clone(),
@@ -228,8 +228,8 @@ fn sim_cluster_crash_restart() {
             );
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-            let metashard_state = MetashardState::single(shard_ids[0]);
-            let (_ms_handle, _) = PersistMetashardActor::spawn(
+            let metashard_state = MetaState::single(shard_ids[0]);
+            let (_ms_handle, _) = PersistMetaActor::spawn(
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
@@ -277,8 +277,8 @@ fn sim_cluster_crash_restart() {
             );
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-            let metashard_state = MetashardState::single(shard_ids[0]);
-            let (_ms_handle, _) = PersistMetashardActor::spawn(
+            let metashard_state = MetaState::single(shard_ids[0]);
+            let (_ms_handle, _) = PersistMetaActor::spawn(
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
@@ -359,8 +359,8 @@ fn sim_cluster_persist_partition() {
             );
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-            let metashard_state = MetashardState::single(shard_ids[0]);
-            let (_, _) = PersistMetashardActor::spawn(
+            let metashard_state = MetaState::single(shard_ids[0]);
+            let (_, _) = PersistMetaActor::spawn(
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
@@ -407,8 +407,8 @@ fn sim_cluster_persist_partition() {
             );
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-            let metashard_state = MetashardState::single(shard_ids[0]);
-            let (_, _) = PersistMetashardActor::spawn(
+            let metashard_state = MetaState::single(shard_ids[0]);
+            let (_, _) = PersistMetaActor::spawn(
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
@@ -541,8 +541,8 @@ fn sim_cluster_split_with_writes() {
             );
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-            let metashard_state = MetashardState::single(shard_ids[0]);
-            let (ms_handle, _) = PersistMetashardActor::spawn(
+            let metashard_state = MetaState::single(shard_ids[0]);
+            let (ms_handle, _) = PersistMetaActor::spawn(
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
@@ -658,8 +658,8 @@ fn sim_cluster_reconfig_with_buggify() {
             );
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-            let metashard_state = MetashardState::single(shard_ids[0]);
-            let (ms_handle, _) = PersistMetashardActor::spawn(
+            let metashard_state = MetaState::single(shard_ids[0]);
+            let (ms_handle, _) = PersistMetaActor::spawn(
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 
@@ -759,8 +759,8 @@ fn sim_cluster_split_during_persist_partition() {
             );
 
             let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-            let metashard_state = MetashardState::single(shard_ids[0]);
-            let (ms_handle, _) = PersistMetashardActor::spawn(
+            let metashard_state = MetaState::single(shard_ids[0]);
+            let (ms_handle, _) = PersistMetaActor::spawn(
                 metashard_state, 256, client.clone(), std::sync::Arc::clone(&factory), ms_shard,
             ).await;
 

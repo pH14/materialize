@@ -531,16 +531,16 @@ impl consensus_learner_server::ConsensusLearner for LearnerGrpcServer {
 // ---------------------------------------------------------------------------
 
 /// Server-side adapter: implements the `ConsensusMetashard` gRPC service trait
-/// by delegating to an in-process `PersistMetashardHandle`.
+/// by delegating to an in-process `PersistMetaHandle`.
 ///
 /// Used by standalone metashard binaries so operators can `grpcurl` the
 /// partition map to discover shard IDs before starting acceptors/learners.
 pub struct MetashardGrpcServer {
-    handle: crate::actors::metashard::PersistMetashardHandle,
+    handle: crate::actors::meta::PersistMetaHandle,
 }
 
 impl MetashardGrpcServer {
-    pub fn new(handle: crate::actors::metashard::PersistMetashardHandle) -> Self {
+    pub fn new(handle: crate::actors::meta::PersistMetaHandle) -> Self {
         MetashardGrpcServer { handle }
     }
 }
