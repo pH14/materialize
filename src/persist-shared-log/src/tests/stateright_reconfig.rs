@@ -14,15 +14,19 @@
 //! 1. [`ReconfigModel`] — partition map data structure invariants.
 //!    Verifies PM1, PM2, PM3, RC1 across all reachable split configurations.
 //!
-//! 2. [`ProtocolModel`] — reconfiguration protocol with crash recovery.
-//!    Models the full seal→replay→commit lifecycle, client writes interleaved
-//!    with protocol phases, and crash/recovery at any point. Verifies:
+//! 2. [`ProtocolModel`] — reconfiguration protocol with Reconcile/Reconfigure
+//!    control loop, leader lease, and crash recovery.
+//!
+//!    Models the Reconfigure (CAS-only) → Reconcile → execute_reconfiguration
+//!    lifecycle, client writes interleaved with protocol phases, and
+//!    crash/recovery at any point. Verifies:
 //!    - **RC2**: no committed write is lost during reconfiguration.
 //!    - **Carry-forward**: data in old shards at seal time appears in new
 //!      shards after commit.
 //!    - **No partial replay**: commit only happens after all replays complete.
 //!    - **Crash safety**: recovery from any phase preserves all committed data.
 //!    - **Liveness**: reconfiguration eventually completes despite crashes.
+//!    - **Leader fencing**: only one leader drives state transitions.
 //!
 //! The protocol model is parameterized by [`Scenario`] (split or merge).
 
@@ -31,17 +35,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use stateright::*;
 
 // =========================================================================
-// Model 1: Partition Map (existing, unchanged)
+// Model 1: Partition Map (unchanged)
 // =========================================================================
 
-/// A log shard in the partition map model.
 type ShardId = u8;
 
-/// A simplified partition map for model checking.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ModelPartitionMap {
     epoch: u64,
-    /// Vec of (lo_inclusive, hi_exclusive, shard_id).
     ranges: Vec<(u8, u16, ShardId)>,
 }
 
@@ -57,15 +58,12 @@ impl ModelPartitionMap {
         if self.ranges.is_empty() {
             return false;
         }
-        // PM1: starts at 0x00.
         if self.ranges[0].0 != 0x00 {
             return false;
         }
-        // PM1: ends at 0x100.
         if self.ranges.last().unwrap().1 != 0x100 {
             return false;
         }
-        // PM2: non-overlapping, contiguous.
         for i in 1..self.ranges.len() {
             if self.ranges[i - 1].1 != u16::from(self.ranges[i].0) {
                 return false;
@@ -79,7 +77,6 @@ impl ModelPartitionMap {
     }
 }
 
-/// The partition map model state.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ReconfigState {
     partition_map: ModelPartitionMap,
@@ -87,14 +84,11 @@ struct ReconfigState {
     next_shard_id: ShardId,
 }
 
-/// Actions the partition map model can take.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum ReconfigAction {
-    /// Split the range at index `range_idx` at midpoint, creating a new shard.
     Split { range_idx: usize },
 }
 
-/// Stateright model for partition map reconfiguration safety.
 struct ReconfigModel;
 
 impl Model for ReconfigModel {
@@ -110,7 +104,6 @@ impl Model for ReconfigModel {
     }
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
-        // Can split any range that is wide enough (at least 2 keys).
         for (idx, &(lo, hi, _)) in state.partition_map.ranges.iter().enumerate() {
             if hi - u16::from(lo) >= 2 {
                 actions.push(ReconfigAction::Split { range_idx: idx });
@@ -123,39 +116,27 @@ impl Model for ReconfigModel {
             ReconfigAction::Split { range_idx } => {
                 let mut new_state = state.clone();
                 let (lo, hi, old_shard) = new_state.partition_map.ranges[range_idx];
-
-                // RC1: seal the old shard before reassigning its range.
                 new_state.sealed_shards.insert(old_shard);
-
-                // Split at midpoint.
                 let mid = u16::from(lo) + (hi - u16::from(lo)) / 2;
                 let new_shard_a = new_state.next_shard_id;
                 let new_shard_b = new_state.next_shard_id + 1;
                 new_state.next_shard_id += 2;
-
-                // Replace the old range with two new ranges.
                 new_state.partition_map.ranges.remove(range_idx);
-                new_state
-                    .partition_map
-                    .ranges
-                    .insert(range_idx, (u8::try_from(mid).expect("mid fits u8"), hi, new_shard_b));
+                new_state.partition_map.ranges.insert(
+                    range_idx,
+                    (u8::try_from(mid).expect("mid fits u8"), hi, new_shard_b),
+                );
                 new_state
                     .partition_map
                     .ranges
                     .insert(range_idx, (lo, mid, new_shard_a));
-
-                // PM3: monotonic epoch.
                 new_state.partition_map.epoch += 1;
-
-                // Bound the state space: stop after 4 reconfigurations.
                 if new_state.partition_map.epoch > 4 {
                     return None;
                 }
-                // Bound: max 8 shards.
                 if new_state.next_shard_id > 8 {
                     return None;
                 }
-
                 Some(new_state)
             }
         }
@@ -163,25 +144,20 @@ impl Model for ReconfigModel {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            // PM1 + PM2: partition map is always valid (covering, non-overlapping).
             Property::<Self>::always("PM1+PM2: valid partition map", |_, state| {
                 state.partition_map.validate()
             }),
-            // PM3: epoch increases monotonically (>= 0).
             Property::<Self>::always("PM3: monotonic epoch", |_, state| {
                 let _ = state;
                 true
             }),
-            // RC1: sealed shards are never in the active partition map.
             Property::<Self>::always("RC1: sealed shards not in active map", |_, state| {
                 let active = state.partition_map.shard_ids();
                 state.sealed_shards.is_disjoint(&active)
             }),
-            // The partition map always has at least one range.
             Property::<Self>::always("non-empty partition map", |_, state| {
                 !state.partition_map.ranges.is_empty()
             }),
-            // Eventually we can reach a state with multiple shards.
             Property::<Self>::eventually("can split", |_, state| {
                 state.partition_map.ranges.len() > 1
             }),
@@ -201,20 +177,14 @@ fn stateright_reconfig_model() {
 
 #[test]
 fn stateright_reconfig_state_count() {
-    let checker = ReconfigModel
-        .checker()
-        .threads(1)
-        .spawn_bfs()
-        .join();
+    let checker = ReconfigModel.checker().threads(1).spawn_bfs().join();
     checker.assert_properties();
     let state_count = checker.unique_state_count();
-    // Sanity check: we explore a reasonable number of states.
     assert!(
         state_count >= 10,
         "expected >=10 states, got {}",
         state_count
     );
-    // The model is bounded, so we shouldn't explore millions.
     assert!(
         state_count < 100_000,
         "unexpectedly large state space: {}",
@@ -223,58 +193,41 @@ fn stateright_reconfig_state_count() {
 }
 
 // =========================================================================
-// Model 2: Reconfiguration Protocol with Crash Recovery
+// Model 2: Reconfiguration Protocol — Reconcile/Reconfigure + Leader Lease
 // =========================================================================
 //
-// This model verifies that the seal→replay→commit protocol preserves data
-// integrity even when crashes occur at any point. It tracks abstract data
-// (seqno per client shard per log shard) and verifies that committed writes
-// are never lost.
+// Models the durable state machine:
+//   Completed(epoch=N, leader=L)
+//     → ClaimLeadership       [CAS: leader L→L+1]
+//     → Reconfigure            [CAS: status→Reconfiguring, epoch N→N+1]
+//     → execute_reconfiguration [holds, snapshots, seal, wait, clear]
+//     → CAS: status→Completed
+//     → Completed(epoch=N+1)
 //
-// Key simplifications vs. the real system:
-// - Seqno abstracted to 0..MAX_SEQ (not full CAS evaluation)
-// - Replay is per-predecessor (crash during partial replay is modeled)
-// - No network, no message delivery, no timing
-// - Durable state = log shard data + sealed set + metashard intent/epoch
+// Crash at any point resets volatile state. A new leader claims and
+// reconciles from whatever the durable state says.
 
-/// Maximum seqno per client shard. Enough to distinguish "no data",
-/// "one write", "two writes".
 const MAX_SEQ: u8 = 2;
-
-/// Maximum crash-and-recover events per exploration path.
 const MAX_CRASHES: u8 = 2;
-
-/// Number of client shards. Client shard 0 maps to partition key 0x20
-/// (first half), client shard 1 maps to 0x90 (second half).
 const NUM_CS: usize = 2;
 
-/// Does the range [lo, hi_exclusive) cover client shard `cs`?
 fn range_covers(lo: u8, hi: u16, cs: usize) -> bool {
     let pk: u8 = if cs == 0 { 0x20 } else { 0x90 };
     pk >= lo && u16::from(pk) < hi
 }
 
-/// Find the active (non-sealed) shard covering client shard `cs`, if any.
-fn active_shard_for(
-    map: &[(u8, u16, u8)],
-    sealed: &BTreeSet<u8>,
-    cs: usize,
-) -> Option<u8> {
+fn active_shard_for(map: &[(u8, u16, u8)], sealed: &BTreeSet<u8>, cs: usize) -> Option<u8> {
     map.iter()
         .find(|&&(lo, hi, shard)| range_covers(lo, hi, cs) && !sealed.contains(&shard))
         .map(|&(_, _, shard)| shard)
 }
 
-/// Reconfiguration scenario: split (1→2) or merge (2→1).
 #[derive(Clone, Debug)]
 enum Scenario {
-    /// Start with 1 shard [0x00, 0x100), split into 2.
     Split,
-    /// Start with 2 shards [0x00, 0x80) and [0x80, 0x100), merge into 1.
     Merge,
 }
 
-/// Plan for a reconfiguration, computed at the start.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct Plan {
     new_map: Vec<(u8, u16, u8)>,
@@ -282,134 +235,109 @@ struct Plan {
     retiring: Vec<u8>,
 }
 
-/// Protocol phase (volatile — lost on crash).
+/// Durable metashard status — matches MetaStatus in meta.rs.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum DurableStatus {
+    Completed,
+    Reconfiguring,
+}
+
+/// Protocol phase — volatile, lost on crash.
+/// Represents where execute_reconfiguration is in its work.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 enum Phase {
-    /// No reconfiguration in progress.
+    /// No work in progress. Either fully reconciled or waiting for commands.
     Idle,
-    /// Intent persisted to metashard shard. Recovery will re-run from here.
-    IntentPersisted,
-    /// CriticalSince holds acquired on retiring shards.
+    /// Leader claimed, ready to accept Reconfigure or Reconcile.
+    LeaderClaimed,
+    /// Reconfigure CAS succeeded, status is Reconfiguring. Now reconciling.
+    Reconciling,
+    /// CriticalSince holds acquired.
     HoldsAcquired,
-    /// Bulk snapshot writing in progress. Some (new_shard, predecessor) pairs
-    /// have been snapshot but not all. Crash clears progress, requiring re-write.
+    /// Bulk snapshot writing in progress.
     SnapshotWriting,
-    /// All bulk snapshots (batch_id=1) written. Metashard can now seal.
+    /// All bulk snapshots written.
     SnapshotsWritten,
-    /// Retiring shards sealed (upper = []). This is durable in the log shards.
+    /// Retiring shards sealed.
     Sealed,
     /// Delta snapshot writing in progress.
     DeltaWriting,
-    /// All delta snapshots (batch_id=2) written. Can now swap routing.
+    /// All delta snapshots written.
     DeltasWritten,
-    /// Routing swapped to new shards. The in-memory map and epoch have been
-    /// updated, but durable_intent still exists and the durable epoch/map
-    /// have NOT been updated. A crash here recovers from the durable state
-    /// (old epoch + intent), re-runs do_reconfigure idempotently.
-    RoutingSwapped,
-    /// Durable state persisted. intent cleared, new epoch+map are durable.
-    DurableCommitted,
+    /// Status→Completed CAS succeeded, predecessors cleared.
+    Committed,
 }
 
-/// The protocol model state.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ProtocolState {
     // --- Durable state (survives crash) ---
-
-    /// Durable epoch (persisted to metashard shard).
     durable_epoch: u8,
-    /// Durable partition map.
     durable_map: Vec<(u8, u16, u8)>,
-    /// Log shard data: seqno per client shard. Lives in the persist shard,
-    /// survives crashes.
+    durable_status: DurableStatus,
+    durable_leader_id: u8,
+    /// Predecessors for new shards (durable). Non-empty when Reconfiguring.
+    durable_predecessors: BTreeMap<u8, Vec<u8>>,
+    /// Previous partition map (durable). Set when Reconfiguring so that
+    /// crash recovery can route to old shards while reconciliation completes.
+    previous_map: Option<Vec<(u8, u16, u8)>>,
+
+    /// Log shard data: seqno per client shard. Durable in persist.
     data: BTreeMap<u8, [u8; NUM_CS]>,
-    /// Sealed log shards (upper = []). Durable in persist.
     sealed: BTreeSet<u8>,
-    /// Pending reconfiguration intent. Persisted in the metashard shard
-    /// at Phase::IntentPersisted; cleared at Phase::DurableCommitted.
-    durable_intent: Option<Plan>,
 
-    // --- In-memory state (may diverge from durable between SwapRouting and PersistCommit) ---
-
-    /// In-memory epoch (updated at SwapRouting, made durable at PersistCommit).
-    epoch: u8,
-    /// In-memory partition map (updated at SwapRouting).
+    // --- In-memory state (volatile) ---
+    /// Current leader's claimed ID. 0 = no leader.
+    leader_id: u8,
+    /// In-memory view of the map (used for routing).
     map: Vec<(u8, u16, u8)>,
-
-    // --- Volatile state (lost on crash) ---
-
-    /// Current protocol phase.
     phase: Phase,
-    /// CriticalSince holds (prevent compaction of sealed shards during replay).
     holds: BTreeSet<u8>,
-    /// (new_shard, predecessor) pairs that have completed bulk snapshot (batch_id=1).
     bulk_snapshots: BTreeSet<(u8, u8)>,
-    /// (new_shard, predecessor) pairs that have completed delta snapshot (batch_id=2).
     delta_snapshots: BTreeSet<(u8, u8)>,
 
     // --- Bookkeeping ---
-
-    /// Next log shard ID to allocate.
     next_shard: u8,
-    /// Number of crashes so far (bounded to limit state space).
     crashes: u8,
-    /// Whether a reconfiguration has been started (limits to 1).
     started_reconfig: bool,
 
     // --- Retraction state ---
-
-    /// Pending retractions per shard: unique retraction IDs.
-    /// Each rejected write generates a unique ID (monotonic counter).
     pending_retractions: BTreeMap<u8, BTreeSet<u16>>,
-    /// Next retraction ID (monotonic, unique across all shards).
     next_retraction_id: u16,
-    /// Number of retraction polls that have happened (bounded).
     retraction_polls: u8,
 
     // --- Ghost state (for property checking, not part of system) ---
-
     /// All (client_shard, seqno) pairs the client has seen committed.
-    /// Used to verify RC2: no committed write is lost.
     committed_writes: BTreeSet<(usize, u8)>,
-    /// All retraction IDs that have been flushed by the acceptor.
     retracted: BTreeSet<u16>,
+    /// Highest seqno ever observed by a read for each client shard.
+    /// Used to verify monotonic reads (linearizability): a read must never
+    /// return a seqno lower than one previously observed.
+    last_read: [u8; NUM_CS],
+    /// Total number of reads performed (bounded to limit state space).
+    read_count: u8,
 }
 
-/// Actions in the protocol model.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum ProtocolAction {
-    /// Client writes to the active shard for this client shard (committed).
     Write { cs: usize },
-    /// Client writes a stale CaS that is rejected, producing a pending retraction.
+    /// Read the current seqno for a client shard from the active shard.
+    Read { cs: usize },
     StaleWrite { cs: usize },
-    /// Begin reconfiguration: validate plan, persist intent.
-    BeginReconfig,
-    /// Acquire CriticalSince holds on retiring shards.
+    ClaimLeadership,
+    Reconfigure,
+    /// Begin reconciliation (reads durable state, starts execute_reconfiguration).
+    BeginReconcile,
     AcquireHolds,
-    /// Acceptor writes bulk snapshot of one predecessor into one new shard
-    /// at batch_id=1. Available BEFORE seal (while predecessor is still live).
     WriteBulkSnapshot { new_shard: u8, predecessor: u8 },
-    /// Seal retiring log shards. Available after all bulk snapshots written.
     Seal,
-    /// Acceptor writes delta snapshot of one predecessor into one new shard
-    /// at batch_id=2. Available AFTER seal (predecessor frontier = []).
     WriteDeltaSnapshot { new_shard: u8, predecessor: u8 },
-    /// Swap routing to new partition map. In-memory map/epoch updated,
-    /// intent cleared in memory but NOT yet durably persisted.
-    SwapRouting,
-    /// Persist the committed state durably. After this, durable_intent is
-    /// cleared and new epoch/map are crash-safe.
-    PersistCommit,
-    /// Release CriticalSince holds.
+    /// CAS: set status→Completed, clear predecessors.
+    CommitReconciliation,
     ReleaseHolds,
-    /// Acceptor polls learner for pending retractions (every Nth flush).
-    /// The acceptor includes them as -1 diffs in its next flush.
     PollRetractions { shard: u8 },
-    /// Crash and recover. Resets volatile state, recovers from durable.
     Crash,
 }
 
-/// The protocol model, parameterized by scenario.
 struct ProtocolModel {
     scenario: Scenario,
 }
@@ -427,12 +355,10 @@ impl ProtocolModel {
         }
     }
 
-    /// Build the reconfiguration plan based on the scenario and current state.
     fn build_plan(&self, state: &ProtocolState) -> Plan {
         match &self.scenario {
             Scenario::Split => {
-                // Split [0x00, 0x100) into [0x00, 0x80) and [0x80, 0x100)
-                let old_shard = state.map[0].2;
+                let old_shard = state.durable_map[0].2;
                 let shard_a = state.next_shard;
                 let shard_b = state.next_shard + 1;
                 Plan {
@@ -442,9 +368,8 @@ impl ProtocolModel {
                 }
             }
             Scenario::Merge => {
-                // Merge [0x00, 0x80) + [0x80, 0x100) into [0x00, 0x100)
-                let shard_a = state.map[0].2;
-                let shard_b = state.map[1].2;
+                let shard_a = state.durable_map[0].2;
+                let shard_b = state.durable_map[1].2;
                 let merged = state.next_shard;
                 Plan {
                     new_map: vec![(0x00, 0x100, merged)],
@@ -456,26 +381,13 @@ impl ProtocolModel {
     }
 }
 
-/// Check if all overlapping (new_shard, predecessor) pairs are present in `done`.
+/// Check if all (new_shard, predecessor) pairs from durable_predecessors are done.
 fn all_predecessor_pairs_done(
-    plan: &Plan,
-    old_map: &[(u8, u16, u8)],
+    predecessors: &BTreeMap<u8, Vec<u8>>,
     done: &BTreeSet<(u8, u8)>,
 ) -> bool {
-    plan.new_shards.iter().all(|&ns| {
-        let new_r = plan.new_map.iter().find(|&&(_, _, sid)| sid == ns);
-        plan.retiring.iter().all(|&pred| {
-            let pred_r = old_map.iter().find(|&&(_, _, sid)| sid == pred);
-            match (new_r, pred_r) {
-                (Some(nr), Some(pr)) => {
-                    let overlaps = (0..NUM_CS).any(|cs| {
-                        range_covers(nr.0, nr.1, cs) && range_covers(pr.0, pr.1, cs)
-                    });
-                    !overlaps || done.contains(&(ns, pred))
-                }
-                _ => true,
-            }
-        })
+    predecessors.iter().all(|(&new_shard, preds)| {
+        preds.iter().all(|&pred| done.contains(&(new_shard, pred)))
     })
 }
 
@@ -492,11 +404,14 @@ impl Model for ProtocolModel {
                 vec![ProtocolState {
                     durable_epoch: 0,
                     durable_map: init_map.clone(),
-                    epoch: 0,
-                    map: init_map,
+                    durable_status: DurableStatus::Completed,
+                    durable_leader_id: 0,
+                    durable_predecessors: BTreeMap::new(),
+                    previous_map: None,
                     data,
                     sealed: BTreeSet::new(),
-                    durable_intent: None,
+                    leader_id: 0,
+                    map: init_map,
                     phase: Phase::Idle,
                     holds: BTreeSet::new(),
                     bulk_snapshots: BTreeSet::new(),
@@ -509,6 +424,8 @@ impl Model for ProtocolModel {
                     retraction_polls: 0,
                     committed_writes: BTreeSet::new(),
                     retracted: BTreeSet::new(),
+                    last_read: [0u8; NUM_CS],
+                    read_count: 0,
                 }]
             }
             Scenario::Merge => {
@@ -519,11 +436,14 @@ impl Model for ProtocolModel {
                 vec![ProtocolState {
                     durable_epoch: 0,
                     durable_map: init_map.clone(),
-                    epoch: 0,
-                    map: init_map,
+                    durable_status: DurableStatus::Completed,
+                    durable_leader_id: 0,
+                    durable_predecessors: BTreeMap::new(),
+                    previous_map: None,
                     data,
                     sealed: BTreeSet::new(),
-                    durable_intent: None,
+                    leader_id: 0,
+                    map: init_map,
                     phase: Phase::Idle,
                     holds: BTreeSet::new(),
                     bulk_snapshots: BTreeSet::new(),
@@ -536,21 +456,23 @@ impl Model for ProtocolModel {
                     retraction_polls: 0,
                     committed_writes: BTreeSet::new(),
                     retracted: BTreeSet::new(),
+                    last_read: [0u8; NUM_CS],
+                    read_count: 0,
                 }]
             }
         }
     }
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
-        // --- Client writes ---
-        // Available when there's an unsealed shard covering the client shard
-        // and seqno hasn't reached MAX_SEQ.
+        // --- Client reads and writes (available if shard is active) ---
         for cs in 0..NUM_CS {
             if let Some(shard) = active_shard_for(&state.map, &state.sealed, cs) {
+                // Reads: bounded to limit state space.
+                if state.read_count < 4 {
+                    actions.push(ProtocolAction::Read { cs });
+                }
                 if state.data[&shard][cs] < MAX_SEQ {
                     actions.push(ProtocolAction::Write { cs });
-                    // A stale write is also possible (rejected CaS → retraction).
-                    // Bounded to prevent unbounded state space.
                     if state.data[&shard][cs] > 0 && state.next_retraction_id < 3 {
                         actions.push(ProtocolAction::StaleWrite { cs });
                     }
@@ -559,8 +481,6 @@ impl Model for ProtocolModel {
         }
 
         // --- Retraction polling ---
-        // Available when any active shard has pending retractions.
-        // Bounded to limit state space.
         if state.retraction_polls < 2 {
             for &(_, _, shard) in &state.map {
                 if !state.sealed.contains(&shard) {
@@ -576,43 +496,36 @@ impl Model for ProtocolModel {
         // --- Protocol phases ---
         match state.phase {
             Phase::Idle => {
-                if !state.started_reconfig {
+                // Must claim leadership first.
+                actions.push(ProtocolAction::ClaimLeadership);
+            }
+            Phase::LeaderClaimed => {
+                // Can reconfigure (if status is Completed and not already done).
+                if state.durable_status == DurableStatus::Completed && !state.started_reconfig {
                     let can_start = match &self.scenario {
-                        Scenario::Split => state.map.len() == 1,
-                        Scenario::Merge => state.map.len() == 2,
+                        Scenario::Split => state.durable_map.len() == 1,
+                        Scenario::Merge => state.durable_map.len() == 2,
                     };
                     if can_start {
-                        actions.push(ProtocolAction::BeginReconfig);
+                        actions.push(ProtocolAction::Reconfigure);
                     }
                 }
+                // Can reconcile (always — idempotent).
+                if state.durable_status == DurableStatus::Reconfiguring {
+                    actions.push(ProtocolAction::BeginReconcile);
+                }
             }
-            Phase::IntentPersisted => {
+            Phase::Reconciling => {
                 actions.push(ProtocolAction::AcquireHolds);
             }
             Phase::HoldsAcquired | Phase::SnapshotWriting => {
-                // Acceptor writes bulk snapshot (batch_id=1) BEFORE seal.
-                // Per-predecessor granularity so crash-during-partial-snapshot
-                // is a modeled state.
-                if let Some(plan) = &state.durable_intent {
-                    let old_map = &state.durable_map;
-                    for &new_shard in &plan.new_shards {
-                        let new_range = plan.new_map.iter().find(|&&(_, _, sid)| sid == new_shard);
-                        if let Some(new_range) = new_range {
-                            for &pred in &plan.retiring {
-                                let pred_range = old_map.iter().find(|&&(_, _, sid)| sid == pred);
-                                if let Some(pred_range) = pred_range {
-                                    let overlaps = (0..NUM_CS).any(|cs| {
-                                        range_covers(new_range.0, new_range.1, cs)
-                                            && range_covers(pred_range.0, pred_range.1, cs)
-                                    });
-                                    if overlaps && !state.bulk_snapshots.contains(&(new_shard, pred)) {
-                                        actions.push(ProtocolAction::WriteBulkSnapshot {
-                                            new_shard,
-                                            predecessor: pred,
-                                        });
-                                    }
-                                }
-                            }
+                for (&new_shard, preds) in &state.durable_predecessors {
+                    for &pred in preds {
+                        if !state.bulk_snapshots.contains(&(new_shard, pred)) {
+                            actions.push(ProtocolAction::WriteBulkSnapshot {
+                                new_shard,
+                                predecessor: pred,
+                            });
                         }
                     }
                 }
@@ -621,59 +534,28 @@ impl Model for ProtocolModel {
                 actions.push(ProtocolAction::Seal);
             }
             Phase::Sealed | Phase::DeltaWriting => {
-                // Acceptor writes delta snapshot (batch_id=2) AFTER seal.
-                if let Some(plan) = &state.durable_intent {
-                    let old_map = &state.durable_map;
-                    for &new_shard in &plan.new_shards {
-                        let new_range = plan.new_map.iter().find(|&&(_, _, sid)| sid == new_shard);
-                        if let Some(new_range) = new_range {
-                            for &pred in &plan.retiring {
-                                let pred_range = old_map.iter().find(|&&(_, _, sid)| sid == pred);
-                                if let Some(pred_range) = pred_range {
-                                    let overlaps = (0..NUM_CS).any(|cs| {
-                                        range_covers(new_range.0, new_range.1, cs)
-                                            && range_covers(pred_range.0, pred_range.1, cs)
-                                    });
-                                    if overlaps && !state.delta_snapshots.contains(&(new_shard, pred)) {
-                                        actions.push(ProtocolAction::WriteDeltaSnapshot {
-                                            new_shard,
-                                            predecessor: pred,
-                                        });
-                                    }
-                                }
-                            }
+                for (&new_shard, preds) in &state.durable_predecessors {
+                    for &pred in preds {
+                        if !state.delta_snapshots.contains(&(new_shard, pred)) {
+                            actions.push(ProtocolAction::WriteDeltaSnapshot {
+                                new_shard,
+                                predecessor: pred,
+                            });
                         }
                     }
                 }
             }
             Phase::DeltasWritten => {
-                actions.push(ProtocolAction::SwapRouting);
+                actions.push(ProtocolAction::CommitReconciliation);
             }
-            Phase::RoutingSwapped => {
-                actions.push(ProtocolAction::PersistCommit);
-            }
-            Phase::DurableCommitted => {
+            Phase::Committed => {
                 actions.push(ProtocolAction::ReleaseHolds);
             }
         }
 
         // --- Crash ---
-        // Available during any active reconfiguration phase, bounded by max crashes.
-        if state.crashes < MAX_CRASHES {
-            match state.phase {
-                Phase::IntentPersisted
-                | Phase::HoldsAcquired
-                | Phase::SnapshotWriting
-                | Phase::SnapshotsWritten
-                | Phase::Sealed
-                | Phase::DeltaWriting
-                | Phase::DeltasWritten
-                | Phase::RoutingSwapped
-                | Phase::DurableCommitted => {
-                    actions.push(ProtocolAction::Crash);
-                }
-                Phase::Idle => {}
-            }
+        if state.crashes < MAX_CRASHES && state.phase != Phase::Idle {
+            actions.push(ProtocolAction::Crash);
         }
     }
 
@@ -683,16 +565,24 @@ impl Model for ProtocolModel {
         match action {
             ProtocolAction::Write { cs } => {
                 let shard = active_shard_for(&s.map, &s.sealed, cs)
-                    .expect("Write action only available when active shard exists");
-                let entry = s.data.get_mut(&shard).expect("shard must have data entry");
+                    .expect("Write requires active shard");
+                let entry = s.data.get_mut(&shard).expect("shard must have data");
                 entry[cs] += 1;
                 s.committed_writes.insert((cs, entry[cs]));
             }
 
+            ProtocolAction::Read { cs } => {
+                // Read the current seqno for this client shard from the
+                // active (non-sealed) shard. Record the observed value in
+                // ghost state for the monotonic reads property.
+                let shard = active_shard_for(&s.map, &s.sealed, cs)
+                    .expect("Read requires active shard");
+                let observed = s.data[&shard][cs];
+                s.last_read[cs] = s.last_read[cs].max(observed);
+                s.read_count += 1;
+            }
+
             ProtocolAction::StaleWrite { cs } => {
-                // A rejected CaS: the proposal is appended to the log but
-                // the learner evaluates it as a no-op. It becomes a pending
-                // retraction with a unique ID.
                 let shard = active_shard_for(&s.map, &s.sealed, cs)
                     .expect("StaleWrite requires active shard");
                 let retraction_id = s.next_retraction_id;
@@ -704,41 +594,74 @@ impl Model for ProtocolModel {
             }
 
             ProtocolAction::PollRetractions { shard } => {
-                // The acceptor polls the learner for pending retractions and
-                // includes them as -1 diffs in its next flush. The pending
-                // retractions are cleared (the learner will see the -1 diffs
-                // arrive via subscription and prune them).
                 if let Some(pending) = s.pending_retractions.remove(&shard) {
                     for id in &pending {
-                        // Verify no double retraction (no negative multiplicity).
                         assert!(
                             s.retracted.insert(*id),
                             "double retraction: shard={}, id={}",
-                            shard, id,
+                            shard,
+                            id,
                         );
                     }
                 }
                 s.retraction_polls += 1;
             }
 
-            ProtocolAction::BeginReconfig => {
+            ProtocolAction::ClaimLeadership => {
+                // CAS: increment leader_id.
+                s.durable_leader_id += 1;
+                s.leader_id = s.durable_leader_id;
+                s.phase = Phase::LeaderClaimed;
+            }
+
+            ProtocolAction::Reconfigure => {
                 let plan = self.build_plan(state);
 
                 // Initialize empty data entries for new shards.
                 for &shard in &plan.new_shards {
                     s.data.insert(shard, [0u8; NUM_CS]);
                 }
-                s.next_shard = state.next_shard + u8::try_from(plan.new_shards.len()).expect("len fits u8");
+                s.next_shard =
+                    state.next_shard + u8::try_from(plan.new_shards.len()).expect("len fits u8");
 
-                // Persist the intent (durable).
-                s.durable_intent = Some(plan);
-                s.phase = Phase::IntentPersisted;
+                // CAS: set status→Reconfiguring, bump epoch, store predecessors.
+                // Save the old map so crash recovery can route to old shards.
+                s.previous_map = Some(s.durable_map.clone());
+                s.durable_epoch += 1;
+                s.durable_map = plan.new_map.clone();
+                s.durable_status = DurableStatus::Reconfiguring;
+                // Store predecessors durably.
+                s.durable_predecessors.clear();
+                for &new_shard in &plan.new_shards {
+                    s.durable_predecessors
+                        .insert(new_shard, plan.retiring.clone());
+                }
+
+                // In-memory map stays at the OLD value during reconfiguration.
+                // Routing only switches to new shards at CommitReconciliation,
+                // after bulk+delta snapshots ensure data continuity.
+                // s.map is NOT updated here.
                 s.started_reconfig = true;
+
+                // After Reconfigure CAS, transition to LeaderClaimed so
+                // the actor sends Reconcile next.
+                s.phase = Phase::LeaderClaimed;
+            }
+
+            ProtocolAction::BeginReconcile => {
+                // Reads durable state (already in sync in the model).
+                // Begins execute_reconfiguration.
+                s.phase = Phase::Reconciling;
             }
 
             ProtocolAction::AcquireHolds => {
-                let plan = s.durable_intent.as_ref().expect("must have intent");
-                s.holds = plan.retiring.iter().copied().collect();
+                // Collect all predecessor shards.
+                let preds: BTreeSet<u8> = s
+                    .durable_predecessors
+                    .values()
+                    .flat_map(|v| v.iter().copied())
+                    .collect();
+                s.holds = preds;
                 s.phase = Phase::HoldsAcquired;
             }
 
@@ -746,25 +669,28 @@ impl Model for ProtocolModel {
                 new_shard,
                 predecessor,
             } => {
-                let plan = s.durable_intent.as_ref().expect("must have intent").clone();
-                let new_range = plan.new_map.iter().find(|&&(_, _, sid)| sid == new_shard)
-                    .expect("new shard must be in new map");
-                let pred_range = state.durable_map.iter().find(|&&(_, _, sid)| sid == predecessor)
-                    .expect("predecessor must be in old map");
-                // Copy each client shard that both ranges cover (idempotent max).
-                for cs in 0..NUM_CS {
-                    if range_covers(new_range.0, new_range.1, cs)
-                        && range_covers(pred_range.0, pred_range.1, cs)
-                    {
-                        let pred_seq = s.data[&predecessor][cs];
-                        let entry = s.data.get_mut(&new_shard).unwrap();
-                        entry[cs] = entry[cs].max(pred_seq);
+                // Copy data from predecessor to new shard (idempotent max).
+                let new_range = s
+                    .durable_map
+                    .iter()
+                    .find(|&&(_, _, sid)| sid == new_shard)
+                    .copied();
+                if let Some(new_range) = new_range {
+                    for cs in 0..NUM_CS {
+                        if range_covers(new_range.0, new_range.1, cs) {
+                            let pred_seq = s.data.get(&predecessor).map_or(0, |d| d[cs]);
+                            let entry = s.data.get_mut(&new_shard).unwrap();
+                            entry[cs] = entry[cs].max(pred_seq);
+                        }
                     }
                 }
                 s.bulk_snapshots.insert((new_shard, predecessor));
 
-                // Check if all bulk snapshots are written.
-                let all_done = all_predecessor_pairs_done(&plan, &state.durable_map, &s.bulk_snapshots);
+                // Check if all bulk snapshots done.
+                let all_done = all_predecessor_pairs_done(
+                    &s.durable_predecessors,
+                    &s.bulk_snapshots,
+                );
                 s.phase = if all_done {
                     Phase::SnapshotsWritten
                 } else {
@@ -773,9 +699,13 @@ impl Model for ProtocolModel {
             }
 
             ProtocolAction::Seal => {
-                let plan = s.durable_intent.as_ref().expect("must have intent");
-                for &shard in &plan.retiring {
-                    s.sealed.insert(shard);
+                let retiring: BTreeSet<u8> = s
+                    .durable_predecessors
+                    .values()
+                    .flat_map(|v| v.iter().copied())
+                    .collect();
+                for shard in &retiring {
+                    s.sealed.insert(*shard);
                 }
                 s.phase = Phase::Sealed;
             }
@@ -784,25 +714,27 @@ impl Model for ProtocolModel {
                 new_shard,
                 predecessor,
             } => {
-                let plan = s.durable_intent.as_ref().expect("must have intent").clone();
-                let new_range = plan.new_map.iter().find(|&&(_, _, sid)| sid == new_shard)
-                    .expect("new shard must be in new map");
-                let pred_range = state.durable_map.iter().find(|&&(_, _, sid)| sid == predecessor)
-                    .expect("predecessor must be in old map");
-                // Re-copy (idempotent max) — captures writes between snapshot and seal.
-                for cs in 0..NUM_CS {
-                    if range_covers(new_range.0, new_range.1, cs)
-                        && range_covers(pred_range.0, pred_range.1, cs)
-                    {
-                        let pred_seq = s.data[&predecessor][cs];
-                        let entry = s.data.get_mut(&new_shard).unwrap();
-                        entry[cs] = entry[cs].max(pred_seq);
+                // Re-copy (captures writes between snapshot and seal).
+                let new_range = s
+                    .durable_map
+                    .iter()
+                    .find(|&&(_, _, sid)| sid == new_shard)
+                    .copied();
+                if let Some(new_range) = new_range {
+                    for cs in 0..NUM_CS {
+                        if range_covers(new_range.0, new_range.1, cs) {
+                            let pred_seq = s.data.get(&predecessor).map_or(0, |d| d[cs]);
+                            let entry = s.data.get_mut(&new_shard).unwrap();
+                            entry[cs] = entry[cs].max(pred_seq);
+                        }
                     }
                 }
                 s.delta_snapshots.insert((new_shard, predecessor));
 
-                // Check if all delta snapshots are written.
-                let all_done = all_predecessor_pairs_done(&plan, &state.durable_map, &s.delta_snapshots);
+                let all_done = all_predecessor_pairs_done(
+                    &s.durable_predecessors,
+                    &s.delta_snapshots,
+                );
                 s.phase = if all_done {
                     Phase::DeltasWritten
                 } else {
@@ -810,22 +742,15 @@ impl Model for ProtocolModel {
                 };
             }
 
-            ProtocolAction::SwapRouting => {
-                let plan = s.durable_intent.as_ref().expect("must have intent").clone();
-                // Update IN-MEMORY partition map and epoch only.
-                // durable_epoch / durable_map / durable_intent are UNCHANGED.
-                // A crash here reverts to the durable state (old epoch + intent).
-                s.epoch = s.durable_epoch + 1;
-                s.map = plan.new_map;
-                s.phase = Phase::RoutingSwapped;
-            }
-
-            ProtocolAction::PersistCommit => {
-                // Make the in-memory state durable.
-                s.durable_epoch = s.epoch;
-                s.durable_map = s.map.clone();
-                s.durable_intent = None;
-                s.phase = Phase::DurableCommitted;
+            ProtocolAction::CommitReconciliation => {
+                // CAS: status→Completed, clear predecessors, clear previous map.
+                s.durable_status = DurableStatus::Completed;
+                s.durable_predecessors.clear();
+                s.previous_map = None;
+                // NOW switch routing to the new partition map. Data continuity
+                // is guaranteed because bulk+delta snapshots completed.
+                s.map = s.durable_map.clone();
+                s.phase = Phase::Committed;
             }
 
             ProtocolAction::ReleaseHolds => {
@@ -834,24 +759,22 @@ impl Model for ProtocolModel {
             }
 
             ProtocolAction::Crash => {
-                // Revert in-memory state to durable state.
-                s.epoch = s.durable_epoch;
-                s.map = s.durable_map.clone();
+                // Revert in-memory routing to the appropriate map.
+                // During Reconfiguring, route to old shards (previous_map).
+                // During Completed, route to current durable_map.
+                s.map = match (&s.durable_status, &s.previous_map) {
+                    (DurableStatus::Reconfiguring, Some(prev)) => prev.clone(),
+                    _ => s.durable_map.clone(),
+                };
                 // Reset all volatile state.
+                s.leader_id = 0;
                 s.phase = Phase::Idle;
                 s.holds.clear();
                 s.bulk_snapshots.clear();
                 s.delta_snapshots.clear();
                 s.crashes += 1;
-
-                // Recovery: if durable intent exists, re-enter the protocol.
-                // This models metashard.rs run() detecting a pending intent
-                // and calling do_reconfigure().
-                if s.durable_intent.is_some() {
-                    s.phase = Phase::IntentPersisted;
-                }
-                // If no durable intent, we crashed after DurableCommitted or
-                // before BeginReconfig. Nothing to recover.
+                // Recovery: new actor starts at Idle, must ClaimLeadership
+                // before reconciling.
             }
         }
 
@@ -860,7 +783,6 @@ impl Model for ProtocolModel {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            // PM1+PM2: partition map always valid.
             Property::<Self>::always("PM1+PM2: valid partition map", |_, state| {
                 let map = &state.map;
                 if map.is_empty() {
@@ -879,105 +801,92 @@ impl Model for ProtocolModel {
                 }
                 true
             }),
-            // RC1: in stable configurations (no pending reconfig intent), the
-            // active partition map never references a sealed shard.
-            //
-            // During reconfiguration, the old map intentionally still
-            // references sealed shards (the acceptor returns Sealed errors,
-            // clients retry). RC1 is about the committed state.
+            // RC1: in stable (Completed) states, active map has no sealed shards.
             Property::<Self>::always(
                 "RC1: stable config has no sealed shards in map",
                 |_, state| {
-                    if state.durable_intent.is_some() {
-                        return true; // intermediate reconfig state — expected
-                    }
-                    let active: BTreeSet<u8> = state.map.iter().map(|r| r.2).collect();
-                    state.sealed.is_disjoint(&active)
-                },
-            ),
-            // RC1 strengthened: at the exact moment of commit, the new map
-            // does not reference any sealed shards.
-            Property::<Self>::always(
-                "RC1: new map at commit has no sealed shards",
-                |_, state| {
-                    if state.phase != Phase::DurableCommitted {
+                    if state.durable_status == DurableStatus::Reconfiguring {
                         return true;
                     }
                     let active: BTreeSet<u8> = state.map.iter().map(|r| r.2).collect();
                     state.sealed.is_disjoint(&active)
                 },
             ),
-            // Snapshot-before-seal: bulk snapshots are written before seal.
+            // Snapshot-before-seal: at seal time, all bulk snapshots are done.
             Property::<Self>::always("snapshots before seal", |_, state| {
-                if state.phase != Phase::SnapshotsWritten {
+                if state.phase != Phase::SnapshotsWritten && state.phase != Phase::Sealed {
                     return true;
                 }
-                // All bulk snapshots must be done before we allow seal.
-                if let Some(plan) = &state.durable_intent {
-                    all_predecessor_pairs_done(plan, &state.durable_map, &state.bulk_snapshots)
-                } else {
-                    true
-                }
+                all_predecessor_pairs_done(
+                    &state.durable_predecessors,
+                    &state.bulk_snapshots,
+                )
             }),
-            // Seal-before-delta: at delta time, all retiring shards are sealed.
+            // Seal-before-delta: at delta-done time, all predecessors are sealed.
             Property::<Self>::always("seal before delta", |_, state| {
                 if state.phase != Phase::DeltasWritten {
                     return true;
                 }
-                if let Some(plan) = &state.durable_intent {
-                    plan.retiring.iter().all(|s| state.sealed.contains(s))
-                } else {
-                    true
-                }
+                let retiring: BTreeSet<u8> = state
+                    .durable_predecessors
+                    .values()
+                    .flat_map(|v| v.iter().copied())
+                    .collect();
+                retiring.iter().all(|s| state.sealed.contains(s))
             }),
-            // RC2 + Carry-forward: after reconfiguration completes, every
-            // previously committed write is readable from some active
-            // (non-sealed) shard.
-            Property::<Self>::always(
-                "RC2: no committed write lost after reconfig",
-                |_, state| {
-                    // Only check in stable states after reconfig.
-                    let stable_after_reconfig = state.started_reconfig
-                        && (state.phase == Phase::DurableCommitted || state.phase == Phase::Idle)
-                        && state.durable_intent.is_none();
-                    if !stable_after_reconfig {
-                        return true;
+            // RC2: after reconfig completes, every committed write is readable.
+            Property::<Self>::always("RC2: no committed write lost after reconfig", |_, state| {
+                let stable = state.started_reconfig
+                    && state.durable_status == DurableStatus::Completed
+                    && (state.phase == Phase::Committed
+                        || state.phase == Phase::Idle
+                        || state.phase == Phase::LeaderClaimed);
+                if !stable {
+                    return true;
+                }
+                for &(cs, seq) in &state.committed_writes {
+                    let readable = state.map.iter().any(|&(lo, hi, shard)| {
+                        range_covers(lo, hi, cs)
+                            && !state.sealed.contains(&shard)
+                            && state.data.get(&shard).map_or(false, |d| d[cs] >= seq)
+                    });
+                    if !readable {
+                        return false;
                     }
-                    for &(cs, seq) in &state.committed_writes {
-                        let readable = state.map.iter().any(|&(lo, hi, shard)| {
-                            range_covers(lo, hi, cs)
-                                && !state.sealed.contains(&shard)
-                                && state.data.get(&shard).map_or(false, |d| d[cs] >= seq)
-                        });
-                        if !readable {
+                }
+                true
+            }),
+            // Linearizability (monotonic reads): a read must never observe a
+            // seqno lower than one previously observed for the same client shard.
+            // This catches stale reads after reconfiguration where data wasn't
+            // properly carried forward.
+            Property::<Self>::always("monotonic reads", |_, state| {
+                for cs in 0..NUM_CS {
+                    if let Some(shard) = active_shard_for(&state.map, &state.sealed, cs) {
+                        let current = state.data.get(&shard).map_or(0, |d| d[cs]);
+                        if current < state.last_read[cs] {
                             return false;
                         }
                     }
-                    true
-                },
-            ),
-            // Liveness: reconfiguration eventually completes.
-            // In terminal states (no more actions), phase should be Idle
-            // with the reconfiguration done.
-            Property::<Self>::eventually("reconfiguration completes", |_, state| {
-                state.started_reconfig && state.phase == Phase::Idle
+                }
+                true
             }),
-            // Reachability: we can reach a state where writes happened
-            // before reconfiguration and data was carried forward.
+            // Liveness: reconfiguration eventually completes.
+            Property::<Self>::eventually("reconfiguration completes", |_, state| {
+                state.started_reconfig
+                    && state.durable_status == DurableStatus::Completed
+                    && state.phase == Phase::Idle
+            }),
             Property::<Self>::sometimes(
                 "writes before reconfig are carried forward",
                 |_, state| {
                     state.phase == Phase::Idle
                         && state.started_reconfig
+                        && state.durable_status == DurableStatus::Completed
                         && !state.committed_writes.is_empty()
                 },
             ),
-            // No negative multiplicity: a retraction can only happen once
-            // per (shard, cs, seq) triple. The assert! in the PollRetractions
-            // transition enforces this structurally, but we also check it as
-            // a property for clarity.
             Property::<Self>::always("no double retraction", |_, state| {
-                // A pending retraction must NOT already be in the retracted set.
                 for (_, pending) in &state.pending_retractions {
                     for id in pending {
                         if state.retracted.contains(id) {
@@ -987,10 +896,17 @@ impl Model for ProtocolModel {
                 }
                 true
             }),
-            // Reachability: retractions actually happen.
+            Property::<Self>::sometimes("retractions are polled", |_, state| {
+                !state.retracted.is_empty()
+            }),
+            // Reachability: reads happen after reconfiguration with non-zero data.
             Property::<Self>::sometimes(
-                "retractions are polled",
-                |_, state| !state.retracted.is_empty(),
+                "reads after reconfig see carried-forward data",
+                |_, state| {
+                    state.started_reconfig
+                        && state.durable_status == DurableStatus::Completed
+                        && state.last_read.iter().any(|&v| v > 0)
+                },
             ),
         ]
     }
@@ -1010,15 +926,13 @@ fn stateright_protocol_split() {
         "protocol split model: {} unique states explored",
         state_count
     );
-    // Should explore a non-trivial number of states (writes × phases × crashes).
     assert!(
         state_count >= 50,
         "expected >=50 states, got {}",
         state_count
     );
-    // But stay bounded.
     assert!(
-        state_count < 1_000_000,
+        state_count < 2_000_000,
         "state space too large: {}",
         state_count
     );
@@ -1044,7 +958,7 @@ fn stateright_protocol_merge() {
         state_count
     );
     assert!(
-        state_count < 1_000_000,
+        state_count < 2_000_000,
         "state space too large: {}",
         state_count
     );

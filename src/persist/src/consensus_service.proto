@@ -83,11 +83,19 @@ message ProtoAwaitResultRequest {
 
 // --- Metashard durable state ---
 
+enum ProtoMetaStatus {
+  PROTO_META_STATUS_UNKNOWN = 0;
+  PROTO_META_STATUS_COMPLETED = 1;
+  PROTO_META_STATUS_RECONFIGURING = 2;
+}
+
 message ProtoMetashardState {
   uint64 epoch = 1;
   repeated ProtoRangeAssignment ranges = 2;
   repeated ProtoLogShardPredecessor predecessors = 3;
   optional ProtoReconfigurationIntent intent = 4;
+  uint64 leader_id = 5;
+  ProtoMetaStatus status = 6;
 }
 
 message ProtoRangeAssignment {

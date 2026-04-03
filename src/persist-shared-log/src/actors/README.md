@@ -17,21 +17,21 @@ identical traces. This is the foundation of the DST suite in `tests/`.
 
 ## The actors
 
-### Meta (`meta.rs`)
+### Meta
 
 Partition map authority. Manages the mapping from key ranges to log shards.
 Persists its state to a dedicated persist shard (the "meta shard") for crash
 recovery. Drives reconfiguration (split/merge) and creates actors for new
 shards via the `ActorFactory`.
 
-### Acceptor (`acceptor.rs`)
+### Acceptor
 
 Blind group commit. Receives CAS and truncate proposals, batches them, and
 flushes to a persist shard. Returns receipts (batch number + position) but
 does NOT evaluate CAS — proposals are appended unconditionally. The learner
 evaluates them during playback.
 
-### Learner (`learner.rs`)
+### Learner
 
 Replicated state machine. Each learner subscribes to the acceptor's persist
 shard and deterministically replays the same ordered log of proposals. Because
@@ -40,7 +40,7 @@ identical state — any replica can serve reads. During playback, the learner
 evaluates CAS preconditions, materializes state, and serves reads and result
 queries.
 
-### Router (`router.rs`)
+### Router
 
 Client-facing entry point. Clients connect to the router, which routes each
 request to the correct acceptor or learner based on the partition map.
@@ -52,8 +52,8 @@ Subscribes to the meta shard for partition map updates.
   ┌─ meta shard ──────────────────────────────────────────────┐
   │                                                           │
   │  ┌─────────────┐       ┌─────────────────────────────┐    │
-  │  │    Meta      │       │     Meta Persist Shard     │    │
-  │  │  (authority) │──────▶│     (partition map)        │    │
+  │  │   Meta      │       │      Meta Persist Shard     │    │
+  │  │ (authority) │──────▶│      (partition map)        │    │
   │  └─────────────┘       └──────────────┬──────────────┘    │
   │                                       │                   │
   └───────────────────────────────────────│───────────────────┘
@@ -89,7 +89,7 @@ Subscribes to the meta shard for partition map updates.
 ## Persist pubsub groups
 
 Pubsub provides instant write notifications so that subscribers don't have to
-poll consensus (Postgres/CRDB). Two groups:
+poll consensus. Two groups:
 
 - **Meta shard pubsub** — The meta actor hosts a pubsub server. Routers connect
   as clients. When the meta actor persists a new partition map, each router's

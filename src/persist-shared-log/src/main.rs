@@ -21,7 +21,6 @@
 //! - **learner**: a standalone learner for one log shard. Connects to the
 //!   acceptor's pubsub server so that `Subscribe` gets instant notifications.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -582,17 +581,12 @@ async fn run_monolith(args: MonolithArgs) {
     let bootstrap_state = if num_shards == 1 {
         MetaState::single(bootstrap_shard_ids[0])
     } else {
-        MetaState {
-            epoch: 0,
-            partition_map: bootstrap_map,
-            log_shards: BTreeMap::new(),
-            pending_intent: None,
-        }
+        MetaState::new(bootstrap_map)
     };
 
     let factory = Arc::new(InProcessActorFactory::new(persist_client.clone()));
 
-    let (_metashard_handle, recover_result, _metashard_task) = PersistMetaActor::spawn(
+    let (_metashard_handle, reconcile_result, _metashard_task) = PersistMetaActor::spawn(
         bootstrap_state,
         256,
         persist_client.clone(),
@@ -601,8 +595,8 @@ async fn run_monolith(args: MonolithArgs) {
     )
     .await;
 
-    let partition_map = recover_result.partition_map;
-    let epoch = recover_result.epoch;
+    let partition_map = reconcile_result.partition_map;
+    let epoch = reconcile_result.epoch;
     info!(
         epoch,
         num_ranges = partition_map.ranges.len(),
@@ -843,12 +837,7 @@ async fn run_metashard(args: MetashardArgs) {
     let bootstrap_state = if num_shards == 1 {
         MetaState::single(bootstrap_shard_ids[0])
     } else {
-        MetaState {
-            epoch: 0,
-            partition_map: bootstrap_map,
-            log_shards: BTreeMap::new(),
-            pending_intent: None,
-        }
+        MetaState::new(bootstrap_map)
     };
 
     // Use ProcessActorFactory to spawn acceptors/learners as child processes.
@@ -863,7 +852,7 @@ async fn run_metashard(args: MetashardArgs) {
         ),
     );
 
-    let (metashard_handle, recover_result, _metashard_task) = PersistMetaActor::spawn(
+    let (metashard_handle, reconcile_result, _metashard_task) = PersistMetaActor::spawn(
         bootstrap_state,
         256,
         persist_client,
@@ -872,8 +861,8 @@ async fn run_metashard(args: MetashardArgs) {
     )
     .await;
 
-    let partition_map = recover_result.partition_map;
-    let epoch = recover_result.epoch;
+    let partition_map = reconcile_result.partition_map;
+    let epoch = reconcile_result.epoch;
     info!(
         epoch,
         num_ranges = partition_map.ranges.len(),

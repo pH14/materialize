@@ -119,7 +119,10 @@ pub struct ProcessDirectory {
 
 impl ProcessDirectory {
     pub fn new(run_dir: std::path::PathBuf, metashard_shard_id: ShardId) -> Self {
-        ProcessDirectory { run_dir, metashard_shard_id }
+        ProcessDirectory {
+            run_dir,
+            metashard_shard_id,
+        }
     }
 
     fn socket_path(&self, role: &str, shard_id: ShardId) -> String {
@@ -175,4 +178,3 @@ impl ServiceDirectory for ProcessDirectory {
         self.socket_path("pubsub", shard_id)
     }
 }
-

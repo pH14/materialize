@@ -131,12 +131,7 @@ async fn spawn_metashard_with_routing_and_shard_id(
     metashard_shard_id: ShardId,
 ) -> crate::actors::meta::PersistMetaHandle {
     let factory = std::sync::Arc::new(InProcessActorFactory::new(client.clone()));
-    let metashard_state = MetaState {
-        epoch: partition_map.epoch,
-        partition_map,
-        log_shards: BTreeMap::new(),
-        pending_intent: None,
-    };
+    let metashard_state = MetaState::new(partition_map);
     let (metashard_handle, _, _metashard_task) = PersistMetaActor::spawn(
         metashard_state,
         256,

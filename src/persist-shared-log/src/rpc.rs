@@ -499,6 +499,8 @@ impl mz_persist::generated::consensus_service::consensus_metashard_server::Conse
             ranges,
             predecessors: vec![],
             intent: None,
+            leader_id: 0,
+            status: 0, // ProtoMetaStatus::Unknown → Completed on decode
         };
 
         Ok(tonic::Response::new(ProtoGetPartitionMapResponse {

@@ -1,6 +1,19 @@
 # Simulation Tests
 
-## Deterministic simulation failures are real bugs
+## CRITICAL: There is no such thing as a flaky test
+
+**A flaky test IS a bug. Every test failure must be investigated and
+root-caused. No exceptions.** Do not dismiss, skip, or retry a failing test
+hoping it goes away. Do not mark a test as `#[ignore]` to unblock other work.
+Do not say "it passed when I re-ran it" and move on. If a test fails even once,
+something is wrong and it must be understood.
+
+This applies to all tests in this crate — deterministic simulation tests,
+integration tests, and unit tests alike. A non-reproducible failure is *worse*
+than a reproducible one because it means something subtle (nondeterminism, race
+condition, leaked state) is hiding. Treat it with more urgency, not less.
+
+### Deterministic simulation failures
 
 The simulation tests in `persist_sim.rs` are seeded and deterministic. A given
 seed must always produce the same trace and the same outcome. If a test fails
@@ -48,6 +61,21 @@ When investigating:
 - **Multi-writer contention**: `persist_sim_multi_writer` runs two acceptors
   against the same shard pool. Each writer maintains its own stale snapshot,
   so one writer's commit causes the other's next CAS to be rejected.
+
+## TODOs
+
+- **Ground-truth validation from persist shards**: Read the raw persist shard
+  data directly and validate that the history is as-intended and per-shard
+  linearizable. Currently we only check the system through the client API
+  (acceptor/learner). Reading the persist shard directly would catch bugs
+  in the acceptor's write path (e.g., the diff-dropping bug in bulk/delta
+  snapshots) that are invisible through the client API due to consolidation.
+
+- **Retractions during reconfiguration**: No test currently generates
+  retractions in the window between CriticalSince and seal. Add a test
+  that produces rejected CAS writes (which generate -1 retraction diffs)
+  during an active reconfiguration and verifies they're properly carried
+  forward to the new shard.
 
 ## Running
 

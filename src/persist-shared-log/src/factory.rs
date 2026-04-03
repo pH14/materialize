@@ -134,6 +134,42 @@ impl InProcessActorFactory {
             learners: Mutex::new(BTreeMap::new()),
         }
     }
+
+    /// Wire the acceptor's retraction source to query the learner for the
+    /// given shard, if both exist in the cache.
+    async fn maybe_wire_retractions(&self, shard_id: ShardId) {
+        use crate::actors::{OrderedKey, Proposal};
+
+        /// Adapter: wraps a `PersistLearnerHandle` as a `RetractionSource`.
+        struct LearnerRetractionSource {
+            learner: PersistLearnerHandle,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::RetractionSource for LearnerRetractionSource {
+            async fn get_retractions(
+                &self,
+                frontier: u64,
+            ) -> Vec<(OrderedKey, Proposal)> {
+                self.learner
+                    .get_retractions(frontier)
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+
+        let (acceptor, learner) = {
+            let acceptors = self.acceptors.lock().unwrap();
+            let learners = self.learners.lock().unwrap();
+            match (acceptors.get(&shard_id), learners.get(&shard_id)) {
+                (Some(a), Some(l)) => (a.clone(), l.clone()),
+                _ => return,
+            }
+        };
+        let source: Box<dyn crate::RetractionSource> =
+            Box::new(LearnerRetractionSource { learner });
+        let _ = acceptor.set_retraction_source(source).await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -162,7 +198,7 @@ impl ActorFactory for InProcessActorFactory {
             shard_id,
             acceptor_metrics,
             epoch,
-            // REVIEW: STOP DOING THIS THIS NEEDS TO BE A REAL SOURCE
+            // Starts with NoOp; wired to real learner in maybe_wire_retractions.
             Box::new(crate::NoOpRetractionSource),
             predecessors,
             range,
@@ -173,6 +209,8 @@ impl ActorFactory for InProcessActorFactory {
             .lock()
             .unwrap()
             .insert(shard_id, handle.clone());
+        // Wire retractions if the learner was already created.
+        self.maybe_wire_retractions(shard_id).await;
         Ok(handle)
     }
 
@@ -197,6 +235,8 @@ impl ActorFactory for InProcessActorFactory {
             .lock()
             .unwrap()
             .insert(shard_id, handle.clone());
+        // Wire retractions if the acceptor was already created.
+        self.maybe_wire_retractions(shard_id).await;
         Ok(handle)
     }
 

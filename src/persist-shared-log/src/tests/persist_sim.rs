@@ -55,10 +55,10 @@ use mz_ore::metrics::MetricsRegistry;
 
 use crate::Acceptor as _;
 use crate::AcceptorConfig;
-use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
 use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
+use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 
 use super::scenario::{
     SharedLogObservation, SharedLogOp, SharedLogOracle, SystemEvent, VersionedData,
@@ -308,8 +308,13 @@ async fn spawn_persist_pair(
 
     let (acceptor_metrics, learner_metrics) = test_metrics();
 
-    let (acceptor, write, acceptor_handle) =
-        PersistAcceptor::new(test_acceptor_config(), write, acceptor_metrics, shard_id, 0);
+    let (acceptor, acceptor_handle) = PersistAcceptor::new(
+        test_acceptor_config(),
+        acceptor_metrics,
+        shard_id,
+        0,
+        Box::new(crate::NoOpRetractionSource),
+    );
     let acceptor_task =
         mz_ore::task::spawn(|| "persist-sim-acceptor", acceptor.run(write)).abort_on_drop();
 
@@ -317,12 +322,17 @@ async fn spawn_persist_pair(
         retraction_interval: Duration::from_millis(100),
         ..Default::default()
     };
-    let (learner, learner_handle) =
-        PersistLearner::new(learner_config, subscribe, learner_metrics);
+    let (learner, learner_handle) = PersistLearner::new(learner_config, subscribe, learner_metrics);
     let learner_task =
         mz_ore::task::spawn(|| "persist-sim-learner", learner.run(upper_handle)).abort_on_drop();
 
-    (acceptor_handle, learner_handle, acceptor_task, learner_task, shard_upper)
+    (
+        acceptor_handle,
+        learner_handle,
+        acceptor_task,
+        learner_task,
+        shard_upper,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -597,10 +607,8 @@ impl PersistSimulator {
 
         // Verify no duplicate OrderedKeys in the retraction set (each
         // rejected proposal should appear exactly once).
-        let unique_keys: std::collections::BTreeSet<_> = retractions
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect();
+        let unique_keys: std::collections::BTreeSet<_> =
+            retractions.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(
             unique_keys.len(),
             retractions.len(),
@@ -609,7 +617,10 @@ impl PersistSimulator {
 
         self.trace.record_note(
             step,
-            format!("retraction check: {} entries pending (all unique)", retractions.len()),
+            format!(
+                "retraction check: {} entries pending (all unique)",
+                retractions.len()
+            ),
         );
     }
 }
@@ -709,13 +720,23 @@ async fn persist_sim_multi_writer() {
         let (acceptor_metrics_a, learner_metrics) = test_metrics();
         let (acceptor_metrics_b, _) = test_metrics();
 
-        let (acceptor_a, write_a, handle_a) =
-            PersistAcceptor::new(test_acceptor_config(), write_a, acceptor_metrics_a, shard_id, 0);
+        let (acceptor_a, handle_a) = PersistAcceptor::new(
+            test_acceptor_config(),
+            acceptor_metrics_a,
+            shard_id,
+            0,
+            Box::new(crate::NoOpRetractionSource),
+        );
         let _task_a = mz_ore::task::spawn(|| "persist-sim-acceptor-a", acceptor_a.run(write_a))
             .abort_on_drop();
 
-        let (acceptor_b, write_b, handle_b) =
-            PersistAcceptor::new(test_acceptor_config(), write_b, acceptor_metrics_b, shard_id, 0);
+        let (acceptor_b, handle_b) = PersistAcceptor::new(
+            test_acceptor_config(),
+            acceptor_metrics_b,
+            shard_id,
+            0,
+            Box::new(crate::NoOpRetractionSource),
+        );
         let _task_b = mz_ore::task::spawn(|| "persist-sim-acceptor-b", acceptor_b.run(write_b))
             .abort_on_drop();
 

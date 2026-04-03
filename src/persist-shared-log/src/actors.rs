@@ -138,7 +138,7 @@ use mz_persist_types::stats::structured::StructStats;
 ///
 /// Uses [`Bytes`] for the encoded payload so that cloning (e.g. on
 /// compare-and-append retries) is O(1) via refcount instead of a memcpy.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Proposal {
     /// Serialized ProtoLogProposal (protobuf bytes).
     pub encoded: Bytes,

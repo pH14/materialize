@@ -685,6 +685,15 @@ async fn decode_and_build_snapshot<R: HandleResolver>(
         }
     };
 
+    // Only update routing when the metashard state is fully reconciled.
+    // During Reconfiguring status, new shards may not have received their
+    // bulk/delta snapshots yet — routing to them would cause stale reads.
+    use mz_persist::generated::consensus_service::ProtoMetaStatus;
+    if ProtoMetaStatus::try_from(proto.status) == Ok(ProtoMetaStatus::Reconfiguring) {
+        debug!("routing task: skipping update with status=Reconfiguring");
+        return None;
+    }
+
     let ranges: Vec<RangeAssignment> = proto.ranges.iter().filter_map(parse_proto_range).collect();
 
     if ranges.is_empty() {

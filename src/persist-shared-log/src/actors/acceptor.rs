@@ -615,11 +615,6 @@ async fn write_bulk_snapshot(
             .expect("snapshot of predecessor failed");
 
         for ((key, proposal), _ts, diff) in snapshot {
-            // REVIEW: I think this is wrong? I think we want to carry truncations forward too, otherwise
-            // we could carry forward +1s that never cancel out that were supposed to. Same for the Listen
-            if diff != 1 {
-                continue;
-            }
             if !range.contains_partition_key(&key.shard) {
                 continue;
             }
@@ -628,7 +623,7 @@ async fn write_bulk_snapshot(
                 position,
                 shard: key.shard.clone(),
             };
-            snapshot_entries.push(((new_key, proposal.clone()), BULK_SNAPSHOT_BATCH_ID, 1));
+            snapshot_entries.push(((new_key, proposal.clone()), BULK_SNAPSHOT_BATCH_ID, diff));
             position += 1;
         }
     }
@@ -728,9 +723,6 @@ async fn write_delta_snapshot(
                     }
                     ListenEvent::Updates(updates) => {
                         for ((key, proposal), _ts, diff) in updates {
-                            if *diff != 1 {
-                                continue;
-                            }
                             if !range.contains_partition_key(&key.shard) {
                                 continue;
                             }
@@ -742,7 +734,7 @@ async fn write_delta_snapshot(
                             delta_entries.push((
                                 (new_key, proposal.clone()),
                                 DELTA_SNAPSHOT_BATCH_ID,
-                                1,
+                                *diff,
                             ));
                             position += 1;
                         }

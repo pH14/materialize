@@ -22,10 +22,10 @@ use mz_ore::metrics::MetricsRegistry;
 
 use crate::Acceptor as _;
 use crate::AcceptorConfig;
-use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 use crate::actors::acceptor::{PersistAcceptor, PersistAcceptorHandle};
 use crate::actors::learner::{PersistLearner, PersistLearnerConfig, PersistLearnerHandle};
 use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
+use crate::metrics::{AcceptorMetrics, LearnerMetrics};
 
 // ---------------------------------------------------------------------------
 // Persist client helper
@@ -106,8 +106,13 @@ impl PersistTestHarness {
         let acceptor_metrics = AcceptorMetrics::register(&registry);
         let learner_metrics = LearnerMetrics::register(&registry);
 
-        let (acceptor, write, acceptor_handle) =
-            PersistAcceptor::new(acceptor_config, write, acceptor_metrics, shard_id, 0);
+        let (acceptor, acceptor_handle) = PersistAcceptor::new(
+            acceptor_config,
+            acceptor_metrics,
+            shard_id,
+            0,
+            Box::new(crate::NoOpRetractionSource),
+        );
         let acceptor_task =
             mz_ore::task::spawn(|| "test-persist-acceptor", acceptor.run(write)).abort_on_drop();
 

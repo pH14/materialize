@@ -75,6 +75,13 @@ impl Default for AcceptorConfig {
 ///
 /// Uses the first byte of the ShardId's hex UUID (characters 1-2 after the
 /// `s` prefix). ShardIds are UUIDs so the distribution is uniform.
+// TODO: Widen the partition key space from u8 (256 split points) to u32 with
+// key hashing. Currently routes on the second byte of the shard key string,
+// limiting split granularity and giving poor distribution. A u32 hash of the
+// full key gives uniform distribution and supports fine-grained splits.
+// The proto fields (ProtoRangeAssignment.lo/hi_exclusive) are already uint32.
+// Changes: RangeAssignment lo/hi_exclusive → u32, partition_key() → hash to u32,
+// build_partition_map() divides [0, 2^32), tests update hardcoded constants.
 pub fn partition_key(client_shard: &str) -> u8 {
     if client_shard.len() >= 3 {
         u8::from_str_radix(&client_shard[1..3], 16).unwrap_or(0)
