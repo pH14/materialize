@@ -25,7 +25,7 @@ harness = false
 aho-corasick = "1.1.4"
 anyhow = "1.0.102"
 bytes = "1.11.1"
-bytesize = "2.1.0"
+bytesize = "2.3.1"
 chrono = { version = "0.4.39", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.8.1", features = ["serde", "case-insensitive"] }
 crc32fast = "1.4.2"
