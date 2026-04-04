@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
-arrow = { version = "57", default-features = false }
+arrow = { version = "58", default-features = false }
 arrow-ipc = "57"
 async-compression = { version = "0.4.27", features = ["bzip2-sys", "gzip", "tokio", "xz", "zstd"] }
 async-stream = "0.3.6"

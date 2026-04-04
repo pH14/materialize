@@ -30,7 +30,7 @@ harness = false
 [dependencies]
 anyhow = "1.0.102"
 arrayvec = "0.7.6"
-arrow = { version = "57", default-features = false }
+arrow = { version = "58", default-features = false }
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 bytes = { version = "1.11.1", features = ["serde"] }
