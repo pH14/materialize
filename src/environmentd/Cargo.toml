@@ -79,7 +79,7 @@ mz-sql = { path = "../sql" }
 mz-sql-parser = { path = "../sql-parser" }
 mz-storage-types = { path = "../storage-types" }
 mz-tracing = { path = "../tracing", optional = true }
-nix = { version = "0.30.1", features = ["signal"] }
+nix = { version = "0.31.2", features = ["signal"] }
 num_cpus = "1.17.0"
 openssl = { version = "0.10.76", features = ["vendored"] }
 openssl-sys = { version = "0.9.108", features = ["vendored"] }
