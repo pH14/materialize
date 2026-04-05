@@ -61,7 +61,7 @@ timely = "0.28.0"
 tokio = { version = "1.49.0", default-features = false, features = ["macros", "sync", "rt", "rt-multi-thread", "time"] }
 tokio-metrics = "0.4.9"
 tokio-stream = { version = "0.1.18", features = ["sync"] }
-tonic = "0.14.2"
+tonic = "0.14.5"
 tonic-prost = "0.14.5"
 tracing = "0.1.44"
 uuid = { version = "1.19.0", features = ["v4"] }
