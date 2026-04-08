@@ -120,9 +120,13 @@ Each log persist shard stores proposals in differential format:
 
 ### Meta shard
 
-The meta persist shard stores a single key (`__metashard`) whose value is a
-serialized `ProtoMetashardState` protobuf containing:
+The meta persist shard uses `MetaState` as the key type and `()` as the value.
+Each write retracts the previous `MetaState` and appends the new one in the
+same CAS batch, keeping the shard bounded to a single live entry.
+
+`MetaState` contains:
 
 - **epoch** — monotonically increasing configuration version
-- **ranges** — the partition map (`[lo, hi_exclusive) -> log_shard_id`)
-- **intent** — in-flight reconfiguration state for crash recovery
+- **leader_id** — current leader (incremented on each ClaimLeadership)
+- **target_state** — the live (or desired, during reconfig) shard set
+- **start_state** — `Some` during an active reconfiguration (outgoing shards); `None` when stable

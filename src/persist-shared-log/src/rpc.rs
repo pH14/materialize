@@ -470,7 +470,7 @@ impl mz_persist::generated::consensus_service::consensus_metashard_server::Conse
         tonic::Status,
     > {
         use mz_persist::generated::consensus_service::{
-            ProtoGetPartitionMapResponse, ProtoMetashardState, ProtoRangeAssignment,
+            ProtoGetPartitionMapResponse, ProtoMetashardStateV2, ProtoRangeAssignment, ProtoShardSet,
         };
 
         let partition_map = self
@@ -484,7 +484,7 @@ impl mz_persist::generated::consensus_service::consensus_metashard_server::Conse
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
 
-        let ranges = partition_map
+        let ranges: Vec<ProtoRangeAssignment> = partition_map
             .ranges
             .iter()
             .map(|r| ProtoRangeAssignment {
@@ -494,13 +494,11 @@ impl mz_persist::generated::consensus_service::consensus_metashard_server::Conse
             })
             .collect();
 
-        let state = ProtoMetashardState {
+        let state = ProtoMetashardStateV2 {
             epoch,
-            ranges,
-            predecessors: vec![],
-            intent: None,
             leader_id: 0,
-            status: 0, // ProtoMetaStatus::Unknown → Completed on decode
+            target_state: Some(ProtoShardSet { ranges }),
+            start_state: None,
         };
 
         Ok(tonic::Response::new(ProtoGetPartitionMapResponse {
@@ -555,10 +553,15 @@ impl mz_persist::generated::consensus_service::consensus_metashard_server::Conse
 
         let new_epoch = self
             .handle
-            .reconfigure(crate::ReconfigurationPlan {
+            .plan_reconfiguration(crate::ReconfigurationPlan {
                 expected_epoch: current_epoch,
                 new_partition_map: new_map,
             })
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+
+        self.handle
+            .reconcile()
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
 

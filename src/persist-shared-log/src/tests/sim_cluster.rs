@@ -555,7 +555,7 @@ fn sim_cluster_split_with_writes() {
             // Split.
             use crate::Metashard;
             let new_epoch = ms_handle
-                .reconfigure(ReconfigurationPlan {
+                .plan_reconfiguration(ReconfigurationPlan {
                     expected_epoch: 0,
                     new_partition_map: PartitionMap {
                         epoch: 1,
@@ -576,6 +576,10 @@ fn sim_cluster_split_with_writes() {
                 .await
                 .expect("split should succeed");
             assert_eq!(new_epoch, 1);
+            ms_handle
+                .reconcile()
+                .await
+                .expect("reconcile after split should succeed");
 
             tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -697,19 +701,23 @@ fn sim_cluster_reconfig_with_buggify() {
                 },
             };
 
-            // Fault at after_seal.
-            fault::configure(FaultConfig::with_points(&["after_seal"], 1.0, 42));
-
             use crate::Metashard;
-            let result = ms_handle.reconfigure(plan.clone()).await;
+
+            // Plan the reconfiguration (CAS only — no faults fire during the plan step).
+            ms_handle
+                .plan_reconfiguration(plan)
+                .await
+                .expect("plan should succeed");
+
+            // Fault at after_seal — fires during reconcile (execute_reconfiguration).
+            fault::configure(FaultConfig::with_points(&["after_seal"], 1.0, 42));
+            let result = ms_handle.reconcile().await;
             assert!(result.is_err(), "should fail at after_seal");
 
+            // Retry reconcile without fault.
             fault::clear();
-            let new_epoch = ms_handle
-                .reconfigure(plan)
-                .await
-                .expect("retry should succeed");
-            assert_eq!(new_epoch, 1);
+            let reconcile_result = ms_handle.reconcile().await.expect("retry should succeed");
+            assert_eq!(reconcile_result.epoch, 1);
 
             tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -817,7 +825,7 @@ fn sim_cluster_split_during_persist_partition() {
 
             // Reconfiguration hangs (persist can't seal or write intent).
             let result =
-                tokio::time::timeout(Duration::from_secs(10), ms_handle.reconfigure(plan.clone()))
+                tokio::time::timeout(Duration::from_secs(10), ms_handle.plan_reconfiguration(plan.clone()))
                     .await;
             assert!(result.is_err(), "reconfig should time out during partition");
 
@@ -833,7 +841,7 @@ fn sim_cluster_split_during_persist_partition() {
             if current_epoch == 0 {
                 // Reconfig didn't complete — retry.
                 let new_epoch = ms_handle
-                    .reconfigure(plan)
+                    .plan_reconfiguration(plan)
                     .await
                     .expect("retried reconfig should succeed");
                 assert_eq!(new_epoch, 1);
@@ -842,6 +850,10 @@ fn sim_cluster_split_during_persist_partition() {
                 // when the partition heals during the timeout window.
                 assert_eq!(current_epoch, 1);
             }
+            ms_handle
+                .reconcile()
+                .await
+                .expect("reconcile after partition repair should succeed");
 
             tokio::time::sleep(Duration::from_millis(500)).await;
 

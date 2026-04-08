@@ -1,3 +1,10 @@
+## Code style
+
+- Delete unused code outright — no "legacy" stubs, no removed-but-kept functions, no comments explaining what used to exist.
+- Do not write comments that describe what was removed or how things previously worked.
+
+## Reference docs
+
 The `reference/` directory contains the architectural design docs for the persist shared log. Read these when planning or building:
 
 - `00_overview.md` — architecture overview, system decomposition, core insight

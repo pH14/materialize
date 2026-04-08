@@ -197,15 +197,17 @@ fn stateright_reconfig_state_count() {
 // =========================================================================
 //
 // Models the durable state machine:
-//   Completed(epoch=N, leader=L)
+//   stable(epoch=N, leader=L, start_map=None)
 //     → ClaimLeadership       [CAS: leader L→L+1]
-//     → Reconfigure            [CAS: status→Reconfiguring, epoch N→N+1]
+//     → Reconfigure           [CAS: start_map=Some(target_map), target_map=new, epoch N→N+1]
 //     → execute_reconfiguration [holds, snapshots, seal, wait, clear]
-//     → CAS: status→Completed
-//     → Completed(epoch=N+1)
+//     → CAS: start_map=None
+//     → stable(epoch=N+1)
 //
 // Crash at any point resets volatile state. A new leader claims and
 // reconciles from whatever the durable state says.
+// Predecessors are computed at runtime from range overlap between start_map
+// and target_map — they are not stored durably.
 
 const MAX_SEQ: u8 = 2;
 const MAX_CRASHES: u8 = 2;
@@ -222,6 +224,29 @@ fn active_shard_for(map: &[(u8, u16, u8)], sealed: &BTreeSet<u8>, cs: usize) -> 
         .map(|&(_, _, shard)| shard)
 }
 
+/// Compute predecessors for each target shard from range overlap.
+/// Returns target_shard → [start_shards whose range overlaps].
+fn compute_predecessors(
+    start: &[(u8, u16, u8)],
+    target: &[(u8, u16, u8)],
+) -> BTreeMap<u8, Vec<u8>> {
+    target
+        .iter()
+        .filter_map(|&(tlo, thi, tshard)| {
+            let preds: Vec<u8> = start
+                .iter()
+                .filter(|&&(slo, shi, _)| u16::from(tlo) < shi && u16::from(slo) < thi)
+                .map(|&(_, _, sshard)| sshard)
+                .collect();
+            if preds.is_empty() {
+                None
+            } else {
+                Some((tshard, preds))
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 enum Scenario {
     Split,
@@ -235,13 +260,6 @@ struct Plan {
     retiring: Vec<u8>,
 }
 
-/// Durable metashard status — matches MetaStatus in meta.rs.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-enum DurableStatus {
-    Completed,
-    Reconfiguring,
-}
-
 /// Protocol phase — volatile, lost on crash.
 /// Represents where execute_reconfiguration is in its work.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -250,7 +268,7 @@ enum Phase {
     Idle,
     /// Leader claimed, ready to accept Reconfigure or Reconcile.
     LeaderClaimed,
-    /// Reconfigure CAS succeeded, status is Reconfiguring. Now reconciling.
+    /// Reconfigure CAS succeeded, start_map is set. Now reconciling.
     Reconciling,
     /// CriticalSince holds acquired.
     HoldsAcquired,
@@ -264,7 +282,7 @@ enum Phase {
     DeltaWriting,
     /// All delta snapshots written.
     DeltasWritten,
-    /// Status→Completed CAS succeeded, predecessors cleared.
+    /// start_map=None CAS succeeded.
     Committed,
 }
 
@@ -272,14 +290,12 @@ enum Phase {
 struct ProtocolState {
     // --- Durable state (survives crash) ---
     durable_epoch: u8,
-    durable_map: Vec<(u8, u16, u8)>,
-    durable_status: DurableStatus,
+    /// Current/desired partition map (incoming shards after reconfiguration).
+    target_map: Vec<(u8, u16, u8)>,
     durable_leader_id: u8,
-    /// Predecessors for new shards (durable). Non-empty when Reconfiguring.
-    durable_predecessors: BTreeMap<u8, Vec<u8>>,
-    /// Previous partition map (durable). Set when Reconfiguring so that
-    /// crash recovery can route to old shards while reconciliation completes.
-    previous_map: Option<Vec<(u8, u16, u8)>>,
+    /// Set when reconfiguring; crash recovery routes to these shards.
+    /// Predecessors are computed at runtime from range overlap with target_map.
+    start_map: Option<Vec<(u8, u16, u8)>>,
 
     /// Log shard data: seqno per client shard. Durable in persist.
     data: BTreeMap<u8, [u8; NUM_CS]>,
@@ -331,7 +347,7 @@ enum ProtocolAction {
     WriteBulkSnapshot { new_shard: u8, predecessor: u8 },
     Seal,
     WriteDeltaSnapshot { new_shard: u8, predecessor: u8 },
-    /// CAS: set status→Completed, clear predecessors.
+    /// CAS: set start_map=None.
     CommitReconciliation,
     ReleaseHolds,
     PollRetractions { shard: u8 },
@@ -358,7 +374,7 @@ impl ProtocolModel {
     fn build_plan(&self, state: &ProtocolState) -> Plan {
         match &self.scenario {
             Scenario::Split => {
-                let old_shard = state.durable_map[0].2;
+                let old_shard = state.target_map[0].2;
                 let shard_a = state.next_shard;
                 let shard_b = state.next_shard + 1;
                 Plan {
@@ -368,8 +384,8 @@ impl ProtocolModel {
                 }
             }
             Scenario::Merge => {
-                let shard_a = state.durable_map[0].2;
-                let shard_b = state.durable_map[1].2;
+                let shard_a = state.target_map[0].2;
+                let shard_b = state.target_map[1].2;
                 let merged = state.next_shard;
                 Plan {
                     new_map: vec![(0x00, 0x100, merged)],
@@ -381,7 +397,6 @@ impl ProtocolModel {
     }
 }
 
-/// Check if all (new_shard, predecessor) pairs from durable_predecessors are done.
 fn all_predecessor_pairs_done(
     predecessors: &BTreeMap<u8, Vec<u8>>,
     done: &BTreeSet<(u8, u8)>,
@@ -403,11 +418,9 @@ impl Model for ProtocolModel {
                 let init_map = vec![(0x00, 0x100, 0)];
                 vec![ProtocolState {
                     durable_epoch: 0,
-                    durable_map: init_map.clone(),
-                    durable_status: DurableStatus::Completed,
+                    target_map: init_map.clone(),
                     durable_leader_id: 0,
-                    durable_predecessors: BTreeMap::new(),
-                    previous_map: None,
+                    start_map: None,
                     data,
                     sealed: BTreeSet::new(),
                     leader_id: 0,
@@ -435,11 +448,9 @@ impl Model for ProtocolModel {
                 let init_map = vec![(0x00, 0x80, 0), (0x80, 0x100, 1)];
                 vec![ProtocolState {
                     durable_epoch: 0,
-                    durable_map: init_map.clone(),
-                    durable_status: DurableStatus::Completed,
+                    target_map: init_map.clone(),
                     durable_leader_id: 0,
-                    durable_predecessors: BTreeMap::new(),
-                    previous_map: None,
+                    start_map: None,
                     data,
                     sealed: BTreeSet::new(),
                     leader_id: 0,
@@ -496,22 +507,19 @@ impl Model for ProtocolModel {
         // --- Protocol phases ---
         match state.phase {
             Phase::Idle => {
-                // Must claim leadership first.
                 actions.push(ProtocolAction::ClaimLeadership);
             }
             Phase::LeaderClaimed => {
-                // Can reconfigure (if status is Completed and not already done).
-                if state.durable_status == DurableStatus::Completed && !state.started_reconfig {
+                if state.start_map.is_none() && !state.started_reconfig {
                     let can_start = match &self.scenario {
-                        Scenario::Split => state.durable_map.len() == 1,
-                        Scenario::Merge => state.durable_map.len() == 2,
+                        Scenario::Split => state.target_map.len() == 1,
+                        Scenario::Merge => state.target_map.len() == 2,
                     };
                     if can_start {
                         actions.push(ProtocolAction::Reconfigure);
                     }
                 }
-                // Can reconcile (always — idempotent).
-                if state.durable_status == DurableStatus::Reconfiguring {
+                if state.start_map.is_some() {
                     actions.push(ProtocolAction::BeginReconcile);
                 }
             }
@@ -519,7 +527,11 @@ impl Model for ProtocolModel {
                 actions.push(ProtocolAction::AcquireHolds);
             }
             Phase::HoldsAcquired | Phase::SnapshotWriting => {
-                for (&new_shard, preds) in &state.durable_predecessors {
+                let predecessors = compute_predecessors(
+                    state.start_map.as_ref().unwrap(),
+                    &state.target_map,
+                );
+                for (&new_shard, preds) in &predecessors {
                     for &pred in preds {
                         if !state.bulk_snapshots.contains(&(new_shard, pred)) {
                             actions.push(ProtocolAction::WriteBulkSnapshot {
@@ -534,7 +546,11 @@ impl Model for ProtocolModel {
                 actions.push(ProtocolAction::Seal);
             }
             Phase::Sealed | Phase::DeltaWriting => {
-                for (&new_shard, preds) in &state.durable_predecessors {
+                let predecessors = compute_predecessors(
+                    state.start_map.as_ref().unwrap(),
+                    &state.target_map,
+                );
+                for (&new_shard, preds) in &predecessors {
                     for &pred in preds {
                         if !state.delta_snapshots.contains(&(new_shard, pred)) {
                             actions.push(ProtocolAction::WriteDeltaSnapshot {
@@ -608,7 +624,6 @@ impl Model for ProtocolModel {
             }
 
             ProtocolAction::ClaimLeadership => {
-                // CAS: increment leader_id.
                 s.durable_leader_id += 1;
                 s.leader_id = s.durable_leader_id;
                 s.phase = Phase::LeaderClaimed;
@@ -617,47 +632,32 @@ impl Model for ProtocolModel {
             ProtocolAction::Reconfigure => {
                 let plan = self.build_plan(state);
 
-                // Initialize empty data entries for new shards.
                 for &shard in &plan.new_shards {
                     s.data.insert(shard, [0u8; NUM_CS]);
                 }
                 s.next_shard =
                     state.next_shard + u8::try_from(plan.new_shards.len()).expect("len fits u8");
 
-                // CAS: set status→Reconfiguring, bump epoch, store predecessors.
-                // Save the old map so crash recovery can route to old shards.
-                s.previous_map = Some(s.durable_map.clone());
-                s.durable_epoch += 1;
-                s.durable_map = plan.new_map.clone();
-                s.durable_status = DurableStatus::Reconfiguring;
-                // Store predecessors durably.
-                s.durable_predecessors.clear();
-                for &new_shard in &plan.new_shards {
-                    s.durable_predecessors
-                        .insert(new_shard, plan.retiring.clone());
-                }
-
-                // In-memory map stays at the OLD value during reconfiguration.
+                // CAS: set start_map=Some(target_map), target_map=new, bump epoch.
+                // In-memory map stays at the old value during reconfiguration.
                 // Routing only switches to new shards at CommitReconciliation,
                 // after bulk+delta snapshots ensure data continuity.
+                s.start_map = Some(s.target_map.clone());
+                s.durable_epoch += 1;
+                s.target_map = plan.new_map.clone();
                 // s.map is NOT updated here.
                 s.started_reconfig = true;
-
-                // After Reconfigure CAS, transition to LeaderClaimed so
-                // the actor sends Reconcile next.
                 s.phase = Phase::LeaderClaimed;
             }
 
             ProtocolAction::BeginReconcile => {
-                // Reads durable state (already in sync in the model).
-                // Begins execute_reconfiguration.
                 s.phase = Phase::Reconciling;
             }
 
             ProtocolAction::AcquireHolds => {
-                // Collect all predecessor shards.
-                let preds: BTreeSet<u8> = s
-                    .durable_predecessors
+                let predecessors =
+                    compute_predecessors(s.start_map.as_ref().unwrap(), &s.target_map);
+                let preds: BTreeSet<u8> = predecessors
                     .values()
                     .flat_map(|v| v.iter().copied())
                     .collect();
@@ -669,9 +669,8 @@ impl Model for ProtocolModel {
                 new_shard,
                 predecessor,
             } => {
-                // Copy data from predecessor to new shard (idempotent max).
                 let new_range = s
-                    .durable_map
+                    .target_map
                     .iter()
                     .find(|&&(_, _, sid)| sid == new_shard)
                     .copied();
@@ -686,11 +685,9 @@ impl Model for ProtocolModel {
                 }
                 s.bulk_snapshots.insert((new_shard, predecessor));
 
-                // Check if all bulk snapshots done.
-                let all_done = all_predecessor_pairs_done(
-                    &s.durable_predecessors,
-                    &s.bulk_snapshots,
-                );
+                let predecessors =
+                    compute_predecessors(s.start_map.as_ref().unwrap(), &s.target_map);
+                let all_done = all_predecessor_pairs_done(&predecessors, &s.bulk_snapshots);
                 s.phase = if all_done {
                     Phase::SnapshotsWritten
                 } else {
@@ -699,8 +696,9 @@ impl Model for ProtocolModel {
             }
 
             ProtocolAction::Seal => {
-                let retiring: BTreeSet<u8> = s
-                    .durable_predecessors
+                let predecessors =
+                    compute_predecessors(s.start_map.as_ref().unwrap(), &s.target_map);
+                let retiring: BTreeSet<u8> = predecessors
                     .values()
                     .flat_map(|v| v.iter().copied())
                     .collect();
@@ -714,9 +712,8 @@ impl Model for ProtocolModel {
                 new_shard,
                 predecessor,
             } => {
-                // Re-copy (captures writes between snapshot and seal).
                 let new_range = s
-                    .durable_map
+                    .target_map
                     .iter()
                     .find(|&&(_, _, sid)| sid == new_shard)
                     .copied();
@@ -731,10 +728,9 @@ impl Model for ProtocolModel {
                 }
                 s.delta_snapshots.insert((new_shard, predecessor));
 
-                let all_done = all_predecessor_pairs_done(
-                    &s.durable_predecessors,
-                    &s.delta_snapshots,
-                );
+                let predecessors =
+                    compute_predecessors(s.start_map.as_ref().unwrap(), &s.target_map);
+                let all_done = all_predecessor_pairs_done(&predecessors, &s.delta_snapshots);
                 s.phase = if all_done {
                     Phase::DeltasWritten
                 } else {
@@ -743,13 +739,10 @@ impl Model for ProtocolModel {
             }
 
             ProtocolAction::CommitReconciliation => {
-                // CAS: status→Completed, clear predecessors, clear previous map.
-                s.durable_status = DurableStatus::Completed;
-                s.durable_predecessors.clear();
-                s.previous_map = None;
-                // NOW switch routing to the new partition map. Data continuity
-                // is guaranteed because bulk+delta snapshots completed.
-                s.map = s.durable_map.clone();
+                // CAS: start_map=None. NOW switch routing to target_map.
+                // Data continuity is guaranteed because bulk+delta snapshots completed.
+                s.start_map = None;
+                s.map = s.target_map.clone();
                 s.phase = Phase::Committed;
             }
 
@@ -760,21 +753,18 @@ impl Model for ProtocolModel {
 
             ProtocolAction::Crash => {
                 // Revert in-memory routing to the appropriate map.
-                // During Reconfiguring, route to old shards (previous_map).
-                // During Completed, route to current durable_map.
-                s.map = match (&s.durable_status, &s.previous_map) {
-                    (DurableStatus::Reconfiguring, Some(prev)) => prev.clone(),
-                    _ => s.durable_map.clone(),
+                // During reconfiguration, route to start_map (old shards).
+                // When stable, route to target_map.
+                s.map = match &s.start_map {
+                    Some(start) => start.clone(),
+                    None => s.target_map.clone(),
                 };
-                // Reset all volatile state.
                 s.leader_id = 0;
                 s.phase = Phase::Idle;
                 s.holds.clear();
                 s.bulk_snapshots.clear();
                 s.delta_snapshots.clear();
                 s.crashes += 1;
-                // Recovery: new actor starts at Idle, must ClaimLeadership
-                // before reconciling.
             }
         }
 
@@ -801,11 +791,11 @@ impl Model for ProtocolModel {
                 }
                 true
             }),
-            // RC1: in stable (Completed) states, active map has no sealed shards.
+            // RC1: in stable states, active map has no sealed shards.
             Property::<Self>::always(
                 "RC1: stable config has no sealed shards in map",
                 |_, state| {
-                    if state.durable_status == DurableStatus::Reconfiguring {
+                    if state.start_map.is_some() {
                         return true;
                     }
                     let active: BTreeSet<u8> = state.map.iter().map(|r| r.2).collect();
@@ -817,18 +807,22 @@ impl Model for ProtocolModel {
                 if state.phase != Phase::SnapshotsWritten && state.phase != Phase::Sealed {
                     return true;
                 }
-                all_predecessor_pairs_done(
-                    &state.durable_predecessors,
-                    &state.bulk_snapshots,
-                )
+                let predecessors = compute_predecessors(
+                    state.start_map.as_ref().unwrap(),
+                    &state.target_map,
+                );
+                all_predecessor_pairs_done(&predecessors, &state.bulk_snapshots)
             }),
             // Seal-before-delta: at delta-done time, all predecessors are sealed.
             Property::<Self>::always("seal before delta", |_, state| {
                 if state.phase != Phase::DeltasWritten {
                     return true;
                 }
-                let retiring: BTreeSet<u8> = state
-                    .durable_predecessors
+                let predecessors = compute_predecessors(
+                    state.start_map.as_ref().unwrap(),
+                    &state.target_map,
+                );
+                let retiring: BTreeSet<u8> = predecessors
                     .values()
                     .flat_map(|v| v.iter().copied())
                     .collect();
@@ -837,7 +831,7 @@ impl Model for ProtocolModel {
             // RC2: after reconfig completes, every committed write is readable.
             Property::<Self>::always("RC2: no committed write lost after reconfig", |_, state| {
                 let stable = state.started_reconfig
-                    && state.durable_status == DurableStatus::Completed
+                    && state.start_map.is_none()
                     && (state.phase == Phase::Committed
                         || state.phase == Phase::Idle
                         || state.phase == Phase::LeaderClaimed);
@@ -874,7 +868,7 @@ impl Model for ProtocolModel {
             // Liveness: reconfiguration eventually completes.
             Property::<Self>::eventually("reconfiguration completes", |_, state| {
                 state.started_reconfig
-                    && state.durable_status == DurableStatus::Completed
+                    && state.start_map.is_none()
                     && state.phase == Phase::Idle
             }),
             Property::<Self>::sometimes(
@@ -882,7 +876,7 @@ impl Model for ProtocolModel {
                 |_, state| {
                     state.phase == Phase::Idle
                         && state.started_reconfig
-                        && state.durable_status == DurableStatus::Completed
+                        && state.start_map.is_none()
                         && !state.committed_writes.is_empty()
                 },
             ),
@@ -904,7 +898,7 @@ impl Model for ProtocolModel {
                 "reads after reconfig see carried-forward data",
                 |_, state| {
                     state.started_reconfig
-                        && state.durable_status == DurableStatus::Completed
+                        && state.start_map.is_none()
                         && state.last_read.iter().any(|&v| v > 0)
                 },
             ),

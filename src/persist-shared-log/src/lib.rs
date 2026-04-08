@@ -118,7 +118,7 @@ impl std::fmt::Display for PartitionMap {
 }
 
 /// A single range in the partition map.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RangeAssignment {
     /// Inclusive lower bound of the partition key range.
     pub lo: u8,
@@ -304,10 +304,7 @@ pub enum MetaError {
     /// The expected epoch did not match the current epoch.
     EpochMismatch { expected: u64, actual: u64 },
     /// This meta actor was fenced by another writer on the metashard persist shard.
-    Fenced {
-        stale_epoch: u64,
-        current_epoch: u64,
-    },
+    Fenced { stale_epoch: u64 },
 }
 
 impl std::fmt::Display for MetaError {
@@ -326,15 +323,8 @@ impl std::fmt::Display for MetaError {
                     expected, actual
                 )
             }
-            MetaError::Fenced {
-                stale_epoch,
-                current_epoch,
-            } => {
-                write!(
-                    f,
-                    "meta actor fenced: our epoch {} is stale, current epoch {}",
-                    stale_epoch, current_epoch
-                )
+            MetaError::Fenced { stale_epoch } => {
+                write!(f, "meta actor fenced: our epoch {} is stale", stale_epoch)
             }
         }
     }
@@ -387,9 +377,10 @@ pub trait Metashard: Clone + std::fmt::Debug + Send + Sync + 'static {
     /// Current epoch.
     async fn current_epoch(&self) -> Result<u64, MetaError>;
 
-    /// Execute a reconfiguration: install a new partition map, spawning new
-    /// actors and sealing old log shards. Returns the new epoch on success.
-    async fn reconfigure(&self, plan: ReconfigurationPlan) -> Result<u64, MetaError>;
+    /// Record a new desired partition map via CAS. Does not execute the
+    /// reconfiguration — call `reconcile` afterward to drive the world toward
+    /// the new state. Returns the new epoch on success.
+    async fn plan_reconfiguration(&self, plan: ReconfigurationPlan) -> Result<u64, MetaError>;
 }
 
 /// A source of retraction entries for the acceptor.

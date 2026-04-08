@@ -77,6 +77,13 @@ When investigating:
   during an active reconfiguration and verifies they're properly carried
   forward to the new shard.
 
+- **TODO: Invariants as a first-class struct**: The protocol invariants checked
+  in `stateright_reconfig.rs` `properties()` are inlined closures. Factor them
+  out into a dedicated `Invariants` struct with named methods. Eventually this
+  struct should have multiple impls or backends: one for Stateright model
+  checking, one for the DST harness (checked after each simulated operation),
+  and potentially one that compiles to debug asserts in the production actors.
+
 ## Running
 
 ```bash

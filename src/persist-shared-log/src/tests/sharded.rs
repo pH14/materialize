@@ -376,13 +376,17 @@ async fn test_reconfiguration_split() {
     };
 
     let new_epoch = metashard_handle
-        .reconfigure(ReconfigurationPlan {
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0,
             new_partition_map: new_partition_map.clone(),
         })
         .await
         .expect("reconfiguration should succeed");
     assert_eq!(new_epoch, 1);
+    metashard_handle
+        .reconcile()
+        .await
+        .expect("reconcile should succeed");
 
     // Verify the metashard state updated.
     assert_eq!(metashard_handle.current_epoch().await.unwrap(), 1);
@@ -430,7 +434,7 @@ async fn test_reconfiguration_split() {
 
     // Verify epoch mismatch is caught.
     let err = metashard_handle
-        .reconfigure(ReconfigurationPlan {
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0, // stale
             new_partition_map,
         })
@@ -483,13 +487,17 @@ async fn test_reconfiguration_state_carryforward() {
     let new_partition_map = PartitionMap::single(shard_new);
 
     let new_epoch = metashard_handle
-        .reconfigure(ReconfigurationPlan {
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0,
             new_partition_map,
         })
         .await
         .expect("reconfiguration should succeed");
     assert_eq!(new_epoch, 1);
+    metashard_handle
+        .reconcile()
+        .await
+        .expect("reconcile should succeed");
 
     // --- Verify state carried forward ---
     // The new learner should have replayed shard_old and have the data.
@@ -595,13 +603,17 @@ async fn test_multi_shard_workload_with_reconfiguration() {
     };
 
     let new_epoch = metashard_handle
-        .reconfigure(ReconfigurationPlan {
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0,
             new_partition_map,
         })
         .await
         .expect("reconfiguration should succeed");
     assert_eq!(new_epoch, 1);
+    metashard_handle
+        .reconcile()
+        .await
+        .expect("reconcile should succeed");
 
     // Wait for learner predecessor replay to complete.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -758,7 +770,7 @@ async fn test_shard_ownership_invariant_after_split() {
     let shard_a = ShardId::new(); // [0x00, 0x80)
     let shard_b = ShardId::new(); // [0x80, 0x100)
     metashard_handle
-        .reconfigure(ReconfigurationPlan {
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0,
             new_partition_map: PartitionMap {
                 epoch: 1,
@@ -778,6 +790,10 @@ async fn test_shard_ownership_invariant_after_split() {
         })
         .await
         .unwrap();
+    metashard_handle
+        .reconcile()
+        .await
+        .expect("reconcile should succeed");
 
     // Invariant: each key's head is readable through the router, routed to
     // the correct shard. Keys in [0x00, 0x80) should route to shard_a, and
@@ -879,12 +895,16 @@ async fn test_reconfiguration_merge() {
     // Merge into a single shard.
     let shard_merged = ShardId::new();
     metashard_handle
-        .reconfigure(ReconfigurationPlan {
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0,
             new_partition_map: PartitionMap::single(shard_merged),
         })
         .await
         .unwrap();
+    metashard_handle
+        .reconcile()
+        .await
+        .expect("reconcile should succeed");
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -982,8 +1002,8 @@ async fn test_no_silent_loss_during_reconfiguration() {
 
     let shard_new_a = ShardId::new();
     let shard_new_b = ShardId::new();
-    let _ = metashard_handle
-        .reconfigure(ReconfigurationPlan {
+    let plan_result = metashard_handle
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0,
             new_partition_map: PartitionMap {
                 epoch: 1,
@@ -1002,6 +1022,9 @@ async fn test_no_silent_loss_during_reconfiguration() {
             },
         })
         .await;
+    if plan_result.is_ok() {
+        let _ = metashard_handle.reconcile().await;
+    }
 
     // Wait for the writer to finish.
     writer_task.await;
@@ -1078,12 +1101,16 @@ async fn test_restart_after_reconfiguration_preserves_state() {
     // Reconfigure: old shard → new shard.
     let shard_new = ShardId::new();
     handle1
-        .reconfigure(ReconfigurationPlan {
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0,
             new_partition_map: PartitionMap::single(shard_new),
         })
         .await
         .unwrap();
+    handle1
+        .reconcile()
+        .await
+        .expect("reconcile should succeed");
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1178,12 +1205,16 @@ async fn test_restart_after_merge_preserves_both_predecessors() {
     // Merge into a single shard.
     let shard_merged = ShardId::new();
     handle1
-        .reconfigure(ReconfigurationPlan {
+        .plan_reconfiguration(ReconfigurationPlan {
             expected_epoch: 0,
             new_partition_map: PartitionMap::single(shard_merged),
         })
         .await
         .unwrap();
+    handle1
+        .reconcile()
+        .await
+        .expect("reconcile should succeed");
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1291,7 +1322,7 @@ async fn test_crash_during_reconfiguration_recovers_intent() {
     use crate::fault::{self, FaultConfig};
     fault::configure(FaultConfig::with_points(&["after_intent_persist"], 1.0, 42));
 
-    let result = handle1.reconfigure(split_plan).await;
+    let result = handle1.plan_reconfiguration(split_plan).await;
     assert!(
         result.is_err(),
         "reconfiguration should fail at after_intent_persist injection point"
@@ -1475,7 +1506,7 @@ async fn test_concurrent_linearizability_during_reconfig() {
     let shard_b = ShardId::new();
     let reconfig_task = mz_ore::task::spawn(|| "reconfig", async move {
         metashard_handle
-            .reconfigure(ReconfigurationPlan {
+            .plan_reconfiguration(ReconfigurationPlan {
                 expected_epoch: 0,
                 new_partition_map: PartitionMap {
                     epoch: 1,
@@ -1493,7 +1524,9 @@ async fn test_concurrent_linearizability_during_reconfig() {
                     ],
                 },
             })
-            .await
+            .await?;
+        metashard_handle.reconcile().await?;
+        Ok::<(), crate::MetaError>(())
     });
 
     // Wait for all client tasks to complete.
@@ -1589,7 +1622,16 @@ async fn test_buggify_reconfiguration_recovery() {
     // NOTE: "during_predecessor_replay" and "after_replay_complete" were
     // removed — predecessor handling moved from learner to acceptor (setup
     // batches at batch_id=1/2), so there's no in-protocol replay step.
-    let injection_points = ["after_intent_persist", "after_actor_spawn", "after_seal"];
+    let injection_points = [
+        "after_intent_persist",
+        "after_actor_spawn",
+        "after_seal",
+        // Fires after delta snapshot completes but before the durable state
+        // commit — the routing task has not yet seen start_state=None, so the
+        // router still points to the old (now sealed) shards. Recovery is
+        // required for the client to make progress.
+        "after_routing_swap",
+    ];
 
     let client = new_persist_client_for_test().await;
 
@@ -1641,25 +1683,36 @@ async fn test_buggify_reconfiguration_recovery() {
         // Enable the fault injection point at 100% probability.
         fault::configure(FaultConfig::with_points(&[point], 1.0, 42));
 
-        // Attempt reconfiguration — should fail at the injection point.
-        let result = metashard_handle.reconfigure(plan.clone()).await;
-        assert!(
-            result.is_err(),
-            "point={}: reconfiguration should fail at injection point",
-            point
-        );
+        // `after_intent_persist` fires during plan — AFTER the CAS commits
+        // start_state=Some to durable storage. The other points fire during
+        // reconcile (execute_reconfiguration). Handle both.
+        let plan_result = metashard_handle.plan_reconfiguration(plan.clone()).await;
+        if plan_result.is_err() {
+            // Fault fired after the intent was durably persisted — plan returns
+            // Err but start_state=Some is already in durable storage. Clear the
+            // fault and fall through to the final reconcile, which will detect
+            // the in-progress state and drive it to completion.
+            assert_eq!(
+                *point, "after_intent_persist",
+                "only after_intent_persist fires during plan"
+            );
+            fault::clear();
+        } else {
+            // Fault fires during the reconcile phase.
+            let reconcile_result = metashard_handle.reconcile().await;
+            assert!(
+                reconcile_result.is_err(),
+                "point={}: reconcile should fail at injection point",
+                point
+            );
+            fault::clear();
+        }
 
-        // Disable fault injection.
-        fault::clear();
-
-        // Retry reconfiguration — should succeed now.
-        let result = metashard_handle.reconfigure(plan).await;
-        assert!(
-            result.is_ok(),
-            "point={}: retry should succeed after fault cleared: {:?}",
-            point,
-            result
-        );
+        // Drive to completion.
+        metashard_handle
+            .reconcile()
+            .await
+            .expect(&format!("point={}: final reconcile should succeed", point));
 
         // Verify the pre-fault write survived via chain replay.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1695,8 +1748,11 @@ async fn test_buggify_reconfiguration_recovery() {
 async fn test_buggify_post_commit_injection_points() {
     use crate::fault::{self, FaultConfig};
 
+    // Post-commit injection points: the durable state has already been
+    // committed (start_state=None), so the routing task will update the router
+    // to the new shards. Data is accessible via the new shards' learners even
+    // if the error propagates.
     let post_commit_points = [
-        "after_routing_swap",
         "after_commit_persist",
         "before_hold_release",
     ];
@@ -1742,12 +1798,16 @@ async fn test_buggify_post_commit_injection_points() {
             },
         };
 
-        fault::configure(FaultConfig::with_points(&[point], 1.0, 42));
+        // Plan the reconfiguration (CAS only — post-commit fault points fire during reconcile).
+        metashard_handle
+            .plan_reconfiguration(plan)
+            .await
+            .expect(&format!("point={}: plan should succeed", point));
 
-        // The reconfiguration should fail AFTER the routing swap / commit
-        // persist — the error is from the injection point, not from any
-        // actual protocol failure.
-        let result = metashard_handle.reconfigure(plan).await;
+        // Enable fault, then reconcile — fails AFTER the point of no return.
+        // The error is from the injection point, not from any protocol failure.
+        fault::configure(FaultConfig::with_points(&[point], 1.0, 42));
+        let result = metashard_handle.reconcile().await;
         assert!(
             result.is_err(),
             "point={}: should fail at injection point",

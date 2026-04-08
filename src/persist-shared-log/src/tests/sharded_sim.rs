@@ -645,7 +645,7 @@ async fn sharded_sim_linearizability_across_reconfig() {
     let shard_b = ShardId::new();
     let reconfig_task = mz_ore::task::spawn(|| "reconfig", async move {
         metashard_handle
-            .reconfigure(ReconfigurationPlan {
+            .plan_reconfiguration(ReconfigurationPlan {
                 expected_epoch: 0,
                 new_partition_map: PartitionMap {
                     epoch: 1,
@@ -663,7 +663,9 @@ async fn sharded_sim_linearizability_across_reconfig() {
                     ],
                 },
             })
-            .await
+            .await?;
+        metashard_handle.reconcile().await?;
+        Ok::<(), crate::MetaError>(())
     });
 
     // Wait for all client tasks.

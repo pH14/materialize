@@ -24,23 +24,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use prost::Message;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLog;
 use mz_persist::generated::consensus_service::{
     ProtoCompareAndSetRequest, ProtoCompareAndSetResponse, ProtoHeadRequest, ProtoHeadResponse,
-    ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal, ProtoMetashardState,
-    ProtoScanRequest, ProtoScanResponse, ProtoTruncateRequest, ProtoTruncateResponse,
-    ProtoVersionedData, proto_log_proposal,
+    ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal, ProtoScanRequest,
+    ProtoScanResponse, ProtoTruncateRequest, ProtoTruncateResponse, ProtoVersionedData,
+    proto_log_proposal,
 };
 use mz_persist_client::read::ListenEvent;
 use mz_persist_client::{Diagnostics, PersistClient, ShardId};
+use mz_persist_types::codec_impls::UnitSchema;
 
-use crate::actors::{OrderedKey, OrderedKeySchema, Proposal, ProposalSchema};
-use crate::{Acceptor, Learner, PartitionMap, RangeAssignment};
+use crate::{Acceptor, Learner, PartitionMap};
 
 // ---------------------------------------------------------------------------
 // HandleResolver
@@ -461,7 +459,12 @@ impl<A: Acceptor, L: Learner> Router<A, L> {
                         Err(_) => {
                             debug!(%key, "learner failed, parking scan for routing update");
                             let _ = retry_tx
-                                .send(RouterCommand::Scan { key, from, limit, reply })
+                                .send(RouterCommand::Scan {
+                                    key,
+                                    from,
+                                    limit,
+                                    reply,
+                                })
                                 .await;
                         }
                     }
@@ -515,9 +518,7 @@ impl<A: Acceptor, L: Learner> Router<A, L> {
                                 .map_err(tonic::Status::from);
                             let _ = reply.send(result);
                         }
-                        Err(
-                            crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown,
-                        ) => {
+                        Err(crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown) => {
                             debug!(
                                 %key,
                                 "acceptor sealed/shutdown, parking CAS for routing update"
@@ -558,9 +559,7 @@ impl<A: Acceptor, L: Learner> Router<A, L> {
                                 .map_err(tonic::Status::from);
                             let _ = reply.send(result);
                         }
-                        Err(
-                            crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown,
-                        ) => {
+                        Err(crate::AcceptorError::Sealed | crate::AcceptorError::Shutdown) => {
                             debug!(
                                 %key,
                                 "acceptor sealed/shutdown, parking truncate for routing update"
@@ -615,17 +614,13 @@ pub async fn spawn_routing_task<R: HandleResolver>(
     resolver: R,
     routing_tx: mpsc::Sender<RoutingSnapshot<R::A, R::L>>,
 ) {
-    // The metashard shard reuses the same (OrderedKey, Proposal) schema as log
-    // shards. Its state is stored as a single key "__metashard" with a serialized
-    // ProtoMetashardState as the proposal payload.
-    let key_schema = Arc::new(OrderedKeySchema);
-    let val_schema = Arc::new(ProposalSchema);
+    use super::meta::{MetaState, MetaStateSchema};
 
-    let (_, read) = persist_client
-        .open::<OrderedKey, Proposal, u64, i64>(
+    let read = persist_client
+        .open_leased_reader::<MetaState, (), u64, i64>(
             metashard_shard_id,
-            key_schema,
-            val_schema,
+            Arc::new(MetaStateSchema),
+            Arc::new(UnitSchema),
             Diagnostics::from_purpose("routing-task-subscribe"),
             false,
         )
@@ -642,21 +637,21 @@ pub async fn spawn_routing_task<R: HandleResolver>(
         let mut subscribe = subscribe;
         loop {
             let events = subscribe.fetch_next().await;
-            let mut new_data: Option<Bytes> = None;
+            let mut new_state: Option<MetaState> = None;
             for event in events {
                 match event {
                     ListenEvent::Progress(_) => {}
                     ListenEvent::Updates(updates) => {
-                        for ((key, proposal), _ts, diff) in updates {
-                            if diff == 1 && key.shard == "__metashard" {
-                                new_data = Some(proposal.encoded.clone());
+                        for ((state, ()), _ts, diff) in updates {
+                            if diff == 1 {
+                                new_state = Some(state);
                             }
                         }
                     }
                 }
             }
-            if let Some(data) = new_data {
-                if let Some(snapshot) = decode_and_build_snapshot(&data, &resolver).await {
+            if let Some(state) = new_state {
+                if let Some(snapshot) = build_routing_snapshot(&state, &resolver).await {
                     let map = &snapshot.partition_map;
                     info!("routing task: new partition map\n{map}");
                     if routing_tx.send(snapshot).await.is_err() {
@@ -669,50 +664,32 @@ pub async fn spawn_routing_task<R: HandleResolver>(
     });
 }
 
-/// Decode a `ProtoMetashardState` and build a `RoutingSnapshot` using the
-/// resolver to connect to existing actors.
-async fn decode_and_build_snapshot<R: HandleResolver>(
-    data: &[u8],
+/// Build a `RoutingSnapshot` from a [`MetaState`] using the resolver to
+/// connect to existing actors.
+///
+/// Returns `None` during an active reconfiguration (`start_state.is_some()`),
+/// since new shards may not yet have received their bulk/delta snapshots.
+async fn build_routing_snapshot<R: HandleResolver>(
+    state: &super::meta::MetaState,
     resolver: &R,
 ) -> Option<RoutingSnapshot<R::A, R::L>> {
-    use super::meta::parse_proto_range;
-
-    let proto = match ProtoMetashardState::decode(data) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("failed to decode metashard state: {e}");
-            return None;
-        }
-    };
-
-    // Only update routing when the metashard state is fully reconciled.
-    // During Reconfiguring status, new shards may not have received their
-    // bulk/delta snapshots yet — routing to them would cause stale reads.
-    use mz_persist::generated::consensus_service::ProtoMetaStatus;
-    if ProtoMetaStatus::try_from(proto.status) == Ok(ProtoMetaStatus::Reconfiguring) {
-        debug!("routing task: skipping update with status=Reconfiguring");
+    if state.start_state.is_some() {
+        debug!("routing task: skipping update during active reconfiguration");
         return None;
     }
 
-    let ranges: Vec<RangeAssignment> = proto.ranges.iter().filter_map(parse_proto_range).collect();
-
-    if ranges.is_empty() {
-        return None;
-    }
-
-    let partition_map = PartitionMap {
-        epoch: proto.epoch,
-        ranges: ranges.clone(),
-    };
+    let partition_map = state.partition_map();
     if partition_map.validate().is_err() {
         warn!("decoded invalid partition map, ignoring");
         return None;
     }
 
+    let ranges = &partition_map.ranges;
+
     let mut acceptors = BTreeMap::new();
     let mut learners = BTreeMap::new();
 
-    for range in &ranges {
+    for range in ranges {
         let shard_id = range.log_shard;
         match resolver.resolve_acceptor(shard_id).await {
             Ok(a) => {
