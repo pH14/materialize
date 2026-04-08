@@ -7420,6 +7420,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "stateright",
+ "tempfile",
  "timely 0.28.0",
  "tokio",
  "tokio-postgres",

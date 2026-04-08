@@ -38,8 +38,9 @@ use mz_persist::generated::consensus_service::consensus_learner_client::Consensu
 use mz_persist::generated::consensus_service::consensus_learner_server;
 use mz_persist::generated::consensus_service::{
     ProtoAppendRequest, ProtoAppendResponse, ProtoAwaitResultRequest, ProtoCompareAndSetResponse,
-    ProtoHeadRequest, ProtoHeadResponse, ProtoListKeysRequest, ProtoListKeysResponse,
-    ProtoLogProposal, ProtoScanRequest, ProtoScanResponse, ProtoTruncateResponse,
+    ProtoGetRetractionsRequest, ProtoGetRetractionsResponse, ProtoHeadRequest, ProtoHeadResponse,
+    ProtoListKeysRequest, ProtoListKeysResponse, ProtoLogProposal, ProtoOrderedKey,
+    ProtoRetraction, ProtoScanRequest, ProtoScanResponse, ProtoTruncateResponse,
 };
 
 use crate::actors::acceptor::PersistAcceptorHandle;
@@ -303,6 +304,69 @@ impl crate::Learner for GrpcLearnerHandle {
     }
 }
 
+impl GrpcLearnerHandle {
+    /// Fetch pending retractions for proposals with `batch_id < frontier`.
+    pub async fn get_retractions(
+        &self,
+        frontier: u64,
+    ) -> Result<Vec<(crate::actors::OrderedKey, crate::actors::Proposal)>, LearnerError> {
+        let request = ProtoGetRetractionsRequest { frontier };
+        let response = self
+            .client
+            .clone()
+            .get_retractions(request)
+            .await
+            .map_err(status_to_learner_error)?;
+        let entries = response
+            .into_inner()
+            .entries
+            .into_iter()
+            .map(|r| {
+                let key_proto = r.key.unwrap_or_default();
+                let key = crate::actors::OrderedKey {
+                    batch_id: key_proto.batch_id,
+                    position: key_proto.position,
+                    shard: key_proto.shard,
+                };
+                let proposal = crate::actors::Proposal {
+                    encoded: bytes::Bytes::from(r.proposal),
+                };
+                (key, proposal)
+            })
+            .collect();
+        Ok(entries)
+    }
+}
+
+/// A retraction source that polls a remote learner via gRPC.
+///
+/// Implements [`RetractionSource`] by forwarding calls to `GrpcLearnerHandle::get_retractions`.
+pub struct GrpcLearnerRetractionSource {
+    handle: GrpcLearnerHandle,
+}
+
+impl GrpcLearnerRetractionSource {
+    pub fn new(handle: GrpcLearnerHandle) -> Self {
+        GrpcLearnerRetractionSource { handle }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::RetractionSource for GrpcLearnerRetractionSource {
+    async fn get_retractions(
+        &self,
+        frontier: u64,
+    ) -> Vec<(crate::actors::OrderedKey, crate::actors::Proposal)> {
+        match self.handle.get_retractions(frontier).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("get_retractions gRPC call failed: {e:?}");
+                Vec::new()
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Server adapters (in-process handle -> gRPC server trait)
 // ===========================================================================
@@ -434,6 +498,30 @@ impl consensus_learner_server::ConsensusLearner for LearnerGrpcServer {
         Ok(tonic::Response::new(
             tokio_stream::wrappers::ReceiverStream::new(rx),
         ))
+    }
+
+    async fn get_retractions(
+        &self,
+        request: tonic::Request<ProtoGetRetractionsRequest>,
+    ) -> Result<tonic::Response<ProtoGetRetractionsResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let retractions = self
+            .handle
+            .get_retractions(req.frontier)
+            .await
+            .map_err(tonic::Status::from)?;
+        let entries = retractions
+            .into_iter()
+            .map(|(key, proposal)| ProtoRetraction {
+                key: Some(ProtoOrderedKey {
+                    batch_id: key.batch_id,
+                    position: key.position,
+                    shard: key.shard,
+                }),
+                proposal: proposal.encoded.to_vec(),
+            })
+            .collect();
+        Ok(tonic::Response::new(ProtoGetRetractionsResponse { entries }))
     }
 }
 

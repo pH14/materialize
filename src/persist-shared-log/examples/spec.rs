@@ -22,23 +22,28 @@
 //!     --workload examples/scenarios/production-10k.yaml --transport grpc
 //! ```
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use mz_ore::cast::{CastFrom, CastLossy};
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist::generated::consensus_service::{
-    ProtoCasProposal, ProtoLogProposal, ProtoTruncateProposal, proto_log_proposal,
+    ProtoCasProposal, ProtoHeadResponse, ProtoLogProposal, ProtoTruncateProposal,
+    ProtoVersionedData, proto_log_proposal,
 };
 use mz_persist_client::ShardId;
 use mz_persist_shared_log::Acceptor as _;
 use mz_persist_shared_log::AcceptorConfig;
-use mz_persist_shared_log::metrics::{AcceptorMetrics, LearnerMetrics};
 use mz_persist_shared_log::actors::acceptor::PersistAcceptor;
-use mz_persist_shared_log::latency_blob::LatencyProfile;
 use mz_persist_shared_log::actors::learner::{PersistLearner, PersistLearnerConfig};
+use mz_persist_shared_log::actors::router::{Router, RouterHandle, RoutingSnapshot};
+use mz_persist_shared_log::latency_blob::LatencyProfile;
+use mz_persist_shared_log::metrics::{AcceptorMetrics, LearnerMetrics};
+use mz_persist_shared_log::factory::ActorFactory as _;
+use mz_persist_shared_log::process_factory::ProcessActorFactory;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Deserialize;
@@ -168,6 +173,32 @@ struct Cli {
     /// acceptor + learner, so throughput scales linearly.
     #[arg(long, default_value = "1")]
     num_log_shards: usize,
+
+    /// Run in process mode: spawn acceptors and learners as child OS processes
+    /// communicating over Unix-socket gRPC. Requires --blob-url and
+    /// --consensus-url to be set.
+    #[arg(long, default_value = "false")]
+    process: bool,
+
+    /// Number of in-process routers to create in process mode.
+    /// Clients pick routers randomly; more routers reduce channel contention.
+    #[arg(long, default_value = "1")]
+    num_routers: usize,
+
+    /// Shared run directory for actor Unix sockets in process mode.
+    /// Defaults to a fresh temporary directory.
+    #[arg(long)]
+    run_dir: Option<std::path::PathBuf>,
+
+    /// Blob storage URL for the persist backend (required in process mode).
+    /// E.g. file:///tmp/spec-blob
+    #[arg(long)]
+    blob_url: Option<String>,
+
+    /// Consensus storage URL for the persist backend (required in process mode).
+    /// E.g. mem:// or postgres://...
+    #[arg(long)]
+    consensus_url: Option<String>,
 }
 
 /// Workload configuration. Deserializable directly from YAML with defaults
@@ -200,6 +231,16 @@ struct WorkloadConfig {
     json: bool,
     #[serde(skip)]
     saturate: bool,
+    #[serde(skip)]
+    process: bool,
+    #[serde(skip)]
+    num_routers: usize,
+    #[serde(skip)]
+    run_dir: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    blob_url: Option<String>,
+    #[serde(skip)]
+    consensus_url: Option<String>,
 }
 
 impl Default for WorkloadConfig {
@@ -224,6 +265,11 @@ impl Default for WorkloadConfig {
             warmup: 10,
             json: false,
             saturate: false,
+            process: false,
+            num_routers: 1,
+            run_dir: None,
+            blob_url: None,
+            consensus_url: None,
         }
     }
 }
@@ -278,6 +324,11 @@ impl WorkloadConfig {
         );
         cfg.json = cli.json;
         cfg.saturate = cli.saturate;
+        cfg.process = cli.process;
+        cfg.num_routers = cli.num_routers;
+        cfg.run_dir = cli.run_dir;
+        cfg.blob_url = cli.blob_url;
+        cfg.consensus_url = cli.consensus_url;
 
         cfg
     }
@@ -324,6 +375,12 @@ enum Transport {
         acceptor: mz_persist_shared_log::actors::acceptor::PersistAcceptorHandle,
         learner: mz_persist_shared_log::actors::learner::PersistLearnerHandle,
     },
+    /// Pool of in-process routers backed by gRPC acceptor/learner subprocesses.
+    /// Clients pick a router round-robin on each call.
+    Router {
+        routers: Arc<Vec<RouterHandle>>,
+        next: Arc<AtomicUsize>,
+    },
 }
 
 enum CasResult {
@@ -333,6 +390,11 @@ enum CasResult {
 }
 
 impl Transport {
+    fn pick_router<'a>(routers: &'a [RouterHandle], next: &AtomicUsize) -> &'a RouterHandle {
+        let idx = next.fetch_add(1, Ordering::Relaxed) % routers.len();
+        &routers[idx]
+    }
+
     async fn cas(
         &mut self,
         key: &str,
@@ -363,6 +425,18 @@ impl Transport {
                     Err(_) => CasResult::Shutdown,
                 }
             }
+            Transport::Router { routers, next } => {
+                let router = Self::pick_router(routers, next);
+                let new = ProtoVersionedData {
+                    seqno,
+                    data: data.into(),
+                };
+                match RouterHandle::compare_and_set(router, key.to_string(), expected, new).await {
+                    Ok(resp) if resp.committed => CasResult::Committed,
+                    Ok(_) => CasResult::Rejected,
+                    Err(_) => CasResult::Shutdown,
+                }
+            }
         }
     }
 
@@ -372,6 +446,13 @@ impl Transport {
                 let resp = learner.head(key.to_string()).await.ok()?;
                 resp.data.map(|d| (d.seqno, d.data.len()))
             }
+            Transport::Router { routers, next } => {
+                let router = Self::pick_router(routers, next);
+                let resp: ProtoHeadResponse = RouterHandle::head(router, key.to_string())
+                    .await
+                    .ok()?;
+                resp.data.map(|d| (d.seqno, d.data.len()))
+            }
         }
     }
 
@@ -379,6 +460,12 @@ impl Transport {
         match self {
             Transport::Direct { learner, .. } => {
                 learner.scan(key.to_string(), from, limit).await.is_ok()
+            }
+            Transport::Router { routers, next } => {
+                let router = Self::pick_router(routers, next);
+                RouterHandle::scan(router, key.to_string(), from, limit)
+                    .await
+                    .is_ok()
             }
         }
     }
@@ -398,6 +485,12 @@ impl Transport {
                 };
                 learner
                     .await_truncate_result(receipt.batch_number, receipt.position)
+                    .await
+                    .is_ok()
+            }
+            Transport::Router { routers, next } => {
+                let router = Self::pick_router(routers, next);
+                RouterHandle::truncate(router, key.to_string(), seqno)
                     .await
                     .is_ok()
             }
@@ -1149,6 +1242,17 @@ async fn main() {
     let cfg = WorkloadConfig::from_cli(cli);
     cfg.validate();
 
+    if cfg.process {
+        assert!(
+            cfg.blob_url.is_some(),
+            "--blob-url is required in --process mode"
+        );
+        assert!(
+            cfg.consensus_url.is_some(),
+            "--consensus-url is required in --process mode"
+        );
+    }
+
     let target_writes_per_sec = f64::cast_lossy(cfg.num_shards)
         * f64::cast_lossy(cfg.writers_per_shard)
         * cfg.write_rate_per_second;
@@ -1185,10 +1289,6 @@ async fn main() {
     use mz_persist_shared_log::{PartitionMap, RangeAssignment};
 
     let num_log_shards = cli_num_log_shards;
-    let persist_client_config = PersistClientConfig {
-        latency_profile: cfg.latency_profile(),
-    };
-    let persist_client = client::new_persist_client(persist_client_config);
 
     // Build partition map: evenly divide [0x00, 0x100) across N log shards.
     let mut partition_ranges: Vec<RangeAssignment> = Vec::with_capacity(num_log_shards);
@@ -1224,62 +1324,155 @@ async fn main() {
         );
     }
 
-    // Spawn one acceptor + learner per log shard.
-    let mut shard_transports: std::collections::BTreeMap<ShardId, Transport> =
-        std::collections::BTreeMap::new();
+    // Shared transport used by all clients — either per-shard Direct handles or
+    // a pool of Routers backed by gRPC subprocesses.
+    let shared_router_transport: Option<Transport>;
+    // Per-shard transports used in direct mode.
+    let mut shard_transports: BTreeMap<ShardId, Transport> = BTreeMap::new();
     let mut _tasks: Vec<mz_ore::task::JoinHandle<()>> = Vec::new();
 
-    for (i, range) in partition_map.ranges.iter().enumerate() {
-        let shard_id = range.log_shard;
-        // Shard 0 uses the report metrics; others get their own.
-        let (shard_acceptor_metrics, shard_learner_metrics) = if i == 0 {
-            (report_acceptor_metrics.clone(), report_learner_metrics.clone())
-        } else {
-            let r = MetricsRegistry::new();
-            (AcceptorMetrics::register(&r), LearnerMetrics::register(&r))
+    if cfg.process {
+        let blob_url = cfg
+            .blob_url
+            .as_ref()
+            .expect("--blob-url is required in process mode");
+        let consensus_url = cfg
+            .consensus_url
+            .as_ref()
+            .expect("--consensus-url is required in process mode");
+
+        // Use the provided run-dir, or create a fresh temp directory.
+        let _temp_dir_guard;
+        let run_dir: std::path::PathBuf = match &cfg.run_dir {
+            Some(path) => {
+                std::fs::create_dir_all(path).expect("create --run-dir");
+                _temp_dir_guard = None::<tempfile::TempDir>;
+                path.clone()
+            }
+            None => {
+                let td = tempfile::tempdir().expect("create temp run dir");
+                let path = td.path().to_path_buf();
+                _temp_dir_guard = Some(td);
+                path
+            }
         };
 
-        let acceptor_config = AcceptorConfig { queue_depth };
-        let (acceptor_handle, acceptor_task) = PersistAcceptor::spawn(
-            acceptor_config,
-            &persist_client,
-            shard_id,
-            shard_acceptor_metrics,
-            0,
-            mz_persist_shared_log::noop_retraction_sources(),
-            vec![],
-            range.clone(),
-        )
-        .await;
-
-        let learner_config = PersistLearnerConfig {
-            queue_depth,
-            ..Default::default()
-        };
-        let (learner_handle, learner_task) = PersistLearner::spawn(
-            learner_config,
-            &persist_client,
-            shard_id,
-            shard_learner_metrics,
-        )
-        .await;
-
-        shard_transports.insert(
-            shard_id,
-            Transport::Direct {
-                acceptor: acceptor_handle,
-                learner: learner_handle,
-            },
+        let binary =
+            std::env::current_exe().expect("could not determine current executable path");
+        let factory = ProcessActorFactory::new(
+            binary,
+            run_dir.clone(),
+            blob_url.clone(),
+            consensus_url.clone(),
         );
-        _tasks.push(acceptor_task);
-        _tasks.push(learner_task);
+
+        let mut grpc_acceptors = BTreeMap::new();
+        let mut grpc_learners = BTreeMap::new();
+
+        for (i, range) in partition_map.ranges.iter().enumerate() {
+            let shard_id = range.log_shard;
+            let acceptor_handle = factory
+                .create_acceptor(shard_id, 0, vec![], range.clone())
+                .await
+                .unwrap_or_else(|e| panic!("failed to spawn acceptor for shard {shard_id}: {e}"));
+            let learner_handle = factory
+                .create_learner(shard_id)
+                .await
+                .unwrap_or_else(|e| panic!("failed to spawn learner for shard {shard_id}: {e}"));
+
+            if !json {
+                eprintln!(
+                    "  log shard {}: [0x{:02x}, 0x{:03x}) → {} (process)",
+                    i, range.lo, range.hi_exclusive, shard_id
+                );
+            }
+
+            grpc_acceptors.insert(shard_id, acceptor_handle);
+            grpc_learners.insert(shard_id, vec![learner_handle]);
+        }
+
+        let routing_snapshot =
+            RoutingSnapshot::new(partition_map.clone(), grpc_acceptors, grpc_learners);
+
+        let num_routers = cfg.num_routers;
+        let routers: Vec<RouterHandle> = (0..num_routers)
+            .map(|_| {
+                let (router, handle, _routing_tx) =
+                    Router::with_routing(queue_depth, routing_snapshot.clone());
+                mz_ore::task::spawn(|| "spec-router", router.run());
+                handle
+            })
+            .collect();
 
         if !json {
-            eprintln!(
-                "  log shard {}: [0x{:02x}, 0x{:03x}) → {}",
-                i, range.lo, range.hi_exclusive, shard_id
-            );
+            eprintln!("specsheet: {} in-process routers", num_routers);
         }
+
+        shared_router_transport = Some(Transport::Router {
+            routers: Arc::new(routers),
+            next: Arc::new(AtomicUsize::new(0)),
+        });
+    } else {
+        // Direct mode: in-process acceptors and learners, one per log shard.
+        let persist_client_config = PersistClientConfig {
+            latency_profile: cfg.latency_profile(),
+        };
+        let persist_client = client::new_persist_client(persist_client_config);
+
+        for (i, range) in partition_map.ranges.iter().enumerate() {
+            let shard_id = range.log_shard;
+            // Shard 0 uses the report metrics; others get their own.
+            let (shard_acceptor_metrics, shard_learner_metrics) = if i == 0 {
+                (report_acceptor_metrics.clone(), report_learner_metrics.clone())
+            } else {
+                let r = MetricsRegistry::new();
+                (AcceptorMetrics::register(&r), LearnerMetrics::register(&r))
+            };
+
+            let acceptor_config = AcceptorConfig { queue_depth };
+            let (acceptor_handle, acceptor_task) = PersistAcceptor::spawn(
+                acceptor_config,
+                &persist_client,
+                shard_id,
+                shard_acceptor_metrics,
+                0,
+                mz_persist_shared_log::noop_retraction_sources(),
+                vec![],
+                range.clone(),
+            )
+            .await;
+
+            let learner_config = PersistLearnerConfig {
+                queue_depth,
+                ..Default::default()
+            };
+            let (learner_handle, learner_task) = PersistLearner::spawn(
+                learner_config,
+                &persist_client,
+                shard_id,
+                shard_learner_metrics,
+            )
+            .await;
+
+            shard_transports.insert(
+                shard_id,
+                Transport::Direct {
+                    acceptor: acceptor_handle,
+                    learner: learner_handle,
+                },
+            );
+            _tasks.push(acceptor_task);
+            _tasks.push(learner_task);
+
+            if !json {
+                eprintln!(
+                    "  log shard {}: [0x{:02x}, 0x{:03x}) → {}",
+                    i, range.lo, range.hi_exclusive, shard_id
+                );
+            }
+        }
+
+        shared_router_transport = None;
     }
 
     // --- Timing ---
@@ -1308,11 +1501,19 @@ async fn main() {
         // partition key. Spread clients evenly across the key space.
         let pk = u8::try_from((u64::cast_from(shard_idx) * 256) / cfg.num_shards).unwrap_or(0);
         let shard_key = format!("s{:02x}{:06x}-0000-0000-0000-{:012x}", pk, shard_idx, shard_idx);
-        let log_shard = partition_map.route(&shard_key);
-        let t = shard_transports
-            .get(&log_shard)
-            .expect("partition map routes to known shard")
-            .clone();
+
+        let t = if let Some(router_transport) = &shared_router_transport {
+            // Process mode: all clients share the router pool.
+            router_transport.clone()
+        } else {
+            // Direct mode: route to the correct per-shard transport.
+            let log_shard = partition_map.route(&shard_key);
+            shard_transports
+                .get(&log_shard)
+                .expect("partition map routes to known shard")
+                .clone()
+        };
+
         let stop = Arc::clone(&stop);
         let client_cfg = ClientConfig {
             shard_key,
@@ -1334,6 +1535,7 @@ async fn main() {
     // Drop transports so the service shuts down when client tasks finish
     // (they hold the remaining clones).
     drop(shard_transports);
+    drop(shared_router_transport);
 
     // --- Wait for duration ---
     tokio::time::sleep(total_dur).await;

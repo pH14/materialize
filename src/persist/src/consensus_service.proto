@@ -37,6 +37,9 @@ service ConsensusLearner {
   rpc Head(ProtoHeadRequest) returns (ProtoHeadResponse);
   rpc Scan(ProtoScanRequest) returns (ProtoScanResponse);
   rpc ListKeys(ProtoListKeysRequest) returns (stream ProtoListKeysResponse);
+  // Return pending retractions for proposals with batch_id < frontier.
+  // Non-destructive: entries stay in the learner until the -1 diffs arrive.
+  rpc GetRetractions(ProtoGetRetractionsRequest) returns (ProtoGetRetractionsResponse);
 }
 
 // Metashard: partition map authority. Manages the mapping from key ranges to
@@ -101,6 +104,30 @@ message ProtoRangeAssignment {
   uint32 lo = 1;          // inclusive lower bound (u8)
   uint32 hi_exclusive = 2; // exclusive upper bound (u16, max 0x100)
   string log_shard = 3;   // ShardId
+}
+
+// --- Retraction messages ---
+
+// Identifies a proposal's position in the log (the persist-level key).
+message ProtoOrderedKey {
+  uint64 batch_id = 1;
+  uint32 position = 2;
+  string shard = 3;
+}
+
+// A pending retraction: a proposal eligible to be retracted from the log.
+message ProtoRetraction {
+  ProtoOrderedKey key = 1;
+  // Raw encoded Proposal bytes.
+  bytes proposal = 2;
+}
+
+message ProtoGetRetractionsRequest {
+  uint64 frontier = 1;
+}
+
+message ProtoGetRetractionsResponse {
+  repeated ProtoRetraction entries = 1;
 }
 
 // --- Learner request/response messages ---

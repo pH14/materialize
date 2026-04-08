@@ -697,13 +697,56 @@ async fn run_acceptor(args: AcceptorArgs) {
         })
         .collect();
 
+    // Create a watch channel for the retraction source. The acceptor starts
+    // with the no-op source; a background task replaces it once the learner's
+    // Unix socket appears.
+    let (retraction_tx, retraction_rx) = tokio::sync::watch::channel(
+        std::sync::Arc::new(mz_persist_shared_log::NoOpRetractionSource)
+            as std::sync::Arc<dyn mz_persist_shared_log::RetractionSource>,
+    );
+
+    // Background task: wait for the learner socket, connect, then send the
+    // real GrpcLearnerRetractionSource through the watch channel.
+    let learner_sock = args
+        .run_dir
+        .join(format!("learner-{shard_id}-0"))
+        .join("grpc.sock");
+    let learner_sock_str = learner_sock.to_string_lossy().to_string();
+    mz_ore::task::spawn(|| "acceptor-retraction-wirer", async move {
+        // Wait until the learner socket file exists.
+        loop {
+            if learner_sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        match mz_persist_shared_log::rpc::GrpcLearnerHandle::connect_with_retry(
+            learner_sock_str,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(handle) => {
+                let source = std::sync::Arc::new(
+                    mz_persist_shared_log::rpc::GrpcLearnerRetractionSource::new(handle),
+                )
+                    as std::sync::Arc<dyn mz_persist_shared_log::RetractionSource>;
+                let _ = retraction_tx.send(source);
+                info!(%shard_id, "retraction source wired to learner");
+            }
+            Err(e) => {
+                error!(%shard_id, "failed to connect to learner for retractions: {e}");
+            }
+        }
+    });
+
     let (handle, _task) = mz_persist_shared_log::actors::acceptor::PersistAcceptor::spawn(
         AcceptorConfig::default(),
         &persist_client,
         shard_id,
         acceptor_metrics,
         args.epoch,
-        mz_persist_shared_log::noop_retraction_sources(),
+        retraction_rx,
         predecessors,
         range,
     )
