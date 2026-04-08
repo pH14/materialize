@@ -313,7 +313,7 @@ async fn spawn_persist_pair(
         acceptor_metrics,
         shard_id,
         0,
-        Box::new(crate::NoOpRetractionSource),
+        crate::noop_retraction_sources(),
     );
     let acceptor_task =
         mz_ore::task::spawn(|| "persist-sim-acceptor", acceptor.run(write)).abort_on_drop();
@@ -725,7 +725,7 @@ async fn persist_sim_multi_writer() {
             acceptor_metrics_a,
             shard_id,
             0,
-            Box::new(crate::NoOpRetractionSource),
+            crate::noop_retraction_sources(),
         );
         let _task_a = mz_ore::task::spawn(|| "persist-sim-acceptor-a", acceptor_a.run(write_a))
             .abort_on_drop();
@@ -735,7 +735,7 @@ async fn persist_sim_multi_writer() {
             acceptor_metrics_b,
             shard_id,
             0,
-            Box::new(crate::NoOpRetractionSource),
+            crate::noop_retraction_sources(),
         );
         let _task_b = mz_ore::task::spawn(|| "persist-sim-acceptor-b", acceptor_b.run(write_b))
             .abort_on_drop();

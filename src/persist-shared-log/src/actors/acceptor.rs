@@ -28,6 +28,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::watch;
+
 use timely::progress::Antichain;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -72,12 +74,6 @@ pub enum PersistAcceptorCommand {
     /// Used in tests to force deterministic flush boundaries.
     #[allow(dead_code)]
     Flush { reply: oneshot::Sender<()> },
-    /// Set the retraction source after the acceptor is already running.
-    /// Used when acceptors must be spawned before learners (learner subscribe
-    /// blocks until the acceptor writes setup batches to advance upper).
-    SetRetractionSource {
-        source: Box<dyn crate::RetractionSource>,
-    },
 }
 
 /// A typed handle to the acceptor's command channel.
@@ -98,19 +94,6 @@ impl PersistAcceptorHandle {
             .await
             .map_err(|_| AcceptorError::Shutdown)?;
         reply_rx.await.map_err(|_| AcceptorError::DroppedReply)
-    }
-
-    /// Wire a retraction source to a running acceptor. Used when acceptors
-    /// are spawned before learners (setup batches must advance upper before
-    /// learner subscribe can proceed).
-    pub async fn set_retraction_source(
-        &self,
-        source: Box<dyn crate::RetractionSource>,
-    ) -> Result<(), AcceptorError> {
-        self.tx
-            .send(PersistAcceptorCommand::SetRetractionSource { source })
-            .await
-            .map_err(|_| AcceptorError::Shutdown)
     }
 }
 
@@ -181,8 +164,12 @@ pub struct PersistAcceptor {
     log_shard_id: String,
     /// Partition map epoch this acceptor was created under.
     epoch: u64,
-    /// Source of retraction entries from the serving layer / learners.
-    retraction_source: Box<dyn crate::RetractionSource>,
+    /// Watch receiver for the current retraction source.
+    ///
+    /// The factory updates this when learners become available or change.
+    /// The acceptor clones the current `Arc` before each poll so it holds
+    /// the lock for as little time as possible.
+    retraction_sources: watch::Receiver<Arc<dyn crate::RetractionSource>>,
     /// Buffered retractions waiting to be included in the next flush.
     buffered_retractions: Vec<(OrderedKey, Proposal)>,
     /// Flush counter for periodic retraction polling.
@@ -201,7 +188,7 @@ impl PersistAcceptor {
         metrics: AcceptorMetrics,
         log_shard_id: ShardId,
         epoch: u64,
-        retraction_source: Box<dyn crate::RetractionSource>,
+        retraction_sources: watch::Receiver<Arc<dyn crate::RetractionSource>>,
     ) -> (Self, PersistAcceptorHandle) {
         let (tx, rx) = mpsc::channel(config.queue_depth);
 
@@ -211,7 +198,7 @@ impl PersistAcceptor {
             metrics,
             log_shard_id: log_shard_id.to_string(),
             epoch,
-            retraction_source,
+            retraction_sources,
             buffered_retractions: Vec::new(),
             flush_count: 0,
             retraction_poll_interval: 100,
@@ -243,9 +230,6 @@ impl PersistAcceptor {
             PersistAcceptorCommand::Flush { reply } => {
                 self.metrics.flush_explicit_triggered.inc();
                 self.pending.push(PendingItem::FlushBarrier(reply));
-            }
-            PersistAcceptorCommand::SetRetractionSource { source } => {
-                self.retraction_source = source;
             }
         }
     }
@@ -285,7 +269,9 @@ impl PersistAcceptor {
 
     /// Poll the retraction source and buffer results for the next flush.
     async fn poll_retractions(&mut self, current_upper: u64) {
-        let retractions = self.retraction_source.get_retractions(current_upper).await;
+        // Clone the Arc to release the watch lock before the async call.
+        let source = self.retraction_sources.borrow().clone();
+        let retractions = source.get_retractions(current_upper).await;
         if retractions.is_empty() {
             return;
         }
@@ -791,7 +777,7 @@ impl PersistAcceptor {
         shard_id: ShardId,
         metrics: AcceptorMetrics,
         epoch: u64,
-        retraction_source: Box<dyn crate::RetractionSource>,
+        retraction_sources: watch::Receiver<Arc<dyn crate::RetractionSource>>,
         predecessors: Vec<PredecessorSpec>,
         range: crate::RangeAssignment,
     ) -> (PersistAcceptorHandle, mz_ore::task::JoinHandle<()>) {
@@ -805,7 +791,7 @@ impl PersistAcceptor {
             .await
             .expect("failed to open persist shard for acceptor");
 
-        let (acceptor, handle) = Self::new(config, metrics, shard_id, epoch, retraction_source);
+        let (acceptor, handle) = Self::new(config, metrics, shard_id, epoch, retraction_sources);
         let client = client.clone();
         let task = mz_ore::task::spawn(|| "persist-acceptor", async move {
             // Setup runs as the first action inside the actor task. The bulk

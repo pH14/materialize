@@ -111,7 +111,7 @@ impl PersistTestHarness {
             acceptor_metrics,
             shard_id,
             0,
-            Box::new(crate::NoOpRetractionSource),
+            crate::noop_retraction_sources(),
         );
         let acceptor_task =
             mz_ore::task::spawn(|| "test-persist-acceptor", acceptor.run(write)).abort_on_drop();

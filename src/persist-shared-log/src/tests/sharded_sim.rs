@@ -101,7 +101,7 @@ async fn spawn_shard(
         acceptor_metrics,
         shard_id,
         0,
-        Box::new(crate::NoOpRetractionSource),
+        crate::noop_retraction_sources(),
     );
     let _atask =
         mz_ore::task::spawn(|| "sharded-sim-acceptor", acceptor.run(write)).abort_on_drop();

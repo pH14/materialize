@@ -703,7 +703,7 @@ async fn run_acceptor(args: AcceptorArgs) {
         shard_id,
         acceptor_metrics,
         args.epoch,
-        Box::new(mz_persist_shared_log::NoOpRetractionSource),
+        mz_persist_shared_log::noop_retraction_sources(),
         predecessors,
         range,
     )

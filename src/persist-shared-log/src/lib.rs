@@ -418,6 +418,19 @@ impl RetractionSource for NoOpRetractionSource {
     }
 }
 
+/// Creates a watch receiver pre-loaded with [`NoOpRetractionSource`].
+///
+/// Suitable for standalone acceptors and tests that don't need retraction
+/// polling. The sender is dropped immediately; [`tokio::sync::watch::Receiver::borrow`]
+/// continues to return the no-op source.
+pub fn noop_retraction_sources(
+) -> tokio::sync::watch::Receiver<std::sync::Arc<dyn RetractionSource>> {
+    let (_, rx) = tokio::sync::watch::channel(
+        std::sync::Arc::new(NoOpRetractionSource) as std::sync::Arc<dyn RetractionSource>,
+    );
+    rx
+}
+
 /// A plan for a reconfiguration operation.
 #[derive(Debug, Clone)]
 pub struct ReconfigurationPlan {
