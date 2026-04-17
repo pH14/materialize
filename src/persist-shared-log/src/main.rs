@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist::generated::consensus_service::persist_shared_log_server::PersistSharedLogServer;
@@ -80,6 +80,12 @@ enum Commands {
     /// Routes client requests to remote acceptors and learners via gRPC.
     /// Subscribes to the metashard persist shard for partition map updates.
     Router(RouterArgs),
+
+    /// Kill acceptor/learner processes whose PID files live under `--run-dir`,
+    /// then remove the run directory. Useful after a crash or Ctrl-C of the
+    /// parent meta/router where the children were detached (via `setsid`) and
+    /// are now running as orphans.
+    Cleanup(CleanupArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +107,12 @@ struct StorageArgs {
 /// Delete all state from prior runs: blob directory, consensus schema, run directory.
 async fn reset_state(storage: &StorageArgs, run_dir: Option<&std::path::Path>) {
     info!("--reset: clearing all prior state");
+
+    // Kill any orphaned actor processes before nuking their run directory,
+    // otherwise they'll keep scribbling on the (now-stale) blob/consensus.
+    if let Some(run_dir) = run_dir {
+        cleanup_run_dir(run_dir);
+    }
 
     // Delete blob directory (file:///path → /path).
     if let Some(path) = storage.blob_url.strip_prefix("file://") {
@@ -133,15 +145,64 @@ async fn reset_state(storage: &StorageArgs, run_dir: Option<&std::path::Path>) {
             .expect("reset consensus state");
     }
 
-    // Delete run directory (stale sockets, PID files).
-    if let Some(run_dir) = run_dir {
-        if run_dir.exists() {
-            info!(?run_dir, "deleting run directory");
-            std::fs::remove_dir_all(run_dir).expect("delete run directory");
+    info!("reset complete");
+}
+
+/// Kill any processes whose PID files live under `run_dir`, then delete the
+/// directory. Idempotent: missing dirs, missing PID files, and dead PIDs are
+/// all no-ops. Safe to call on a shared run dir after a crash of the parent
+/// meta/router process, since children are detached via `setsid`.
+fn cleanup_run_dir(run_dir: &std::path::Path) {
+    if !run_dir.exists() {
+        info!(?run_dir, "run directory does not exist, nothing to clean");
+        return;
+    }
+
+    // Collect every PID we can find under run_dir/*/pid.
+    let mut pids: Vec<(String, i32)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(run_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let pid_file = path.join("pid");
+            let Ok(pid_str) = std::fs::read_to_string(&pid_file) else {
+                continue;
+            };
+            let Ok(pid) = pid_str.trim().parse::<i32>() else {
+                continue;
+            };
+            let label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            pids.push((label, pid));
         }
     }
 
-    info!("reset complete");
+    // Polite shutdown first so sockets get flushed.
+    for (label, pid) in &pids {
+        info!(%label, pid, "sending SIGTERM");
+        unsafe {
+            libc::kill(*pid, libc::SIGTERM);
+        }
+    }
+
+    // Brief grace period, then SIGKILL anyone still alive.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    for (label, pid) in &pids {
+        // kill(pid, 0) returns 0 iff the process exists and we can signal it.
+        if unsafe { libc::kill(*pid, 0) } == 0 {
+            warn!(%label, pid, "still alive after SIGTERM, sending SIGKILL");
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    info!(?run_dir, "deleting run directory");
+    let _ = std::fs::remove_dir_all(run_dir);
 }
 
 /// Create a persist config suitable for the shared log service.
@@ -458,6 +519,19 @@ struct RouterArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Standalone cleanup mode
+// ---------------------------------------------------------------------------
+
+/// Arguments for the `cleanup` subcommand.
+#[derive(clap::Args, Debug)]
+struct CleanupArgs {
+    /// Run directory whose children should be killed and whose contents should
+    /// be deleted.
+    #[arg(long, env = "RUN_DIR")]
+    run_dir: std::path::PathBuf,
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -482,6 +556,7 @@ fn main() {
         Commands::Learner(args) => rt.block_on(run_learner(args)),
         Commands::Metashard(args) => rt.block_on(run_metashard(args)),
         Commands::Router(args) => rt.block_on(run_router(args)),
+        Commands::Cleanup(args) => cleanup_run_dir(&args.run_dir),
     }
 }
 
