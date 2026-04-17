@@ -7402,6 +7402,7 @@ dependencies = [
  "bytes",
  "clap",
  "differential-dataflow 0.20.0",
+ "futures",
  "glob",
  "hyper-util",
  "libc",

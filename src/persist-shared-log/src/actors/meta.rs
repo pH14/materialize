@@ -794,63 +794,76 @@ impl<F: ActorFactory> PersistMetaActor<F> {
         }
 
         // Create actors for new shards that have predecessors.
-        for range in self.state.target_state.ranges.clone() {
-            let shard_id = range.log_shard;
-            let predecessors = target_shard_predecessors
-                .iter()
-                .find(|(id, _)| *id == shard_id)
-                .map(|(_, p)| p.as_slice())
-                .unwrap_or(&[]);
-            // This shard has no predecessors — it was not involved in this reconfiguration.
-            if predecessors.is_empty() {
-                continue;
-            }
-            let pred_specs =
-                Self::build_predecessor_specs(predecessors, &critical_holds, &all_predecessors);
-            self.factory
-                .create_acceptor(shard_id, self.state.epoch, pred_specs, range)
-                .await
-                .map_err(|e| {
-                    MetaError::Command(format!("failed to create acceptor for {shard_id}: {e}"))
-                })?;
-            self.factory.create_learner(shard_id).await.map_err(|e| {
-                MetaError::Command(format!("failed to create learner for {shard_id}: {e}"))
-            })?;
-        }
+        //
+        // In distributed (ProcessActorFactory) mode each call forks a child
+        // process and blocks until it binds its gRPC Unix socket, so spawning
+        // N shards sequentially used to take ~1s × N. Fire them all off in
+        // parallel.
+        let factory = &self.factory;
+        let epoch = self.state.epoch;
+        let spawns = self.state.target_state.ranges.clone().into_iter().filter_map(
+            |range| -> Option<_> {
+                let shard_id = range.log_shard;
+                let predecessors = target_shard_predecessors
+                    .iter()
+                    .find(|(id, _)| *id == shard_id)
+                    .map(|(_, p)| p.as_slice())
+                    .unwrap_or(&[]);
+                if predecessors.is_empty() {
+                    return None;
+                }
+                let pred_specs = Self::build_predecessor_specs(
+                    predecessors,
+                    &critical_holds,
+                    &all_predecessors,
+                );
+                Some(async move {
+                    factory
+                        .create_acceptor(shard_id, epoch, pred_specs, range)
+                        .await
+                        .map_err(|e| format!("failed to create acceptor for {shard_id}: {e}"))?;
+                    factory
+                        .create_learner(shard_id)
+                        .await
+                        .map_err(|e| format!("failed to create learner for {shard_id}: {e}"))?;
+                    Ok::<(), String>(())
+                })
+            },
+        );
+        futures::future::try_join_all(spawns)
+            .await
+            .map_err(MetaError::Command)?;
 
-        // Wait for bulk snapshots on new (target) shards.
-        for (target_shard_id, _) in &target_shard_predecessors {
-            target_writes
-                .get_mut(target_shard_id)
-                .expect("target shard writer")
+        // Wait for bulk snapshots on new (target) shards, in parallel. Each
+        // wait borrows a distinct WriteHandle so the futures don't contend.
+        let bulk_waits = target_writes.iter_mut().map(|(shard_id, write)| async move {
+            write
                 .wait_for_upper_past(&Antichain::from_elem(BULK_SNAPSHOT_BATCH_ID))
                 .await;
-            info!(%target_shard_id, "bulk snapshot complete");
-        }
+            info!(%shard_id, "bulk snapshot complete");
+        });
+        futures::future::join_all(bulk_waits).await;
 
         // Seal predecessor shards (idempotent: already-sealed shards are skipped).
-        for &pred_id in &all_predecessors {
-            let write = pred_writes
-                .get_mut(&pred_id)
-                .expect("predecessor shard writer");
+        let seals = pred_writes.iter_mut().map(|(pred_id, write)| async move {
             if !write.upper().is_empty() {
                 write.advance_upper(&Antichain::new()).await;
                 info!(%pred_id, "sealed log shard");
             }
-        }
+        });
+        futures::future::join_all(seals).await;
 
         // BUGGIFY: crash after seal.
         crate::fault::maybe_fail("after_seal").map_err(MetaError::Command)?;
 
-        // Wait for delta snapshots on new (target) shards.
-        for (target_shard_id, _) in &target_shard_predecessors {
-            target_writes
-                .get_mut(target_shard_id)
-                .expect("target shard writer")
+        // Wait for delta snapshots on new (target) shards, in parallel.
+        let delta_waits = target_writes.iter_mut().map(|(shard_id, write)| async move {
+            write
                 .wait_for_upper_past(&Antichain::from_elem(DELTA_SNAPSHOT_BATCH_ID))
                 .await;
-            info!(%target_shard_id, "delta snapshot complete");
-        }
+            info!(%shard_id, "delta snapshot complete");
+        });
+        futures::future::join_all(delta_waits).await;
 
         // Commit: clear start_state to mark reconfiguration complete.
         let new_state = MetaState {
