@@ -71,18 +71,41 @@ When investigating:
   in the acceptor's write path (e.g., the diff-dropping bug in bulk/delta
   snapshots) that are invisible through the client API due to consolidation.
 
-- **Retractions during reconfiguration**: No test currently generates
-  retractions in the window between CriticalSince and seal. Add a test
-  that produces rejected CAS writes (which generate -1 retraction diffs)
-  during an active reconfiguration and verifies they're properly carried
-  forward to the new shard.
-
 - **TODO: Invariants as a first-class struct**: The protocol invariants checked
   in `stateright_reconfig.rs` `properties()` are inlined closures. Factor them
   out into a dedicated `Invariants` struct with named methods. Eventually this
   struct should have multiple impls or backends: one for Stateright model
   checking, one for the DST harness (checked after each simulated operation),
   and potentially one that compiles to debug asserts in the production actors.
+
+- **TODO: Model the setup-batch re-keying protocol in Stateright**: The
+  current `ProtocolModel` in `stateright_reconfig.rs` verifies safety/liveness
+  properties at the `PartitionMap` + `Reconfigure/Reconcile` level but treats
+  the predecessor-copy step as a single atomic action. It does not model:
+
+  - the bulk/delta split (batch 1 snapshot at CriticalSince + batch 2 listen
+    over the window to seal),
+  - the re-keying of original `OrderedKey`s to fresh
+    `(BULK_SNAPSHOT_BATCH_ID, position, shard)` and
+    `(DELTA_SNAPSHOT_BATCH_ID, position, shard)`,
+  - the in-memory consolidation of delta listen events, or
+  - the `bulk_map` that delta uses to target retractions against bulk-written
+    keys.
+
+  As a result, the model would not have caught the negative-multiplicity bug
+  fixed in the delta-snapshot path (where `-1`s were minted with fresh
+  positions that didn't match the `+1`s the bulk had written).
+
+  The invariant to encode: for every `-1` delivered to the new learner, the
+  matching `+1` for the same `OrderedKey` has been delivered earlier (the
+  `live_keys` invariant). The model should cover concurrent CAS traffic on
+  the predecessor during the delta window, including cases where a live-at-
+  `CriticalSince` entry is retracted before seal, an entry is inserted and
+  retracted entirely within the window (net 0), and an entry is inserted and
+  survives the window (net `+1`). Crash/recovery between phases 4 and 6
+  should be covered too, since the determinism of the rebuilt `bulk_map` is
+  load-bearing. See `doc/reference/05_horizontal_sharding.md#re-keying-protocol`
+  for the algorithm.
 
 ## Running
 

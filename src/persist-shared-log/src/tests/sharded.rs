@@ -1914,3 +1914,238 @@ async fn test_get_retractions_filtering() {
         "frontier=1 should return no retractions (all batch_ids > 1)"
     );
 }
+
+/// Regression test for the bug where retractions in the delta-snapshot window
+/// landed on freshly-minted `OrderedKey`s, so the new learner saw a `-1` for a
+/// key it had never inserted and panicked in `apply_retraction`.
+///
+/// The fix consolidates the delta listen in memory and emits `-1`s against the
+/// same rewritten `OrderedKey` that the bulk snapshot used, via a shared
+/// `bulk_map`.
+#[mz_ore::test(tokio::test)]
+async fn test_delta_snapshot_retracts_bulk_entries_via_map() {
+    use mz_persist::generated::consensus_service::{
+        ProtoCasProposal, ProtoLogProposal, proto_log_proposal,
+    };
+    use prost::Message as _;
+    use timely::progress::Antichain;
+
+    let client = new_persist_client_for_test().await;
+
+    let pred_shard = ShardId::new();
+    let new_shard = ShardId::new();
+
+    let cas_proposal = |client_shard: &str, seqno: u64, data: &[u8]| -> Proposal {
+        let proto = ProtoLogProposal {
+            op: Some(proto_log_proposal::Op::Cas(ProtoCasProposal {
+                key: client_shard.to_string(),
+                expected: None,
+                new_seqno: seqno,
+                data: data.to_vec(),
+            })),
+        };
+        let mut buf = Vec::new();
+        proto.encode(&mut buf).unwrap();
+        Proposal {
+            encoded: bytes::Bytes::from(buf),
+        }
+    };
+
+    // Stage the predecessor directly via raw compare_and_append, bypassing the
+    // acceptor. This lets us construct precisely the +1/-1 interleaving the
+    // delta snapshot has to handle.
+    let mut pred_write = client
+        .open_writer::<OrderedKey, Proposal, u64, i64>(
+            pred_shard,
+            Arc::new(OrderedKeySchema),
+            Arc::new(ProposalSchema),
+            Diagnostics::from_purpose("test-predecessor"),
+        )
+        .await
+        .expect("open predecessor writer");
+
+    // Four logical keys, one per behavior we want to exercise:
+    //   k_retracted : bulk +1, retracted in the delta window  → net -1 delta
+    //   k_preserved : bulk +1, untouched in delta              → no delta entry
+    //   k_inserted  : absent from bulk, +1 in delta, survives  → net +1 delta
+    //   k_churn     : absent from bulk, +1 and -1 in delta     → net 0 (elide)
+    let k_retracted = OrderedKey {
+        batch_id: 3,
+        position: 0,
+        shard: "s10000000-0000-0000-0000-000000000000".into(),
+    };
+    let k_preserved = OrderedKey {
+        batch_id: 3,
+        position: 1,
+        shard: "s20000000-0000-0000-0000-000000000000".into(),
+    };
+    let k_inserted = OrderedKey {
+        batch_id: 4,
+        position: 0,
+        shard: "s30000000-0000-0000-0000-000000000000".into(),
+    };
+    let k_churn = OrderedKey {
+        batch_id: 4,
+        position: 1,
+        shard: "s40000000-0000-0000-0000-000000000000".into(),
+    };
+    let p_retracted = cas_proposal(&k_retracted.shard, 1, b"retracted_v1");
+    let p_preserved = cas_proposal(&k_preserved.shard, 1, b"preserved_v1");
+    let p_inserted = cas_proposal(&k_inserted.shard, 1, b"inserted_v1");
+    let p_churn = cas_proposal(&k_churn.shard, 1, b"churn_v1");
+
+    // T=0: the pre-CriticalSince state the bulk snapshot will pick up.
+    pred_write
+        .compare_and_append(
+            &[
+                ((k_retracted.clone(), p_retracted.clone()), 0u64, 1i64),
+                ((k_preserved.clone(), p_preserved.clone()), 0u64, 1i64),
+            ],
+            Antichain::from_elem(0),
+            Antichain::from_elem(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // T=1: inside the delta window — retract a bulk entry, insert a new one,
+    // and start the churn pair.
+    pred_write
+        .compare_and_append(
+            &[
+                ((k_retracted.clone(), p_retracted.clone()), 1u64, -1i64),
+                ((k_inserted.clone(), p_inserted.clone()), 1u64, 1i64),
+                ((k_churn.clone(), p_churn.clone()), 1u64, 1i64),
+            ],
+            Antichain::from_elem(1),
+            Antichain::from_elem(2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // T=2: finish the churn pair (net 0 once consolidated).
+    pred_write
+        .compare_and_append(
+            &[((k_churn.clone(), p_churn.clone()), 2u64, -1i64)],
+            Antichain::from_elem(2),
+            Antichain::from_elem(3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Seal the predecessor.
+    pred_write.advance_upper(&Antichain::new()).await;
+
+    // Open the new shard's writer.
+    let mut new_write = client
+        .open_writer::<OrderedKey, Proposal, u64, i64>(
+            new_shard,
+            Arc::new(OrderedKeySchema),
+            Arc::new(ProposalSchema),
+            Diagnostics::from_purpose("test-new-shard"),
+        )
+        .await
+        .expect("open new shard writer");
+
+    // CriticalSince = [0] splits the predecessor: bulk snapshot sees T<=0, delta
+    // listen sees T>=1. (Persist's snapshot_and_fetch is inclusive of as_of,
+    // while listen delivers strictly-greater timestamps.)
+    let predecessors = vec![(pred_shard, Antichain::from_elem(0u64))];
+    let range = RangeAssignment {
+        lo: 0x00,
+        hi_exclusive: 0x100,
+        log_shard: new_shard,
+    };
+
+    let bulk_map = crate::actors::acceptor::write_bulk_snapshot(
+        &mut new_write,
+        &client,
+        &predecessors,
+        &range,
+    )
+    .await;
+    assert!(
+        bulk_map.contains_key(&k_retracted),
+        "bulk map must include the key that the delta will retract"
+    );
+    assert!(
+        bulk_map.contains_key(&k_preserved),
+        "bulk map must include the surviving live key"
+    );
+    assert!(
+        !bulk_map.contains_key(&k_inserted),
+        "bulk map should not contain keys first seen in the delta window"
+    );
+
+    crate::actors::acceptor::write_delta_snapshot(
+        &mut new_write,
+        &client,
+        &predecessors,
+        &range,
+        &bulk_map,
+    )
+    .await;
+
+    // Replay the new shard through a subscribe and simulate the learner's
+    // live-keys invariant. A -1 for a key that was never inserted would panic
+    // both here and in `PersistLearner::apply_retraction` — that panic was the
+    // original bug.
+    let (_upper, read) = client
+        .open::<OrderedKey, Proposal, u64, i64>(
+            new_shard,
+            Arc::new(OrderedKeySchema),
+            Arc::new(ProposalSchema),
+            Diagnostics::from_purpose("test-new-shard-reader"),
+            false,
+        )
+        .await
+        .expect("open new shard reader");
+    let since = read.since().clone();
+    let mut subscribe = read.subscribe(since).await.expect("subscribe");
+
+    let mut live_keys: std::collections::BTreeSet<OrderedKey> = std::collections::BTreeSet::new();
+    let target_upper = 3u64;
+    'outer: loop {
+        let events = subscribe.fetch_next().await;
+        for event in &events {
+            match event {
+                mz_persist_client::read::ListenEvent::Progress(frontier) => {
+                    if frontier.as_option().copied() >= Some(target_upper) {
+                        break 'outer;
+                    }
+                }
+                mz_persist_client::read::ListenEvent::Updates(updates) => {
+                    for ((key, _proposal), _ts, diff) in updates {
+                        match *diff {
+                            1 => {
+                                live_keys.insert(key.clone());
+                            }
+                            -1 => {
+                                assert!(
+                                    live_keys.remove(key),
+                                    "delta retraction landed on an OrderedKey never inserted: {:?}",
+                                    key,
+                                );
+                            }
+                            other => panic!("unexpected diff {} for key {:?}", other, key),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // After bulk + delta, exactly k_preserved and k_inserted remain live.
+    let live_shards: std::collections::BTreeSet<String> =
+        live_keys.iter().map(|k| k.shard.clone()).collect();
+    assert_eq!(
+        live_shards,
+        [k_preserved.shard.clone(), k_inserted.shard.clone()]
+            .into_iter()
+            .collect(),
+        "final live-shard set mismatch: {:?}",
+        live_shards,
+    );
+}

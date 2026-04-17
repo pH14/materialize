@@ -25,6 +25,7 @@
 //! on success. On `UpperMismatch` (rare, only with multiple writers) the
 //! pre-built batch would need to be discarded and rebuilt.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -546,42 +547,56 @@ pub type PredecessorSpec = (ShardId, Antichain<u64>);
 /// Entries are blind-copied: proposals are opaque bytes, only OrderedKeys are
 /// re-keyed to `(batch_id, position, shard)`. The learner applies CaS
 /// semantics when it processes these entries from its subscribe.
-async fn write_bulk_snapshot(
+///
+/// Returns a map from each original predecessor `OrderedKey` to the rewritten
+/// key written to the new shard. The delta snapshot uses this map to emit
+/// retractions for entries that were live at CriticalSince but retracted before
+/// seal, so the `-1` diff lands on the same `OrderedKey` that carried the `+1`.
+///
+/// Safe to call after a crash: if the bulk write has already been committed
+/// (upper past `DELTA_SNAPSHOT_BATCH_ID`), we skip the write but still rebuild
+/// the map by re-snapshotting the predecessors. Deterministic sorting by
+/// original `OrderedKey` ensures the rebuilt map produces the same rewritten
+/// keys as the original write.
+pub(crate) async fn write_bulk_snapshot(
     write: &mut WriteHandle<OrderedKey, Proposal, u64, i64>,
     client: &PersistClient,
     predecessors: &[PredecessorSpec],
     range: &crate::RangeAssignment,
-) {
+) -> BTreeMap<OrderedKey, OrderedKey> {
     let current_upper = write.upper().as_option().copied().unwrap_or(u64::MAX);
-    if current_upper >= DELTA_SNAPSHOT_BATCH_ID {
-        info!(
-            "bulk snapshot already written (upper={}), skipping",
-            current_upper
-        );
-        return;
-    }
+    let already_written = current_upper >= DELTA_SNAPSHOT_BATCH_ID;
 
     if predecessors.is_empty() {
-        info!("no predecessors, advancing upper through bulk snapshot (empty)");
-        let upper = write.upper().clone();
-        let new_upper = Antichain::from_elem(DELTA_SNAPSHOT_BATCH_ID);
-        let empty: Vec<((OrderedKey, Proposal), u64, i64)> = vec![];
-        match write.compare_and_append(&empty, upper, new_upper).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                info!("upper mismatch during empty bulk snapshot, another acceptor won");
-            }
-            Err(e) => {
-                error!("invalid usage during empty bulk snapshot: {}", e);
+        if already_written {
+            info!(
+                "bulk snapshot already written (upper={}), skipping empty append",
+                current_upper
+            );
+        } else {
+            info!("no predecessors, advancing upper through bulk snapshot (empty)");
+            let upper = write.upper().clone();
+            let new_upper = Antichain::from_elem(DELTA_SNAPSHOT_BATCH_ID);
+            let empty: Vec<((OrderedKey, Proposal), u64, i64)> = vec![];
+            match write.compare_and_append(&empty, upper, new_upper).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    info!("upper mismatch during empty bulk snapshot, another acceptor won");
+                }
+                Err(e) => {
+                    error!("invalid usage during empty bulk snapshot: {}", e);
+                }
             }
         }
-        return;
+        return BTreeMap::new();
     }
 
+    // Gather live predecessor entries and sort them so every run produces the
+    // same (original -> rewritten) mapping, including recovery after a crash
+    // between the bulk write and the delta write.
     let key_schema = Arc::new(OrderedKeySchema);
     let val_schema = Arc::new(ProposalSchema);
-    let mut snapshot_entries: Vec<((OrderedKey, Proposal), u64, i64)> = Vec::new();
-    let mut position: u32 = 0;
+    let mut live_entries: Vec<(OrderedKey, Proposal)> = Vec::new();
 
     for (pred_shard, since) in predecessors {
         let (_, mut read) = client
@@ -604,14 +619,43 @@ async fn write_bulk_snapshot(
             if !range.contains_partition_key(&key.shard) {
                 continue;
             }
-            let new_key = OrderedKey {
-                batch_id: BULK_SNAPSHOT_BATCH_ID,
-                position,
-                shard: key.shard.clone(),
-            };
-            snapshot_entries.push(((new_key, proposal.clone()), BULK_SNAPSHOT_BATCH_ID, diff));
-            position += 1;
+            // `snapshot_and_fetch` returns a consolidated snapshot, so every
+            // surviving entry has diff=+1. A non-+1 diff would mean a bug
+            // somewhere upstream — skip defensively rather than emit a bogus
+            // entry.
+            if diff != 1 {
+                warn!(
+                    ?key,
+                    diff, "unexpected non-unit diff in predecessor snapshot, skipping"
+                );
+                continue;
+            }
+            live_entries.push((key, proposal));
         }
+    }
+
+    live_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut snapshot_entries: Vec<((OrderedKey, Proposal), u64, i64)> =
+        Vec::with_capacity(live_entries.len());
+    let mut bulk_map: BTreeMap<OrderedKey, OrderedKey> = BTreeMap::new();
+    for (position, (orig_key, proposal)) in live_entries.into_iter().enumerate() {
+        let new_key = OrderedKey {
+            batch_id: BULK_SNAPSHOT_BATCH_ID,
+            position: u32::try_from(position).expect("bulk snapshot position fits u32"),
+            shard: orig_key.shard.clone(),
+        };
+        bulk_map.insert(orig_key, new_key.clone());
+        snapshot_entries.push(((new_key, proposal), BULK_SNAPSHOT_BATCH_ID, 1));
+    }
+
+    if already_written {
+        info!(
+            entries = snapshot_entries.len(),
+            "bulk snapshot already written (upper={}), skipping write but returning rebuilt key map",
+            current_upper,
+        );
+        return bulk_map;
     }
 
     info!(
@@ -635,18 +679,33 @@ async fn write_bulk_snapshot(
             error!("invalid usage during bulk snapshot: {}", e);
         }
     }
+    bulk_map
 }
 
 /// Copy delta events from each predecessor (between its CriticalSince and its
 /// seal) into the new shard at `DELTA_SNAPSHOT_BATCH_ID`.
 ///
-/// Uses `listen` to read only the events after the snapshot point, avoiding the
-/// need to skip the snapshot region that `subscribe` would include.
-async fn write_delta_snapshot(
+/// Uses `listen` to read the events after the snapshot point, then consolidates
+/// them in memory before writing. Consolidation is required because the listen
+/// stream delivers raw `+1`/`-1` diffs that refer to predecessor `OrderedKey`s,
+/// while the new shard uses freshly-minted keys. Without consolidation, a `+1`
+/// and its matching `-1` in the predecessor would land on two different keys on
+/// the new shard, and the learner would panic when it saw a retraction for a
+/// key it never inserted.
+///
+/// The three consolidated cases are:
+/// - net `0`: inserted and retracted inside the delta window — skip entirely.
+/// - net `+1`: inserted in the window and still live at seal — emit `+1` with a
+///   fresh `(DELTA_SNAPSHOT_BATCH_ID, position, shard)` key.
+/// - net `-1`: was live at CriticalSince (hence in the bulk snapshot) and
+///   retracted before seal — emit `-1` against the key the bulk snapshot used,
+///   looked up via `bulk_map`.
+pub(crate) async fn write_delta_snapshot(
     write: &mut WriteHandle<OrderedKey, Proposal, u64, i64>,
     client: &PersistClient,
     predecessors: &[PredecessorSpec],
     range: &crate::RangeAssignment,
+    bulk_map: &BTreeMap<OrderedKey, OrderedKey>,
 ) {
     use mz_persist_client::read::ListenEvent;
 
@@ -676,10 +735,12 @@ async fn write_delta_snapshot(
         return;
     }
 
+    // Aggregate listen events by their original predecessor OrderedKey, summing
+    // diffs. BTreeMap gives a deterministic iteration order for position
+    // assignment below.
     let key_schema = Arc::new(OrderedKeySchema);
     let val_schema = Arc::new(ProposalSchema);
-    let mut delta_entries: Vec<((OrderedKey, Proposal), u64, i64)> = Vec::new();
-    let mut position: u32 = 0;
+    let mut aggregated: BTreeMap<OrderedKey, (Proposal, i64)> = BTreeMap::new();
 
     for (pred_shard, since) in predecessors {
         let (_, read) = client
@@ -712,20 +773,54 @@ async fn write_delta_snapshot(
                             if !range.contains_partition_key(&key.shard) {
                                 continue;
                             }
-                            let new_key = OrderedKey {
-                                batch_id: DELTA_SNAPSHOT_BATCH_ID,
-                                position,
-                                shard: key.shard.clone(),
-                            };
-                            delta_entries.push((
-                                (new_key, proposal.clone()),
-                                DELTA_SNAPSHOT_BATCH_ID,
-                                *diff,
-                            ));
-                            position += 1;
+                            aggregated
+                                .entry(key.clone())
+                                .and_modify(|(_, d)| *d += *diff)
+                                .or_insert_with(|| (proposal.clone(), *diff));
                         }
                     }
                 }
+            }
+        }
+    }
+
+    let mut delta_entries: Vec<((OrderedKey, Proposal), u64, i64)> = Vec::new();
+    let mut position: u32 = 0;
+    for (orig_key, (proposal, net_diff)) in aggregated {
+        match net_diff {
+            0 => {
+                // Inserted and retracted inside the window; nothing to emit.
+            }
+            1 => {
+                let new_key = OrderedKey {
+                    batch_id: DELTA_SNAPSHOT_BATCH_ID,
+                    position,
+                    shard: orig_key.shard.clone(),
+                };
+                delta_entries.push(((new_key, proposal), DELTA_SNAPSHOT_BATCH_ID, 1));
+                position += 1;
+            }
+            -1 => match bulk_map.get(&orig_key) {
+                Some(bulk_key) => {
+                    delta_entries.push((
+                        (bulk_key.clone(), proposal),
+                        DELTA_SNAPSHOT_BATCH_ID,
+                        -1,
+                    ));
+                }
+                None => {
+                    warn!(
+                        ?orig_key,
+                        "delta retraction for key not found in bulk snapshot, skipping",
+                    );
+                }
+            },
+            other => {
+                warn!(
+                    ?orig_key,
+                    net_diff = other,
+                    "unexpected consolidated diff in delta snapshot, skipping",
+                );
             }
         }
     }
@@ -800,8 +895,8 @@ impl PersistAcceptor {
             // acceptor enters its normal flush loop. External callers (e.g.,
             // the meta actor) can monitor progress by listening on the shard.
             let mut write = write;
-            write_bulk_snapshot(&mut write, &client, &predecessors, &range).await;
-            write_delta_snapshot(&mut write, &client, &predecessors, &range).await;
+            let bulk_map = write_bulk_snapshot(&mut write, &client, &predecessors, &range).await;
+            write_delta_snapshot(&mut write, &client, &predecessors, &range, &bulk_map).await;
             acceptor.run(write).await;
         });
 
