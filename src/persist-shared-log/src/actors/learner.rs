@@ -32,9 +32,12 @@
 //! fetching it — the learner does not own the upper handle.
 //!
 //! To amortize the cost of upper fetches across concurrent reads, the
-//! production [`run()`](PersistLearner::run) loop uses the "bus-stand"
-//! optimization: a single `fetch_recent_upper()` call is shared by all reads
-//! that arrive while it's in flight.
+//! production [`run()`](PersistLearner::run) loop uses a bus-stop pattern:
+//! every read that is queued when an `fetch_recent_upper()` call is *issued*
+//! rides that same fetch. Reads that arrive after the fetch is already in
+//! flight wait for the next one, because the returned upper may have been
+//! captured before those reads were invoked and therefore may not reflect
+//! writes that completed before the read was invoked.
 //!
 //! ## Listen task isolation
 //!
@@ -669,9 +672,14 @@ pub struct PersistLearner<E: EventSource = ChannelEventSource> {
     // --- Channels ---
     cmd_rx: mpsc::Receiver<PersistLearnerCommand>,
 
-    // --- Bus-stand linearization ---
-    /// Reads waiting for the current upper fetch to complete.
+    // --- Bus-stop linearization ---
+    /// Reads waiting for the *next* upper fetch to be issued. A read that
+    /// arrives here has not yet been assigned a linearization target.
     pending_reads: Vec<ReadCommand>,
+    /// Reads queued when the currently in-flight upper fetch was issued.
+    /// They will all be linearized at the upper that fetch returns. Empty
+    /// iff no fetch is in flight.
+    fetching_reads: Vec<ReadCommand>,
     /// Reads keyed by linearization target timestamp, waiting for the listen
     /// frontier to reach their target before they can be served.
     linearizing_reads: BTreeMap<u64, Vec<ReadCommand>>,
@@ -722,6 +730,7 @@ impl<E: EventSource> PersistLearner<E> {
             metrics,
             cmd_rx,
             pending_reads: Vec::new(),
+            fetching_reads: Vec::new(),
             linearizing_reads: BTreeMap::new(),
         };
         let handle = PersistLearnerHandle::new(cmd_tx);
@@ -750,27 +759,28 @@ impl<E: EventSource> PersistLearner<E> {
 
     /// An upper fetch completed: assign linearization targets and wake reads.
     ///
-    /// Moves all pending reads into the linearizing set with the given upper
-    /// as their target, then checks whether any can already be served.
+    /// Only the reads that were on the bus when the fetch was issued (moved
+    /// into `fetching_reads` by [`prepare_fetch`](Self::prepare_fetch)) get
+    /// this upper as their target. Reads that arrived after the fetch was
+    /// issued stay in `pending_reads` and will ride the next fetch.
     pub fn on_upper(&mut self, upper: Antichain<u64>) {
         let target = match upper.as_option().copied() {
             Some(t) => t,
             None => {
                 // Upper is [] (sealed). The shard is closed — no more writes
-                // will arrive. Drop all pending reads without replying; the
+                // will arrive. Drop every queued read without replying; the
                 // handle interprets a dropped reply as LearnerError::DroppedReply,
                 // and the router retries against the new shard's learners.
+                self.fetching_reads.clear();
                 self.pending_reads.clear();
                 return;
             }
         };
-        // Assign the fetched upper as the linearization target for all pending
-        // reads, then check if any can be served immediately.
-        let pending = std::mem::take(&mut self.pending_reads);
+        let boarding = std::mem::take(&mut self.fetching_reads);
         self.linearizing_reads
             .entry(target)
             .or_default()
-            .extend(pending);
+            .extend(boarding);
         self.wake_linearizing_reads();
     }
 
@@ -783,12 +793,20 @@ impl<E: EventSource> PersistLearner<E> {
         self.handle_command(cmd);
     }
 
-    /// Returns true if there are reads waiting for an upper fetch.
+    /// Board the bus: if reads are waiting and no fetch is in flight, move
+    /// every waiting read onto the current fetch and return true. The caller
+    /// should then issue a `fetch_recent_upper()` and deliver the result via
+    /// [`on_upper`](Self::on_upper).
     ///
-    /// When this returns true, the caller should fetch the shard upper and
-    /// pass it to [`on_upper`](Self::on_upper).
-    pub fn has_pending_reads(&self) -> bool {
-        !self.pending_reads.is_empty()
+    /// Returns false when there is nothing to do — either no reads are
+    /// waiting, or a previous fetch is still in flight (in which case the
+    /// waiting reads ride that fetch's result, not a new one).
+    pub fn prepare_fetch(&mut self) -> bool {
+        if self.pending_reads.is_empty() || !self.fetching_reads.is_empty() {
+            return false;
+        }
+        self.fetching_reads.append(&mut self.pending_reads);
+        true
     }
 
     /// Returns true if there are pending retractions waiting to be flushed.
@@ -826,14 +844,16 @@ impl<E: EventSource> PersistLearner<E> {
             }
         });
 
-        let mut fetch_in_flight = false;
-
         loop {
-            // Request an upper fetch if reads are waiting and no fetch is
-            // already in flight.
-            if self.has_pending_reads() && !fetch_in_flight {
-                if upper_request_tx.try_send(()).is_ok() {
-                    fetch_in_flight = true;
+            // If reads are waiting and no fetch is in flight, board them
+            // onto a new fetch and issue it. A fetch is in flight iff
+            // `fetching_reads` is non-empty (cleared by `on_upper`).
+            if self.prepare_fetch() {
+                if upper_request_tx.try_send(()).is_err() {
+                    // Channel is full or closed. Put the reads back on the
+                    // platform and try again next iteration. This path is
+                    // not expected under normal operation.
+                    self.pending_reads.append(&mut self.fetching_reads);
                 }
             }
 
@@ -851,7 +871,6 @@ impl<E: EventSource> PersistLearner<E> {
                 }
                 // cancel-safety: channel recv is cancel-safe per tokio docs
                 Some(upper) = upper_result_rx.recv() => {
-                    fetch_in_flight = false;
                     self.on_upper(upper);
                 }
                 // cancel-safety: per tokio docs
@@ -1355,5 +1374,118 @@ impl PersistLearner<ChannelEventSource> {
         });
 
         (handle, task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mz_ore::metrics::MetricsRegistry;
+
+    /// An `EventSource` that never produces events. Useful for tests that
+    /// drive the learner via the event-level API directly.
+    struct NoEvents;
+
+    #[async_trait::async_trait]
+    impl EventSource for NoEvents {
+        async fn next_events(
+            &mut self,
+        ) -> Option<Vec<ListenEvent<u64, ((OrderedKey, Proposal), u64, i64)>>> {
+            std::future::pending().await
+        }
+    }
+
+    fn new_test_learner() -> PersistLearner<NoEvents> {
+        let metrics = LearnerMetrics::register(&MetricsRegistry::new());
+        let (learner, _handle) = PersistLearner::new_with_event_source(
+            PersistLearnerConfig::default(),
+            NoEvents,
+            metrics,
+        );
+        learner
+    }
+
+    fn head(key: &str) -> (PersistLearnerCommand, oneshot::Receiver<ProtoHeadResponse>) {
+        let (tx, rx) = oneshot::channel();
+        let cmd = PersistLearnerCommand::Head {
+            key: key.to_string(),
+            reply: tx,
+            received_at: tokio::time::Instant::now(),
+        };
+        (cmd, rx)
+    }
+
+    /// A read that arrives after an upper fetch has been issued must not
+    /// share that fetch's linearization target. Otherwise the read could be
+    /// linearized at an upper captured before the read was invoked, which
+    /// violates linearizability: a write that completed before the read was
+    /// invoked could be missed.
+    #[mz_ore::test(tokio::test)]
+    async fn mid_flight_read_waits_for_next_bus() {
+        let mut learner = new_test_learner();
+
+        // R1 arrives and catches the first bus.
+        let (cmd1, mut rx1) = head("k");
+        learner.on_command(cmd1);
+        assert!(learner.prepare_fetch(), "R1 should board the bus");
+
+        // R2 arrives while the first fetch is still in flight. It must not
+        // board that bus, so a second prepare_fetch() while the first is
+        // outstanding must return false.
+        let (cmd2, mut rx2) = head("k");
+        learner.on_command(cmd2);
+        assert!(
+            !learner.prepare_fetch(),
+            "R2 must wait: the current fetch might have captured an upper before R2 was invoked"
+        );
+
+        // First fetch returns upper = 5. Deliver progress past 5 so R1 wakes.
+        learner.on_upper(Antichain::from_elem(5));
+        learner.on_events(vec![ListenEvent::Progress(Antichain::from_elem(5))]);
+
+        assert!(
+            rx1.try_recv().is_ok(),
+            "R1 should be served by the first fetch"
+        );
+        assert!(
+            matches!(rx2.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "R2 must not be served by the first fetch"
+        );
+
+        // Second bus leaves. R2 boards this one.
+        assert!(learner.prepare_fetch(), "R2 should board the next bus");
+        learner.on_upper(Antichain::from_elem(6));
+        learner.on_events(vec![ListenEvent::Progress(Antichain::from_elem(6))]);
+
+        assert!(
+            rx2.try_recv().is_ok(),
+            "R2 should be served by the second fetch"
+        );
+    }
+
+    /// prepare_fetch must batch concurrently-queued reads: every read that
+    /// arrived before the fetch was issued rides the same fetch.
+    #[mz_ore::test(tokio::test)]
+    async fn reads_queued_before_fetch_share_the_bus() {
+        let mut learner = new_test_learner();
+
+        let (cmd1, mut rx1) = head("k");
+        let (cmd2, mut rx2) = head("k");
+        learner.on_command(cmd1);
+        learner.on_command(cmd2);
+
+        assert!(learner.prepare_fetch());
+        learner.on_upper(Antichain::from_elem(5));
+        learner.on_events(vec![ListenEvent::Progress(Antichain::from_elem(5))]);
+
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+    }
+
+    /// prepare_fetch must be a no-op when nothing is waiting.
+    #[mz_ore::test(tokio::test)]
+    async fn prepare_fetch_no_reads() {
+        let mut learner = new_test_learner();
+        assert!(!learner.prepare_fetch());
     }
 }

@@ -104,9 +104,12 @@ A read issued at time T returns state that includes the effects of all
 proposals committed before T. If a CAS commits and the client subsequently
 issues a `head` for the same client shard, the result reflects the CAS.
 
-*Implemented by:* The bus stop linearization protocol; reads wait for the
-learner's listen frontier to reach the fetched log-shard upper at read issue
-time.
+*Implemented by:* The bus-stop linearization protocol. A read may only ride
+a `fetch_recent_upper()` call that was issued at or after the read was
+invoked. Reads arriving after a fetch is in flight wait for the next
+fetch; otherwise the captured upper could predate the read's invocation
+and miss writes the client has already observed as durable. See
+[01_protocol.md](01_protocol.md#read-linearization).
 
 **R2. Snapshot consistency.**
 A read returns a consistent snapshot of client shard state. `head` and

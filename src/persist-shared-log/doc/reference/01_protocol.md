@@ -195,22 +195,34 @@ returned key sets, and deduplicates them.
 
 ## Read Linearization
 
-Reads linearize against the current log-shard upper at read-issue time.
+Reads linearize against the current log-shard upper, using a bus-stop
+pattern to amortize the fetch cost across concurrent reads.
 
 1. A read command is queued in `pending_reads`.
-2. The learner fetches the current log-shard upper with
-   `fetch_recent_upper()`.
-3. All reads waiting at that moment share the same linearization target, so
-   one `fetch_recent_upper()` call covers a batch of reads.
-4. The learner waits until its listen frontier reaches that target.
+2. When no upper fetch is in flight, the learner drains `pending_reads` into
+   `fetching_reads` and issues `fetch_recent_upper()`. Every read on the bus
+   at that moment will share the returned upper as its linearization target.
+3. Reads that arrive while the fetch is in flight stay in `pending_reads`.
+   They do not board the current bus. They will ride the next fetch.
+4. When the fetch returns, the learner assigns the upper to every read in
+   `fetching_reads` and waits until its listen frontier reaches that target.
 5. The read is served from in-memory state.
 
-The returned read reflects every committed batch with timestamp `< upper` at
-the time the upper was fetched.
+The split between "on the current bus" and "waiting for the next bus" is
+load-bearing. `fetch_recent_upper()` captures the shard upper at some
+moment between when the call is issued and when it returns. A read invoked
+after the call was issued may have observed a write that completed before
+the read but was not reflected in the captured upper. Servicing that read
+at the captured upper would miss the write and violate linearizability.
+Only reads that were already queued when the bus left can safely ride this
+fetch.
+
+The returned read reflects every committed batch with timestamp `< upper`
+at the time the upper was fetched.
 
 If the fetched upper is the empty antichain, the shard has been sealed. The
-learner drops the request, and the router retries against the new routing
-once it has one.
+learner drops every queued read (both on the current bus and waiting for
+the next), and the router retries against the new routing once it has one.
 
 ## Retractions
 
