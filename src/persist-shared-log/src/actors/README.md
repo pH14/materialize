@@ -1,132 +1,166 @@
 # Actors
 
-The shared log service is built from four message-driven actors. Each is an
-async task that owns private state and communicates exclusively through typed
-command channels (mpsc). This directory contains their implementations.
+The shared log service is built from four message-driven actors. Each actor
+is an async task that owns private state and communicates through typed
+channels. This directory contains the implementations.
 
 ## Why actors?
 
-**No shared mutable state.** All state is owned by a single task — no mutexes,
-no lock ordering concerns. Each actor processes one command at a time, making
-the state machine straightforward to reason about.
-
-**Deterministic simulation testing.** Because actors interact only through
-message channels and persist APIs (which go through turmoil's simulated
-network), the entire system can run under turmoil with a fixed seed and produce
-identical traces. This is the foundation of the DST suite in `tests/`.
+- No shared mutable state. Each actor owns its state machine directly.
+- Deterministic simulation testing. Message passing and persist APIs compose
+  cleanly with turmoil and the DST harness.
+- Clear boundaries. Control-plane concerns stay in the metashard and router;
+  steady-state data-plane concerns stay in the acceptor and learner.
 
 ## The actors
 
 ### Meta
 
-Partition map authority. Manages the mapping from key ranges to log shards.
-Persists its state to a dedicated persist shard (the "meta shard") for crash
-recovery. Drives reconfiguration (split/merge) and creates actors for new
-shards via the `ActorFactory`.
+The metashard is the control-plane authority.
 
-### Acceptor
+Responsibilities:
 
-Blind group commit. Receives CAS and truncate proposals, batches them, and
-flushes to a persist shard. Returns receipts (batch number + position) but
-does NOT evaluate CAS — proposals are appended unconditionally. The learner
-evaluates them during playback.
+- persist the current `MetaState` in the meta shard
+- claim leadership by CAS-bumping `leader_id`
+- reject overlapping reconfigurations when `start_state.is_some()`
+- create new acceptors and learners
+- seal predecessor shards and commit the new routing
 
-### Learner
-
-Replicated state machine. Each learner subscribes to the acceptor's persist
-shard and deterministically replays the same ordered log of proposals. Because
-every replica processes the same log in the same order, they all converge to
-identical state — any replica can serve reads. During playback, the learner
-evaluates CAS preconditions, materializes state, and serves reads and result
-queries.
+The metashard is the only actor that coordinates reconfiguration.
 
 ### Router
 
-Client-facing entry point. Clients connect to the router, which routes each
-request to the correct acceptor or learner based on the partition map.
-Subscribes to the meta shard for partition map updates.
+The router is the client-facing entry point.
+
+Responsibilities:
+
+- serve the `PersistSharedLog` RPC surface
+- subscribe to the meta shard in the background
+- cache a stable `PartitionMap`
+- route writes to the correct acceptor
+- route reads and await-result requests to the correct learner
+- retry requests when a shard is sealed or routing changes
+
+Routers ignore meta-shard updates while `start_state.is_some()`. Traffic only
+moves after the metashard commits a stable state.
+
+### Acceptor
+
+The acceptor is the single writer for one log shard.
+
+Responsibilities:
+
+- accept `ProtoLogProposal` appends
+- batch and flush proposals with `compare_and_append`
+- return `ProtoAppendResponse`
+- during reconfiguration, write batch 1 bulk snapshot and batch 2 delta
+  snapshot before regular traffic starts
+- poll a `RetractionSource` and flush returned entries as `-1` diffs
+
+The acceptor never evaluates CAS preconditions. It treats `Proposal` as
+opaque bytes.
+
+### Learner
+
+The learner is the replicated state machine for one log shard.
+
+Responsibilities:
+
+- subscribe to one log shard
+- decode proposals and apply CAS or truncate semantics
+- maintain materialized client-shard state in memory
+- serve `head`, `scan`, and `list_keys`
+- answer await-result queries
+- identify pending retractions for dead proposals
+
+Multiple learner replicas may follow the same log shard and converge to the
+same state.
 
 ## Actor relationships
 
+```text
+meta shard
+  ^                       router(s)
+  |                           ^
+  |                           |
+metashard --------------------+
+  |
+  | creates actors / seals predecessors
+  v
+log shard N <----- acceptor N
+    |
+    +-----> learner N replica 0
+    +-----> learner N replica 1
+
+router
+  -> acceptor N for CompareAndSet / Truncate
+  -> learner N for Head / Scan / ListKeys / await-result
 ```
-  ┌─ meta shard ──────────────────────────────────────────────┐
-  │                                                           │
-  │  ┌─────────────┐       ┌─────────────────────────────┐    │
-  │  │   Meta      │       │      Meta Persist Shard     │    │
-  │  │ (authority) │──────▶│      (partition map)        │    │
-  │  └─────────────┘       └──────────────┬──────────────┘    │
-  │                                       │                   │
-  └───────────────────────────────────────│───────────────────┘
-                                          │ subscribes to
-                                          ▼
-                                   ┌─────────────┐
-                                   │   Router(s) │
-                                   └──┬───────┬──┘
-                       writes / reads │       │ to each shard range
-                       ┌──────────────┘       └──────────────┐
-                       ▼                                     ▼
-  ┌─ log shard 0 ──────────────────┐  ┌─ log shard 1 ──────────────────┐
-  │                                │  │                                │
-  │  ┌────────────────────┐        │  │  ┌────────────────────┐        │
-  │  │     Acceptor 0     │        │  │  │     Acceptor 1     │        │
-  │  │  (blind commit)    │        │  │  │  (blind commit)    │        │
-  │  └────────┬───────────┘        │  │  └────────┬───────────┘        │
-  │           │ writes to          │  │           │ writes to          │
-  │           ▼                    │  │           ▼                    │
-  │  ┌────────────────────┐        │  │  ┌────────────────────┐        │
-  │  │  Log Persist Shard │        │  │  │  Log Persist Shard │        │
-  │  └──┬─────────────┬───┘        │  │  └──┬─────────────┬───┘        │
-  │     │ subscribes  │ subscribes │  │     │ subscribes  │ subscribes │
-  │     ▼             ▼            │  │     ▼             ▼            │
-  │  ┌──────────┐ ┌──────────┐     │  │  ┌──────────┐ ┌──────────┐     │
-  │  │Learner 0 │ │Learner 1 │     │  │  │Learner 0 │ │Learner 1 │     │
-  │  │(replica) │ │(replica) │     │  │  │(replica) │ │(replica) │     │
-  │  └──────────┘ └──────────┘     │  │  └──────────┘ └──────────┘     │
-  │                                │  │                                │
-  └────────────────────────────────┘  └────────────────────────────────┘
-```
+
+The acceptor and learner know nothing about the metashard or the partition
+map. They operate on a single persist shard identified by `ShardId`. Only the
+metashard and router deal with partition maps, epochs, or multi-shard
+coordination.
 
 ## Persist pubsub groups
 
-Pubsub provides instant write notifications so that subscribers don't have to
-poll consensus. Two groups:
+Pubsub is an optimization for notification latency.
 
-- **Meta shard pubsub** — The meta actor hosts a pubsub server. Routers connect
-  as clients. When the meta actor persists a new partition map, each router's
-  routing task sees it instantly.
+- `Meta shard pubsub`: routers subscribe so they notice committed routing
+  updates quickly.
+- `Per-log-shard pubsub`: learners subscribe so a freshly flushed batch
+  becomes visible without waiting on consensus polling.
 
-- **Per-shard pubsub** — Each acceptor hosts a pubsub server. Its learner(s)
-  connect as clients. When the acceptor flushes a batch, the learner sees it
-  instantly.
+Pubsub does not change the ownership model:
 
-## Boundaries
-
-The acceptor and learner know nothing about the meta actor, partition maps, or
-multi-shard coordination. They operate on a single persist shard identified by
-`ShardId`. The meta actor and router are the only actors that deal with
-partition maps and routing.
+- metashard writes the meta shard
+- acceptor writes the log shard
+- learner remains read-only
 
 ## Data model
 
 ### Log shards
 
-Each log persist shard stores proposals in differential format:
+Each log shard stores proposals in differential form:
 
-- **K**: `OrderedKey` — `(batch_id, position, shard)` StructArray giving a
-  stable total order through compaction
-- **V**: `Proposal` — serialized protobuf bytes
-- **T**: `u64` — incremented by 1 per batch, in lock-step with persist upper
-- **D**: `i64` — `+1` for proposals, `-1` for learner retractions
+- `K`: `OrderedKey` = `(batch_id, position, shard)`
+- `V`: `Proposal` = serialized `ProtoLogProposal`
+- `T`: `u64` append timestamp
+- `D`: `i64`, where `+1` adds a proposal and `-1` retracts one
+
+The acceptor is the only writer. Learners discover retractions, but the
+acceptor is the actor that flushes them.
 
 ### Meta shard
 
-The meta persist shard uses `MetaState` as the key type and `()` as the value.
-Each write retracts the previous `MetaState` and appends the new one in the
-same CAS batch, keeping the shard bounded to a single live entry.
+The meta shard stores:
+
+- `K`: `MetaState`
+- `V`: `()`
+- `T`: `u64`
+- `D`: `i64`, where `+1` adds the new state and `-1` retracts the old one
+
+Each durable update keeps exactly one live `MetaState` row.
 
 `MetaState` contains:
 
-- **epoch** — monotonically increasing configuration version
-- **leader_id** — current leader (incremented on each ClaimLeadership)
-- **target_state** — the live (or desired, during reconfig) shard set
-- **start_state** — `Some` during an active reconfiguration (outgoing shards); `None` when stable
+- `epoch`: monotonically increasing configuration version
+- `leader_id`: durable fencing token for the current metashard leader
+- `target_state`: the current or desired shard set
+- `start_state`: `None` when stable, `Some(old_state)` while a
+  reconfiguration is in progress
+
+## Why this split matters
+
+This layout keeps the steady-state actors simple:
+
+- one acceptor writes one shard
+- one learner tails one shard
+
+And it keeps the complex coordination in one place:
+
+- the metashard owns leader fencing and reconfiguration
+- the router owns request routing and retry
+
+That separation is what lets the implementation scale horizontally without
+teaching the acceptor or learner about global shard topology.
