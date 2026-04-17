@@ -98,6 +98,13 @@ impl ProcessActorFactory {
 
     /// Spawn a supervisor task that runs a child process in a restart loop.
     /// Returns the task handle so it can be aborted to stop the child.
+    ///
+    /// Children are placed in a new session via `setsid()` in `pre_exec`, so
+    /// they survive signals delivered to the parent's process group — e.g.
+    /// Ctrl-C on the meta-actor's terminal reaches the meta process but not
+    /// the acceptors/learners it spawned. On meta restart, the re-attach path
+    /// in `create_acceptor` / `create_learner` picks the surviving children
+    /// back up via their Unix sockets.
     fn spawn_supervisor(
         binary: PathBuf,
         args: Vec<String>,
@@ -114,7 +121,17 @@ impl ProcessActorFactory {
                 }
 
                 info!(%label, ?binary, ?args, "spawning child process");
-                let mut child = match Command::new(&binary).args(&args).spawn() {
+                let mut command = Command::new(&binary);
+                command.args(&args);
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut child = match command.spawn() {
                     Ok(child) => child,
                     Err(e) => {
                         error!(%label, "failed to spawn child: {e}");
@@ -147,6 +164,28 @@ impl ProcessActorFactory {
             }
         })
     }
+
+    /// Try to connect to an existing child listening on `socket_path`. Returns
+    /// `Some(channel)` if the connection succeeds within the short timeout,
+    /// `None` if the socket is missing or unresponsive (stale).
+    async fn try_reattach(socket_path: &Path) -> Option<tonic::transport::Channel> {
+        if !socket_path.exists() {
+            return None;
+        }
+        let socket_str = socket_path.to_string_lossy().to_string();
+        // Short timeout: a live child responds in milliseconds on localhost UDS.
+        // Anything longer is almost certainly a stale socket from a previous run.
+        match connect_uds_with_retry(&socket_str, Duration::from_millis(500)).await {
+            Ok(channel) => Some(channel),
+            Err(_) => {
+                // Stale socket; clean it up so the spawn path can rebind.
+                let pid_file = Self::pid_file(socket_path);
+                let _ = std::fs::remove_file(socket_path);
+                let _ = std::fs::remove_file(&pid_file);
+                None
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -167,6 +206,21 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
         }
 
         let socket_path = self.acceptor_socket(shard_id);
+
+        // Re-attach to a child from a previous run if its socket is still live.
+        // We don't start a supervisor in that case — if the child dies while
+        // we're attached, it stays dead until the next meta restart. Good
+        // enough for demo / dev workflows; production would want supervision.
+        if let Some(channel) = Self::try_reattach(&socket_path).await {
+            info!(%shard_id, "re-attached to existing acceptor process");
+            let handle = GrpcAcceptorHandle::from_channel(channel);
+            self.acceptors
+                .lock()
+                .unwrap()
+                .insert(shard_id, handle.clone());
+            return Ok(handle);
+        }
+
         let mut args = vec![
             "acceptor".to_string(),
             "--run-dir".to_string(),
@@ -227,6 +281,18 @@ impl crate::factory::ActorFactory for ProcessActorFactory {
         }
 
         let socket_path = self.learner_socket(shard_id);
+
+        // Re-attach to a surviving child from a previous run if possible.
+        if let Some(channel) = Self::try_reattach(&socket_path).await {
+            info!(%shard_id, "re-attached to existing learner process");
+            let handle = GrpcLearnerHandle::from_channel(channel);
+            self.learners
+                .lock()
+                .unwrap()
+                .insert(shard_id, handle.clone());
+            return Ok(handle);
+        }
+
         let args = vec![
             "learner".to_string(),
             "--run-dir".to_string(),
