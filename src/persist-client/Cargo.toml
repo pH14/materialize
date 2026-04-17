@@ -63,6 +63,8 @@ tokio-metrics = "0.4.9"
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tonic = "0.14.2"
 tonic-prost = "0.14.5"
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 tracing = "0.1.44"
 uuid = { version = "1.19.0", features = ["v4"] }
 

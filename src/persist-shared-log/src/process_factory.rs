@@ -1,0 +1,368 @@
+// Copyright Materialize, Inc. and contributors. All rights reserved.
+//
+// Use of this software is governed by the Business Source License
+// included in the LICENSE file.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0.
+
+//! Process-based actor factory: spawns acceptors and learners as child OS
+//! processes and connects to them over Unix domain sockets.
+//!
+//! Each child process runs the same `mz-persist-shared-log` binary with a
+//! subcommand (`acceptor` or `learner`) and `--run-dir` pointing to the shared
+//! socket directory. A supervisor task monitors each child and restarts it on
+//! crash.
+//!
+//! Used by the metashard in distributed mode to automatically bring up actors
+//! when the partition map is created or changes.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use timely::progress::Antichain;
+use tokio::process::Command;
+use tracing::{error, info, warn};
+
+use mz_persist_client::ShardId;
+
+use crate::rpc::{GrpcAcceptorHandle, GrpcLearnerHandle};
+use crate::uds::connect_uds_with_retry;
+use crate::RangeAssignment;
+
+/// Factory that spawns acceptor and learner actors as child OS processes.
+///
+/// Each actor gets its own supervisor task that restarts the child on crash.
+/// Handles are obtained by connecting to the child's Unix domain socket after
+/// it starts listening.
+pub struct ProcessActorFactory {
+    /// Path to the mz-persist-shared-log binary.
+    binary: PathBuf,
+    /// Shared run directory for Unix sockets.
+    run_dir: PathBuf,
+    /// Persist blob storage URL, passed to child processes.
+    blob_url: String,
+    /// Persist consensus storage URL, passed to child processes.
+    consensus_url: String,
+    /// Timeout for connecting to a newly spawned child's Unix socket.
+    connect_timeout: Duration,
+    /// Cached acceptor handles (keyed by shard ID).
+    acceptors: Mutex<BTreeMap<ShardId, GrpcAcceptorHandle>>,
+    /// Cached learner handles (keyed by shard ID).
+    learners: Mutex<BTreeMap<ShardId, GrpcLearnerHandle>>,
+    /// Supervisor task handles for each shard (acceptor + learner).
+    /// Dropping these aborts the supervisor, which kills the child process.
+    supervisors: Mutex<BTreeMap<ShardId, Vec<mz_ore::task::AbortOnDropHandle<()>>>>,
+}
+
+impl ProcessActorFactory {
+    pub fn new(
+        binary: PathBuf,
+        run_dir: PathBuf,
+        blob_url: String,
+        consensus_url: String,
+    ) -> Self {
+        ProcessActorFactory {
+            binary,
+            run_dir,
+            blob_url,
+            consensus_url,
+            connect_timeout: Duration::from_secs(30),
+            acceptors: Mutex::new(BTreeMap::new()),
+            learners: Mutex::new(BTreeMap::new()),
+            supervisors: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Socket path for an acceptor's gRPC server.
+    fn acceptor_socket(&self, shard_id: ShardId) -> PathBuf {
+        self.run_dir
+            .join(format!("acceptor-{shard_id}"))
+            .join("grpc.sock")
+    }
+
+    /// Socket path for a learner's gRPC server (replica 0).
+    fn learner_socket(&self, shard_id: ShardId) -> PathBuf {
+        self.run_dir
+            .join(format!("learner-{shard_id}-0"))
+            .join("grpc.sock")
+    }
+
+    /// PID file path for a child process.
+    fn pid_file(socket_path: &Path) -> PathBuf {
+        socket_path.with_file_name("pid")
+    }
+
+    /// Spawn a supervisor task that runs a child process in a restart loop.
+    /// Returns the task handle so it can be aborted to stop the child.
+    ///
+    /// Children are placed in a new session via `setsid()` in `pre_exec`, so
+    /// they survive signals delivered to the parent's process group — e.g.
+    /// Ctrl-C on the meta-actor's terminal reaches the meta process but not
+    /// the acceptors/learners it spawned. On meta restart, the re-attach path
+    /// in `create_acceptor` / `create_learner` picks the surviving children
+    /// back up via their Unix sockets.
+    fn spawn_supervisor(
+        binary: PathBuf,
+        args: Vec<String>,
+        socket_path: PathBuf,
+        label: String,
+    ) -> mz_ore::task::JoinHandle<()> {
+        let pid_file = Self::pid_file(&socket_path);
+        let task_name = format!("supervisor-{label}");
+        mz_ore::task::spawn(|| task_name, async move {
+            loop {
+                // Ensure parent directory exists for the socket.
+                if let Some(parent) = socket_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                info!(%label, ?binary, ?args, "spawning child process");
+                let mut command = Command::new(&binary);
+                command.args(&args);
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut child = match command.spawn() {
+                    Ok(child) => child,
+                    Err(e) => {
+                        error!(%label, "failed to spawn child: {e}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+
+                // Write PID file for debugging / orphan recovery.
+                if let Some(pid) = child.id() {
+                    let pid_str: String = pid.to_string();
+                    let _ = std::fs::write(&pid_file, pid_str);
+                }
+
+                // Wait for the child to exit.
+                match child.wait().await {
+                    Ok(status) => {
+                        warn!(%label, %status, "child process exited, restarting in 1s");
+                    }
+                    Err(e) => {
+                        error!(%label, "error waiting for child: {e}, restarting in 1s");
+                    }
+                }
+
+                // Clean up stale socket before restart.
+                let _ = std::fs::remove_file(&socket_path);
+                let _ = std::fs::remove_file(&pid_file);
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    }
+
+    /// Try to connect to an existing child listening on `socket_path`. Returns
+    /// `Some(channel)` if the connection succeeds within the short timeout,
+    /// `None` if the socket is missing or unresponsive (stale).
+    async fn try_reattach(socket_path: &Path) -> Option<tonic::transport::Channel> {
+        if !socket_path.exists() {
+            return None;
+        }
+        let socket_str = socket_path.to_string_lossy().to_string();
+        // Short timeout: a live child responds in milliseconds on localhost UDS.
+        // Anything longer is almost certainly a stale socket from a previous run.
+        match connect_uds_with_retry(&socket_str, Duration::from_millis(500)).await {
+            Ok(channel) => Some(channel),
+            Err(_) => {
+                // Stale socket; clean it up so the spawn path can rebind.
+                let pid_file = Self::pid_file(socket_path);
+                let _ = std::fs::remove_file(socket_path);
+                let _ = std::fs::remove_file(&pid_file);
+                None
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::factory::ActorFactory for ProcessActorFactory {
+    type A = GrpcAcceptorHandle;
+    type L = GrpcLearnerHandle;
+
+    async fn create_acceptor(
+        &self,
+        shard_id: ShardId,
+        epoch: u64,
+        predecessors: Vec<(ShardId, Antichain<u64>)>,
+        range: RangeAssignment,
+    ) -> Result<GrpcAcceptorHandle, String> {
+        // Return cached handle if already running.
+        if let Some(handle) = self.acceptors.lock().unwrap().get(&shard_id) {
+            return Ok(handle.clone());
+        }
+
+        let socket_path = self.acceptor_socket(shard_id);
+
+        // Re-attach to a child from a previous run if its socket is still live.
+        // We don't start a supervisor in that case — if the child dies while
+        // we're attached, it stays dead until the next meta restart. Good
+        // enough for demo / dev workflows; production would want supervision.
+        if let Some(channel) = Self::try_reattach(&socket_path).await {
+            info!(%shard_id, "re-attached to existing acceptor process");
+            let handle = GrpcAcceptorHandle::from_channel(channel);
+            self.acceptors
+                .lock()
+                .unwrap()
+                .insert(shard_id, handle.clone());
+            return Ok(handle);
+        }
+
+        let mut args = vec![
+            "acceptor".to_string(),
+            "--run-dir".to_string(),
+            self.run_dir.to_string_lossy().to_string(),
+            "--shard-id".to_string(),
+            shard_id.to_string(),
+            "--epoch".to_string(),
+            epoch.to_string(),
+            "--range-lo".to_string(),
+            range.lo.to_string(),
+            "--range-hi".to_string(),
+            range.hi_exclusive.to_string(),
+            "--blob-url".to_string(),
+            self.blob_url.clone(),
+            "--consensus-url".to_string(),
+            self.consensus_url.clone(),
+            // Bind metrics to a random port to avoid conflicts between children.
+            "--metrics-listen-addr".to_string(),
+            "0.0.0.0:0".to_string(),
+        ];
+
+        // Pass predecessor specs so the acceptor snapshots data from old shards.
+        for (pred_shard, since) in &predecessors {
+            let since_val = since.elements().first().copied().unwrap_or(0);
+            args.push("--predecessor".to_string());
+            args.push(format!("{pred_shard}@{since_val}"));
+        }
+
+        let supervisor = Self::spawn_supervisor(
+            self.binary.clone(),
+            args,
+            socket_path.clone(),
+            format!("acceptor-{shard_id}"),
+        );
+        self.supervisors
+            .lock()
+            .unwrap()
+            .entry(shard_id)
+            .or_default()
+            .push(supervisor.abort_on_drop());
+
+        // Wait for the child to start listening on the Unix socket.
+        let socket_str = socket_path.to_string_lossy().to_string();
+        let channel = connect_uds_with_retry(&socket_str, self.connect_timeout).await?;
+        let handle = GrpcAcceptorHandle::from_channel(channel);
+        self.acceptors
+            .lock()
+            .unwrap()
+            .insert(shard_id, handle.clone());
+        info!(%shard_id, "acceptor process ready");
+        Ok(handle)
+    }
+
+    async fn create_learner(&self, shard_id: ShardId) -> Result<GrpcLearnerHandle, String> {
+        // Return cached handle if already running.
+        if let Some(handle) = self.learners.lock().unwrap().get(&shard_id) {
+            return Ok(handle.clone());
+        }
+
+        let socket_path = self.learner_socket(shard_id);
+
+        // Re-attach to a surviving child from a previous run if possible.
+        if let Some(channel) = Self::try_reattach(&socket_path).await {
+            info!(%shard_id, "re-attached to existing learner process");
+            let handle = GrpcLearnerHandle::from_channel(channel);
+            self.learners
+                .lock()
+                .unwrap()
+                .insert(shard_id, handle.clone());
+            return Ok(handle);
+        }
+
+        let args = vec![
+            "learner".to_string(),
+            "--run-dir".to_string(),
+            self.run_dir.to_string_lossy().to_string(),
+            "--shard-id".to_string(),
+            shard_id.to_string(),
+            "--replica-id".to_string(),
+            "0".to_string(),
+            "--blob-url".to_string(),
+            self.blob_url.clone(),
+            "--consensus-url".to_string(),
+            self.consensus_url.clone(),
+            // Bind metrics to a random port to avoid conflicts between children.
+            "--metrics-listen-addr".to_string(),
+            "0.0.0.0:0".to_string(),
+        ];
+
+        let supervisor = Self::spawn_supervisor(
+            self.binary.clone(),
+            args,
+            socket_path.clone(),
+            format!("learner-{shard_id}-0"),
+        );
+        self.supervisors
+            .lock()
+            .unwrap()
+            .entry(shard_id)
+            .or_default()
+            .push(supervisor.abort_on_drop());
+
+        // Wait for the child to start listening on the Unix socket.
+        let socket_str = socket_path.to_string_lossy().to_string();
+        let channel = connect_uds_with_retry(&socket_str, self.connect_timeout).await?;
+        let handle = GrpcLearnerHandle::from_channel(channel);
+        self.learners
+            .lock()
+            .unwrap()
+            .insert(shard_id, handle.clone());
+        info!(%shard_id, "learner process ready");
+        Ok(handle)
+    }
+
+    async fn stop_shard(&self, shard_id: ShardId) {
+        // Kill child processes by reading their PID files and sending SIGKILL.
+        // Must happen BEFORE aborting supervisors — otherwise the supervisor
+        // might restart the child between our kill and the abort.
+        let acceptor_dir = self.run_dir.join(format!("acceptor-{shard_id}"));
+        let learner_dir = self.run_dir.join(format!("learner-{shard_id}-0"));
+        let pubsub_dir = self.run_dir.join(format!("pubsub-{shard_id}"));
+
+        for dir in [&acceptor_dir, &learner_dir] {
+            let pid_file = dir.join("pid");
+            if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    info!(%shard_id, pid, ?dir, "killing child process");
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                }
+            }
+        }
+
+        // Abort supervisor tasks so they don't restart the killed children.
+        self.supervisors.lock().unwrap().remove(&shard_id);
+        self.acceptors.lock().unwrap().remove(&shard_id);
+        self.learners.lock().unwrap().remove(&shard_id);
+
+        // Clean up socket and PID files.
+        for dir in [&acceptor_dir, &learner_dir, &pubsub_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        info!(%shard_id, "stopped shard processes");
+    }
+}

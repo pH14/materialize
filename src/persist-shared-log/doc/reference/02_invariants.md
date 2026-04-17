@@ -1,0 +1,289 @@
+# Persist Shared Log: Invariants & Properties
+
+This document enumerates the properties the system must maintain. These
+properties are the source of truth for formal verification (Stateright model
+checking), deterministic simulation testing (DST) assertions, and stress
+test acceptance criteria.
+
+## Property Classification
+
+Properties are organized into three tiers:
+
+- _Safety_: Must always hold. A violation is a correctness bug.
+- _Liveness_: Must eventually hold under fair scheduling. A violation
+  indicates the system is stuck.
+- _Performance_: Must hold within bounds under specified load. A violation
+  is a scalability concern.
+
+## Safety Properties
+
+### Log Properties
+
+**L1. Batch total order.**
+Batches in the log are totally ordered by batch number. If batch A has
+`batch_number < batch B`, then A precedes B.
+
+*Follows from:* Persist's `compare_and_append` with frontier advancement.
+
+**L2. Batch atomicity.**
+All proposals in a batch are durably logged atomically. Either all proposals
+in a batch are present in the log, or none are.
+
+*Follows from:* Persist's `compare_and_append` atomicity.
+
+**L3. Within-batch order.**
+Proposals within a batch are ordered by position (0-indexed). This order is
+deterministic and stable; it is the insertion order from the acceptor's
+pending buffer at flush time.
+
+**L4. Differential log semantics.**
+Log shards are differential collections. The acceptor appends `+1` rows for
+new proposals and later appends `-1` rows to retract proposals identified by
+learners. A `-1` row only removes a previously written proposal; the
+retraction pipeline does not invent new proposal bodies or reorder surviving
+history.
+
+**L5. No duplicate batches.**
+Each batch number appears exactly once in the log. Persist's frontier
+advancement prevents two `compare_and_append` calls from both succeeding at
+the same timestamp.
+
+### CAS Evaluation Properties
+
+**C1. Deterministic evaluation.**
+Given the same log prefix (batches 0..N), all learners produce identical
+client shard state. CAS evaluation is a pure function of the log.
+
+This is the fundamental correctness property. It allows multiple learners
+to independently evaluate proposals and agree on results.
+
+**C2. Linearizable CAS.**
+If a CAS proposal P commits (its precondition matched), then P's effect is
+visible to all subsequent proposals for the same client shard. "Subsequent"
+means later in batch order, or at a later position within the same batch.
+
+**C3. CAS precondition check.**
+A CAS proposal with `expected = Some(s)` commits if and only if the current
+head seqno for the client shard equals `s`. A CAS proposal with
+`expected = None` commits if and only if the client shard has no entries.
+
+**C4. Client shard independence.**
+A proposal for client shard A never affects the evaluation outcome of a
+proposal for client shard B. Formally: removing all proposals for client
+shard A from the log does not change any evaluation result for client
+shard B.
+
+**C5. CAS seqno advancement.**
+If a CAS proposal with `new_seqno = s` commits, then the client shard's
+head seqno becomes `s` and remains `s` until the next committed CAS for
+that shard.
+
+### Truncate Properties
+
+Truncate is a log operation: truncate proposals are appended to the log by
+the acceptor and evaluated by the learner during playback, following the
+same write path as CAS proposals. This ensures all learners apply the same
+truncates in the same order, preserving deterministic evaluation (C1).
+
+**T1. Truncate removes old entries.**
+After a truncate with `seqno = s`, the client shard contains no entries
+with `seqno < s`.
+
+**T2. Truncate preserves recent entries.**
+After a truncate with `seqno = s`, all entries with `seqno >= s` remain
+in the client shard.
+
+**T3. Truncate is idempotent.**
+Truncating to a seqno at or below the current minimum seqno results in no
+entries removed.
+
+### Read Properties
+
+**R1. Linearizable reads.**
+A read issued at time T returns state that includes the effects of all
+proposals committed before T. If a CAS commits and the client subsequently
+issues a `head` for the same client shard, the result reflects the CAS.
+
+*Implemented by:* The bus-stop linearization protocol. A read may only ride
+a `fetch_recent_upper()` call that was issued at or after the read was
+invoked. Reads arriving after a fetch is in flight wait for the next
+fetch; otherwise the captured upper could predate the read's invocation
+and miss writes the client has already observed as durable. See
+[01_protocol.md](01_protocol.md#read-linearization).
+
+**R2. Snapshot consistency.**
+A read returns a consistent snapshot of client shard state. `head` and
+`scan` for the same client shard reflect the same set of committed
+proposals.
+
+**R3. Read availability under learner loss.**
+If at least one serving learner is caught up to the linearization target,
+reads are available.
+
+### Acceptor Properties
+
+**A1. Receipt uniqueness.**
+Each `(log_shard, batch_number, position)` receipt in `ProtoAppendResponse`
+corresponds to exactly one appended proposal.
+
+**A2. Receipt validity.**
+If the acceptor returns receipt `(log_shard, b, p, epoch)`, then log shard
+`log_shard` contained a proposal at position `p` in batch `b` when the
+append committed.
+
+### Partition Map Properties
+
+These properties are verified by `stateright_reconfig.rs::ReconfigModel`.
+See [05_horizontal_sharding.md](05_horizontal_sharding.md) for how they are
+maintained in the implementation.
+
+**PM1. Covering.**
+At every epoch, the `PartitionMap` covers the full partition-key space
+`[0x00, 0x100)`. Every possible client shard routes to exactly one log
+shard.
+
+**PM2. Non-overlapping.**
+No two `RangeAssignment`s in the same `PartitionMap` share a partition key.
+Ranges are sorted and disjoint.
+
+**PM3. Epoch monotonicity.**
+Each durable `PartitionMap` write advances `MetaState.epoch`. Epochs never
+decrease.
+
+### Reconfiguration Properties
+
+These properties cover transitions from one `PartitionMap` to the next.
+`RC1`, `RC2`, and `RC5` are verified by
+`stateright_reconfig.rs::ProtocolModel` across split and merge scenarios
+with crash recovery.
+
+**RC1. Seal before reassign.**
+No client shard's writes are routed to a new log shard until every
+predecessor log shard covering the same key range has been sealed. Router
+traffic only switches after the metashard commits `start_state = None`, and
+commit happens after `Seal`.
+
+**RC2. No committed write lost.**
+Every proposal that committed before a reconfiguration remains readable on
+the successor log shard after the reconfiguration completes. Bulk and delta
+setup batches carry forward the live state from every predecessor that
+overlaps the new shard's range.
+
+**RC5. Reconfiguration liveness.**
+Under fair scheduling, a reconfiguration that has persisted its intent
+(`start_state.is_some()`) eventually reaches `start_state = None`, even
+across crashes of the metashard. `reconcile()` is idempotent, so a fresh
+leader picks up where the previous one left off.
+
+## Liveness Properties
+
+**Lv1. CAS progress.**
+If a CAS proposal is submitted to a non-failing acceptor and at least one
+learner is running, the client eventually receives a result
+(`committed = true` or `committed = false`).
+
+**Lv2. Read progress.**
+If a read is submitted to a non-failing learner and the acceptor is
+running (so the learner can fetch the upper for linearization), the read
+eventually returns.
+
+**Lv3. Learner convergence.**
+If a learner is subscribed to the log and the log is advancing, the learner
+eventually processes all batches and its materialized state converges to
+reflect the full log.
+
+**Lv4. Upper advancement.**
+If proposals are being submitted, the log shard upper (next batch number)
+eventually advances.
+
+## Performance Properties (Targets)
+
+These are targets for stress testing. Violations indicate design or
+implementation issues, not correctness bugs.
+
+**P1. Writer throughput.**
+The system sustains 10,000 concurrent writers at 10Hz with 4KiB payloads
+(100,000 proposals/s aggregate).
+
+**P2. Batch efficiency.**
+At 10Hz writer tick rate with 20ms flush interval, each batch contains
+roughly 2,000 proposals (100,000 proposals/s * 0.02s). Batching collapses
+O(writers * tick_rate) into O(1/flush_interval) log writes.
+
+**P3. CAS latency.**
+End-to-end CAS latency (client submit to result received) is bounded by
+flush_interval + learner_lag + network_RTT. At 20ms flush interval with
+co-located learner: p50 < 25ms, p99 < 50ms.
+
+**P4. Read latency.**
+Read latency is bounded by linearization_check_RTT + learner_lag. For a
+caught-up learner: p50 < 5ms, p99 < 15ms.
+
+**P5. Rehydration time.**
+A new learner rehydrating from the latest rollup reaches the current upper
+within seconds. Rollup size and compaction determine this.
+
+## Verification Matrix
+
+Each property is verified by one or more approaches. Cells marked _(planned)_
+describe intended coverage that is not yet implemented.
+
+| Property | Stateright | DST (single-shard) | Sharded Sim | Integration | Code Review |
+|----------|------------|--------------------|-------------|-------------|-------------|
+| L1-L5    |            | Implicit           |             | Implicit    | Yes         |
+| C1       |            | Yes (oracle)       |             | Yes         | Yes         |
+| C2       |            | Sequential only    | Yes‡        |             | Yes         |
+| C3       |            | Yes (oracle)       | Yes‡        |             |             |
+| C4       |            | Yes (oracle)       | Yes‡        | Yes         |             |
+| C5       |            | Yes (oracle)       |             |             |             |
+| T1-T3    |            | Yes (oracle)       |             |             |             |
+| R1       |            | Sequential only    | Yes‡        |             | Yes         |
+| R2       |            | Implicit           |             |             | Yes         |
+| R3       |            |                    |             |             |             |
+| A1-A2    |            | Implicit           |             |             | Yes         |
+| Lv1-Lv4  |            | Yes                |             |             |             |
+| PM1-PM3  | Yes        |                    |             | Yes         | Yes         |
+| RC1      | Yes        |                    |             | Yes         | Yes         |
+| RC2      | Yes†       |                    | Yes‡        | Yes         | Yes         |
+| RC5      | Yes†       |                    |             | Yes (crash) |             |
+| P1-P5    |            |                    |             | _(planned)_ |             |
+
+**Notes:**
+- **‡** `sharded_sim.rs` runs concurrent-history linearizability checking:
+  multiple client tasks submit overlapping CAS/Head operations through the
+  `ShardedService`, with the combined history verified via Stateright's
+  `LinearizabilityTester`. Both single-shard (contention) and cross-reconfig
+  (split mid-flight) variants are tested. Operations that fail with transport
+  errors (unknown outcome) are excluded from the linearizability history
+  rather than misclassified as rejections. The concurrency is cooperative
+  (tokio `current_thread` with yield points), not preemptive.
+- **†** The protocol-level Stateright model verifies RC2 (no data loss) and
+  RC5 (reconfiguration liveness) with crash recovery, across both split and
+  merge scenarios. It models the intent-persisted-but-not-yet-committed window
+  during reconfiguration and the restart path that resumes from durable
+  `start_state=Some(...)`. 813 states explored per scenario. The partition-map
+  model verifies PM1-PM3 and RC1.
+- BUGGIFY fault injection (`fault.rs`) adds injection points at metashard
+  protocol phase boundaries, including the post-commit windows
+  `after_routing_swap` and `after_commit_persist`. Tests exercise both
+  pre-commit boundaries (fault→retry→success) and post-commit boundaries
+  (fault after point-of-no-return, verify data accessible).
+- Integration tests in `sharded.rs` cover scripted reconfiguration scenarios
+  (split, merge, state carryforward, restart recovery, crash-mid-reconfig,
+  concurrent writers) but are not oracle-checked.
+
+## Relationship to Persist's Own Invariants
+
+The shared log builds on persist, which maintains its own invariants
+(verified by the `persist-stateright` model):
+
+- _Upper monotonicity_: The shard upper frontier never decreases.
+- _Since monotonicity_: The shard since frontier never decreases.
+- _Since <= upper_: The since frontier never exceeds the upper.
+- _Write contiguity_: Appended batches are contiguous (no gaps in the
+  frontier).
+
+The shared log depends on these invariants. They are verified by persist's
+own Stateright model and exercised by persist's own test suite. The shared
+log's DST exercises the real persist code, so persist-level bugs would
+surface as shared log test failures.

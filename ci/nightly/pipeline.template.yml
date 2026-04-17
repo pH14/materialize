@@ -449,6 +449,37 @@ steps:
           # `gosu` doesn't work on Graviton
           queue: hetzner-x86-64-4cpu-8gb
 
+      - id: testdrive-shared-log
+        label: "testdrive with persist shared log"
+        depends_on: build-aarch64
+        timeout_in_minutes: 180
+        inputs: [test/testdrive, src/persist-shared-log]
+        plugins:
+          - ./ci/plugins/mzcompose:
+              composition: testdrive
+              env:
+                - PERSIST_CONSENSUS_BACKEND: shared-log
+        agents:
+          queue: hetzner-aarch64-4cpu-8gb
+
+      - id: testdrive-in-cloudtest
+        label: "Full Testdrive in Cloudtest (K8s)"
+        depends_on: build-aarch64
+        timeout_in_minutes: 180
+        parallelism: 2
+        env:
+          CLOUDTEST_CLUSTER_DEFINITION_FILE: "misc/kind/cluster.yaml"
+        agents:
+          # TODO(def-): Debezium DNS flakiness doesn't allow running on hetzner
+          # queue: hetzner-aarch64-4cpu-8gb
+          queue: linux-aarch64-medium
+        plugins:
+          - ./ci/plugins/cloudtest:
+              # Uses .td-file based parallelism instead
+              args: [-m=long, test/cloudtest/test_full_testdrive.py, --no-test-parallelism]
+        sanitizer: skip
+>>>>>>> 9e6c1fc341 (persist-shared-log: Wire up mzcompose CI tests with shared log consensus)
+
 
   - group: Limits
     key: limits-group

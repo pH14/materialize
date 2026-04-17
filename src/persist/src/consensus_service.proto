@@ -1,0 +1,249 @@
+// Copyright Materialize, Inc. and contributors. All rights reserved.
+//
+// Use of this software is governed by the Business Source License
+// included in the LICENSE file.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0.
+
+syntax = "proto3";
+
+package mz_persist.gen.consensus_service;
+
+// --- gRPC Services ---
+
+// Acceptor: blind group commit. Receives proposals, batches them, flushes to
+// the log. Returns receipts identifying each proposal's position in the log.
+// Does not evaluate CAS — proposals are appended unconditionally.
+service ConsensusAcceptor {
+  // Append a proposal to the shared log. Blocks until the group commit flush
+  // durably lands. Returns a receipt with the batch number and position.
+  rpc Append(ProtoAppendRequest) returns (ProtoAppendResponse);
+}
+
+// Learner: state machine that tails the shared log, evaluates CAS during
+// playback, maintains materialized state, and serves reads + result queries.
+service ConsensusLearner {
+  // Block until the given batch is materialized, then return the CAS result
+  // for the proposal at the given position.
+  rpc AwaitCasResult(ProtoAwaitResultRequest) returns (ProtoCompareAndSetResponse);
+  // Block until the given batch is materialized, then return the truncate
+  // result for the proposal at the given position.
+  rpc AwaitTruncateResult(ProtoAwaitResultRequest) returns (ProtoTruncateResponse);
+  // Read operations, served from materialized state. Linearizable: the
+  // learner ensures it has materialized through the acceptor's latest
+  // committed batch before serving.
+  rpc Head(ProtoHeadRequest) returns (ProtoHeadResponse);
+  rpc Scan(ProtoScanRequest) returns (ProtoScanResponse);
+  rpc ListKeys(ProtoListKeysRequest) returns (stream ProtoListKeysResponse);
+  // Return pending retractions for proposals with batch_id < frontier.
+  // Non-destructive: entries stay in the learner until the -1 diffs arrive.
+  rpc GetRetractions(ProtoGetRetractionsRequest) returns (ProtoGetRetractionsResponse);
+}
+
+// Metashard: partition map authority. Manages the mapping from key ranges to
+// log shards. Standalone metashard processes serve this so operators can
+// discover shard IDs via grpcurl before starting acceptors/learners.
+service ConsensusMetashard {
+  // Return the current partition map and metashard state.
+  rpc GetPartitionMap(ProtoGetPartitionMapRequest) returns (ProtoGetPartitionMapResponse);
+  // Trigger a reconfiguration to a new number of shards.
+  rpc Reconfigure(ProtoReconfigureRequest) returns (ProtoReconfigureResponse);
+}
+
+// Combined service: maps 1:1 to the persist Consensus trait, plus
+// administrative operations like reconfiguration.
+service PersistSharedLog {
+  rpc Head(ProtoHeadRequest) returns (ProtoHeadResponse);
+  rpc Scan(ProtoScanRequest) returns (ProtoScanResponse);
+  rpc ListKeys(ProtoListKeysRequest) returns (stream ProtoListKeysResponse);
+  rpc CompareAndSet(ProtoCompareAndSetRequest) returns (ProtoCompareAndSetResponse);
+  rpc Truncate(ProtoTruncateRequest) returns (ProtoTruncateResponse);
+}
+
+// --- Acceptor request/response messages ---
+
+message ProtoAppendRequest {
+  ProtoLogProposal proposal = 1;
+}
+
+message ProtoAppendResponse {
+  uint64 batch_number = 1;
+  uint32 position = 2;
+  // Log shard this proposal landed on. Used by the serving layer to route
+  // await_cas_result to the correct learner.
+  string log_shard = 3;
+  // Partition map epoch at the time of routing. Not strictly needed for
+  // correctness, but useful for stale-routing detection and debugging.
+  uint64 epoch = 4;
+}
+
+message ProtoAwaitResultRequest {
+  uint64 batch_number = 1;
+  uint32 position = 2;
+}
+
+// --- Metashard durable state ---
+
+// The metashard persist shard stores MetaState as the key and () as the value.
+// start_state is absent in stable configurations; present during reconfiguration.
+// Predecessors are computed at runtime from range overlap, not stored durably.
+message ProtoShardSet {
+  repeated ProtoRangeAssignment ranges = 1;
+}
+
+message ProtoMetashardStateV2 {
+  uint64 epoch = 1;
+  uint64 leader_id = 2;
+  ProtoShardSet target_state = 3;
+  optional ProtoShardSet start_state = 4;
+}
+
+message ProtoRangeAssignment {
+  uint32 lo = 1;          // inclusive lower bound (u8)
+  uint32 hi_exclusive = 2; // exclusive upper bound (u16, max 0x100)
+  string log_shard = 3;   // ShardId
+}
+
+// --- Retraction messages ---
+
+// Identifies a proposal's position in the log (the persist-level key).
+message ProtoOrderedKey {
+  uint64 batch_id = 1;
+  uint32 position = 2;
+  string shard = 3;
+}
+
+// A pending retraction: a proposal eligible to be retracted from the log.
+message ProtoRetraction {
+  ProtoOrderedKey key = 1;
+  // Raw encoded Proposal bytes.
+  bytes proposal = 2;
+}
+
+message ProtoGetRetractionsRequest {
+  uint64 frontier = 1;
+}
+
+message ProtoGetRetractionsResponse {
+  repeated ProtoRetraction entries = 1;
+}
+
+// --- Learner request/response messages ---
+
+message ProtoVersionedData {
+  uint64 seqno = 1;
+  bytes data = 2;
+}
+
+message ProtoHeadRequest {
+  string key = 1;
+}
+
+message ProtoHeadResponse {
+  // Absent if no data at this key.
+  optional ProtoVersionedData data = 1;
+}
+
+message ProtoCompareAndSetRequest {
+  string key = 1;
+  // Absent means the caller expects no data at this key yet.
+  optional uint64 expected = 2;
+  ProtoVersionedData new = 3;
+}
+
+message ProtoCompareAndSetResponse {
+  bool committed = 1;
+}
+
+message ProtoScanRequest {
+  string key = 1;
+  uint64 from = 2;
+  uint64 limit = 3;
+}
+
+message ProtoScanResponse {
+  repeated ProtoVersionedData data = 1;
+}
+
+message ProtoTruncateRequest {
+  string key = 1;
+  uint64 seqno = 2;
+}
+
+message ProtoTruncateResponse {
+  // Absent if the operation returned None (should not happen in practice).
+  optional uint64 deleted = 1;
+}
+
+message ProtoListKeysRequest {}
+
+message ProtoListKeysResponse {
+  string key = 1;
+}
+
+// --- Metashard messages ---
+
+message ProtoGetPartitionMapRequest {}
+
+message ProtoGetPartitionMapResponse {
+  ProtoMetashardStateV2 state = 1;
+}
+
+// --- Reconfiguration messages ---
+
+message ProtoReconfigureRequest {
+  // Target number of log shards. The service will split or merge ranges
+  // to reach this count, evenly dividing [0x00, 0x100).
+  uint32 num_shards = 1;
+}
+
+message ProtoReconfigureResponse {
+  // The new epoch after reconfiguration.
+  uint64 new_epoch = 1;
+  // Number of log shards in the new partition map.
+  uint32 num_shards = 2;
+}
+
+// --- Log serialization (proposal-based, blind writes) ---
+
+// A CAS proposal as appended to the shared log. Contains the full CAS
+// precondition (expected seqno) so the learner can evaluate it during playback.
+message ProtoCasProposal {
+  string key = 1;
+  // The seqno the proposer expects the shard to be at. Absent means the
+  // proposer expects no data at this key yet.
+  optional uint64 expected = 2;
+  uint64 new_seqno = 3;
+  bytes data = 4;
+}
+
+// A truncate proposal as appended to the shared log.
+message ProtoTruncateProposal {
+  string key = 1;
+  uint64 seqno = 2;
+}
+
+message ProtoLogProposal {
+  oneof op {
+    ProtoCasProposal cas = 1;
+    ProtoTruncateProposal truncate = 2;
+  }
+}
+
+message ProtoLogBatch {
+  uint64 batch_number = 1;
+  repeated ProtoLogProposal proposals = 2;
+}
+
+// --- Snapshot serialization ---
+
+message ProtoShardState {
+  repeated ProtoVersionedData entries = 1;
+}
+
+message ProtoSnapshot {
+  uint64 through_batch = 1;
+  map<string, ProtoShardState> shards = 2;
+}

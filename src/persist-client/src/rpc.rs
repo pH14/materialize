@@ -307,6 +307,35 @@ impl GrpcPubSubClient {
                         .grpc_connection
                         .connect_call_attempt_count
                         .inc();
+                    // Unix domain socket: detect paths starting with '/' and
+                    // use a custom connector instead of HTTP endpoint parsing.
+                    if config.url.starts_with('/') {
+                        let path = config.url.clone();
+                        let endpoint = Endpoint::from_static("http://[::]:0")
+                            .connect_timeout(
+                                PUBSUB_CONNECT_ATTEMPT_TIMEOUT.get(&config.persist_cfg),
+                            )
+                            .timeout(PUBSUB_REQUEST_TIMEOUT.get(&config.persist_cfg));
+                        let channel = match endpoint
+                            .connect_with_connector(tower::service_fn(
+                                move |_: tonic::transport::Uri| {
+                                    let p = path.clone();
+                                    async move {
+                                        let stream =
+                                            tokio::net::UnixStream::connect(p).await?;
+                                        Ok::<_, std::io::Error>(
+                                            hyper_util::rt::TokioIo::new(stream),
+                                        )
+                                    }
+                                },
+                            ))
+                            .await
+                        {
+                            Ok(channel) => channel,
+                            Err(err) => return RetryResult::RetryableErr(err),
+                        };
+                        return RetryResult::Ok(ProtoPersistPubSubClient::new(channel));
+                    }
                     let endpoint = match Endpoint::from_str(&config.url) {
                         Ok(endpoint) => endpoint,
                         Err(err) => return RetryResult::FatalErr(err),
@@ -710,7 +739,7 @@ impl PubSubSender for NoopPubSubSender {
 }
 
 /// Spawns a Tokio task that consumes a [PubSubReceiver], applying its diffs to a [StateCache].
-pub(crate) fn subscribe_state_cache_to_pubsub(
+pub fn subscribe_state_cache_to_pubsub(
     cache: Arc<StateCache>,
     mut pubsub_receiver: Box<dyn PubSubReceiver>,
 ) -> JoinHandle<()> {
@@ -1079,6 +1108,28 @@ impl PersistGrpcPubSubServer {
         tonic::transport::Server::builder()
             .add_service(ProtoPersistPubSubServer::new(self))
             .serve_with_incoming(listener)
+            .await?;
+        Ok(())
+    }
+
+    /// Starts the gRPC server with a generic incoming stream.
+    ///
+    /// This is more flexible than [`serve_with_stream`] — it accepts any stream
+    /// of connections, including `UnixListenerStream` for Unix domain sockets.
+    pub async fn serve_with_incoming<I, IO, IE>(self, incoming: I) -> Result<(), anyhow::Error>
+    where
+        I: futures::Stream<Item = Result<IO, IE>>,
+        IO: tokio::io::AsyncRead
+            + tokio::io::AsyncWrite
+            + tonic::transport::server::Connected
+            + Unpin
+            + Send
+            + 'static,
+        IE: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        tonic::transport::Server::builder()
+            .add_service(ProtoPersistPubSubServer::new(self))
+            .serve_with_incoming(incoming)
             .await?;
         Ok(())
     }
