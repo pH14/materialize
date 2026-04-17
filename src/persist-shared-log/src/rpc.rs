@@ -47,6 +47,15 @@ use crate::actors::acceptor::PersistAcceptorHandle;
 use crate::actors::learner::PersistLearnerHandle;
 use crate::{Acceptor, AcceptorError, LearnerError, Metashard};
 
+/// Maximum gRPC message size (encoded and decoded) for shared-log RPCs.
+///
+/// Tonic's default is 4 MiB, which is easy to exceed for `get_retractions`
+/// responses when many proposals have churned — retractions accumulate until
+/// the acceptor polls the learner. All traffic on these endpoints is trusted
+/// internal UDS/TCP between our own processes, so we set the cap to 4 GiB and
+/// let memory pressure be the limit rather than an arbitrary frame ceiling.
+pub const MAX_GRPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Error conversions (tonic::Status -> domain errors)
 // ---------------------------------------------------------------------------
@@ -88,13 +97,18 @@ impl GrpcAcceptorHandle {
     /// Create a handle from an existing tonic channel.
     pub fn from_channel(channel: tonic::transport::Channel) -> Self {
         GrpcAcceptorHandle {
-            client: ConsensusAcceptorClient::new(channel),
+            client: ConsensusAcceptorClient::new(channel)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
         }
     }
 
     /// Connect to a remote acceptor at the given address.
     pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
-        let client = ConsensusAcceptorClient::connect(addr).await?;
+        let client = ConsensusAcceptorClient::connect(addr)
+            .await?
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
         Ok(GrpcAcceptorHandle { client })
     }
 
@@ -102,7 +116,9 @@ impl GrpcAcceptorHandle {
     pub async fn connect_unix(socket_path: &str) -> Result<Self, anyhow::Error> {
         let channel = crate::uds::connect_uds(socket_path).await?;
         Ok(GrpcAcceptorHandle {
-            client: ConsensusAcceptorClient::new(channel),
+            client: ConsensusAcceptorClient::new(channel)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
         })
     }
 
@@ -171,13 +187,18 @@ impl GrpcLearnerHandle {
     /// Create a handle from an existing tonic channel.
     pub fn from_channel(channel: tonic::transport::Channel) -> Self {
         GrpcLearnerHandle {
-            client: ConsensusLearnerClient::new(channel),
+            client: ConsensusLearnerClient::new(channel)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
         }
     }
 
     /// Connect to a remote learner at the given address.
     pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
-        let client = ConsensusLearnerClient::connect(addr).await?;
+        let client = ConsensusLearnerClient::connect(addr)
+            .await?
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
         Ok(GrpcLearnerHandle { client })
     }
 
@@ -185,7 +206,9 @@ impl GrpcLearnerHandle {
     pub async fn connect_unix(socket_path: &str) -> Result<Self, anyhow::Error> {
         let channel = crate::uds::connect_uds(socket_path).await?;
         Ok(GrpcLearnerHandle {
-            client: ConsensusLearnerClient::new(channel),
+            client: ConsensusLearnerClient::new(channel)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
         })
     }
 

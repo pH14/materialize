@@ -40,6 +40,7 @@ use mz_persist_shared_log::actors::router::Router;
 use mz_persist_shared_log::factory::InProcessActorFactory;
 use mz_persist_shared_log::rpc::{
     AcceptorGrpcServer, ConsensusAcceptorServer, ConsensusLearnerServer, LearnerGrpcServer,
+    MAX_GRPC_MESSAGE_SIZE,
 };
 use mz_persist_shared_log::{AcceptorConfig, PartitionMap, RangeAssignment};
 
@@ -699,7 +700,11 @@ async fn run_monolith(args: MonolithArgs) {
 
     info!(addr = %args.listen_addr, "starting gRPC server");
     Server::builder()
-        .add_service(PersistSharedLogServer::new(router_handle))
+        .add_service(
+            PersistSharedLogServer::new(router_handle)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
+        )
         .serve(args.listen_addr)
         .await
         .expect("gRPC server failed");
@@ -831,9 +836,11 @@ async fn run_acceptor(args: AcceptorArgs) {
         ?acceptor_sock,
         "starting acceptor gRPC server on Unix socket"
     );
-    let router = Server::builder().add_service(ConsensusAcceptorServer::new(
-        AcceptorGrpcServer::new(handle),
-    ));
+    let router = Server::builder().add_service(
+        ConsensusAcceptorServer::new(AcceptorGrpcServer::new(handle))
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
+    );
     mz_persist_shared_log::uds::serve_uds(&acceptor_sock, router)
         .await
         .expect("acceptor gRPC server failed");
@@ -883,8 +890,11 @@ async fn run_learner(args: LearnerArgs) {
     .await;
 
     info!(?learner_sock, "starting learner gRPC server on Unix socket");
-    let router =
-        Server::builder().add_service(ConsensusLearnerServer::new(LearnerGrpcServer::new(handle)));
+    let router = Server::builder().add_service(
+        ConsensusLearnerServer::new(LearnerGrpcServer::new(handle))
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
+    );
     mz_persist_shared_log::uds::serve_uds(&learner_sock, router)
         .await
         .expect("learner gRPC server failed");
@@ -1000,9 +1010,11 @@ async fn run_metashard(args: MetashardArgs) {
         ?metashard_sock,
         "starting metashard gRPC server on Unix socket"
     );
-    let router = Server::builder().add_service(ConsensusMetashardServer::new(
-        MetashardGrpcServer::new(metashard_handle),
-    ));
+    let router = Server::builder().add_service(
+        ConsensusMetashardServer::new(MetashardGrpcServer::new(metashard_handle))
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
+    );
     mz_persist_shared_log::uds::serve_uds(&metashard_sock, router)
         .await
         .expect("metashard gRPC server failed");
@@ -1063,7 +1075,11 @@ async fn run_router(args: RouterArgs) {
 
     info!(addr = %args.listen_addr, "starting router gRPC server");
     Server::builder()
-        .add_service(PersistSharedLogServer::new(router_handle))
+        .add_service(
+            PersistSharedLogServer::new(router_handle)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE),
+        )
         .serve(args.listen_addr)
         .await
         .expect("router gRPC server failed");
