@@ -181,13 +181,6 @@ fn decode_meta_state(data: &[u8]) -> Result<MetaState, String> {
 
     let start = start_state.map(decode_shard_set).transpose()?;
 
-    info!(
-        epoch,
-        num_target_ranges = target.ranges.len(),
-        reconfiguring = start.is_some(),
-        "restored metashard state from durable storage"
-    );
-
     Ok(MetaState {
         epoch,
         leader_id: if leader_id == 0 {
@@ -553,6 +546,12 @@ impl<F: ActorFactory> PersistMetaActor<F> {
             .expect("as_of is within [since, upper)");
 
         if let Some(((state, ()), _, _)) = updates.into_iter().find(|(_, _, diff)| *diff == 1) {
+            debug!(
+                epoch = state.epoch,
+                num_target_ranges = state.target_state.ranges.len(),
+                reconfiguring = state.start_state.is_some(),
+                "fetched latest metashard state from durable storage",
+            );
             self.state = state;
         }
     }
