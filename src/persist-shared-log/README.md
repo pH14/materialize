@@ -10,20 +10,25 @@ The service is split into four actor types that can run in a single process
 (monolith mode) or as separate OS processes communicating over Unix domain
 sockets (distributed mode):
 
-- **Metashard** -- partition map authority. Manages the mapping from key ranges
-  to log shards. Persists reconfiguration state for crash recovery.
-- **Acceptor** -- blind group commit. Receives proposals, batches them, flushes
-  to persist. One per log shard.
-- **Learner** -- state machine that tails the log, evaluates CAS during
-  playback, serves reads. N replicas per log shard.
-- **Router** -- routes client gRPC requests to the correct
-  acceptor/learner based on the partition map.
+- `Metashard`: control-plane authority. Persists `MetaState`, fences
+  competing leaders, and coordinates reconfiguration.
+- `Router`: client-facing entry point. Subscribes to the meta shard, caches
+  the current `PartitionMap`, and routes each request to the correct acceptor
+  or learner.
+- `Acceptor`: single writer for one log shard. Batches proposals, flushes
+  them to persist, and writes setup batches during reconfiguration.
+- `Learner`: state machine for one log shard. Tails the shard, evaluates CAS
+  during playback, serves reads, and identifies proposals that need to be
+  retracted. A log shard can have one or more learner replicas.
+
+Acceptors and learners do not read the meta shard. Only the metashard and
+router know about partition maps or reconfiguration.
 
 ## Running
 
 ### Monolith mode (all-in-one)
 
-Simplest way to run -- all actors in a single process with in-memory storage:
+Runs all actors in a single process with in-memory storage:
 
 ```bash
 cargo run -p mz-persist-shared-log -- monolith \
@@ -52,7 +57,7 @@ export PERSIST_BLOB_URL=file:///tmp/persist/blob
 export PERSIST_CONSENSUS_URL='postgres://phemberger@localhost:5432/consensus'
 ```
 
-**Terminal 1 -- Metashard** (spawns acceptor + learner automatically):
+**Terminal 1, metashard** (spawns acceptor + learner automatically):
 
 ```bash
 cargo run -p mz-persist-shared-log -- metashard \
@@ -62,7 +67,7 @@ cargo run -p mz-persist-shared-log -- metashard \
   --consensus-url $PERSIST_CONSENSUS_URL
 ```
 
-**Terminal 2 -- Router:**
+**Terminal 2, router:**
 
 ```bash
 cargo run -p mz-persist-shared-log -- router \

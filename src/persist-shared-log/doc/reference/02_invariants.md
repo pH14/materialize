@@ -36,11 +36,12 @@ Proposals within a batch are ordered by position (0-indexed). This order is
 deterministic and stable; it is the insertion order from the acceptor's
 pending buffer at flush time.
 
-**L4. Append-only log.**
-Proposals are never modified or removed from the log by the acceptor. The
-log is append-only from the perspective of proposal content. Persist may
-compact the physical representation via rollups and compaction, but the
-logical content is preserved.
+**L4. Differential log semantics.**
+Log shards are differential collections. The acceptor appends `+1` rows for
+new proposals and later appends `-1` rows to retract proposals identified by
+learners. A `-1` row only removes a previously written proposal; the
+retraction pipeline does not invent new proposal bodies or reorder surviving
+history.
 
 **L5. No duplicate batches.**
 Each batch number appears exactly once in the log. Persist's frontier
@@ -104,7 +105,8 @@ proposals committed before T. If a CAS commits and the client subsequently
 issues a `head` for the same client shard, the result reflects the CAS.
 
 *Implemented by:* The bus stop linearization protocol; reads wait for the
-learner's listen frontier to reach the acceptor's upper at read issue time.
+learner's listen frontier to reach the fetched log-shard upper at read issue
+time.
 
 **R2. Snapshot consistency.**
 A read returns a consistent snapshot of client shard state. `head` and
@@ -118,11 +120,57 @@ reads are available.
 ### Acceptor Properties
 
 **A1. Receipt uniqueness.**
-Each `(batch_number, position)` receipt corresponds to exactly one proposal.
+Each `(log_shard, batch_number, position)` receipt in `ProtoAppendResponse`
+corresponds to exactly one appended proposal.
 
 **A2. Receipt validity.**
-If the acceptor returns receipt `(b, p)`, then batch `b` exists in the log
-and contains a proposal at position `p`.
+If the acceptor returns receipt `(log_shard, b, p, epoch)`, then log shard
+`log_shard` contained a proposal at position `p` in batch `b` when the
+append committed.
+
+### Partition Map Properties
+
+These properties are verified by `stateright_reconfig.rs::ReconfigModel`.
+See [05_horizontal_sharding.md](05_horizontal_sharding.md) for how they are
+maintained in the implementation.
+
+**PM1. Covering.**
+At every epoch, the `PartitionMap` covers the full partition-key space
+`[0x00, 0x100)`. Every possible client shard routes to exactly one log
+shard.
+
+**PM2. Non-overlapping.**
+No two `RangeAssignment`s in the same `PartitionMap` share a partition key.
+Ranges are sorted and disjoint.
+
+**PM3. Epoch monotonicity.**
+Each durable `PartitionMap` write advances `MetaState.epoch`. Epochs never
+decrease.
+
+### Reconfiguration Properties
+
+These properties cover transitions from one `PartitionMap` to the next.
+`RC1`, `RC2`, and `RC5` are verified by
+`stateright_reconfig.rs::ProtocolModel` across split and merge scenarios
+with crash recovery.
+
+**RC1. Seal before reassign.**
+No client shard's writes are routed to a new log shard until every
+predecessor log shard covering the same key range has been sealed. Router
+traffic only switches after the metashard commits `start_state = None`, and
+commit happens after `Seal`.
+
+**RC2. No committed write lost.**
+Every proposal that committed before a reconfiguration remains readable on
+the successor log shard after the reconfiguration completes. Bulk and delta
+setup batches carry forward the live state from every predecessor that
+overlaps the new shard's range.
+
+**RC5. Reconfiguration liveness.**
+Under fair scheduling, a reconfiguration that has persisted its intent
+(`start_state.is_some()`) eventually reaches `start_state = None`, even
+across crashes of the metashard. `reconcile()` is idempotent, so a fresh
+leader picks up where the previous one left off.
 
 ## Liveness Properties
 
@@ -142,7 +190,7 @@ eventually processes all batches and its materialized state converges to
 reflect the full log.
 
 **Lv4. Upper advancement.**
-If proposals are being submitted, the acceptor's upper (next batch number)
+If proposals are being submitted, the log shard upper (next batch number)
 eventually advances.
 
 ## Performance Properties (Targets)
@@ -208,12 +256,12 @@ describe intended coverage that is not yet implemented.
   (tokio `current_thread` with yield points), not preemptive.
 - **†** The protocol-level Stateright model verifies RC2 (no data loss) and
   RC5 (reconfiguration liveness) with crash recovery, across both split and
-  merge scenarios. It models the routing-swapped-but-unpersisted window
-  (crash between routing swap and durable persist) as a distinct phase.
-  813 states explored per scenario. The partition-map model verifies PM1-PM3
-  and RC1.
-- BUGGIFY fault injection (`fault.rs`) adds 5 injection points at protocol
-  phase boundaries in `do_reconfigure`, including the post-commit windows
+  merge scenarios. It models the intent-persisted-but-not-yet-committed window
+  during reconfiguration and the restart path that resumes from durable
+  `start_state=Some(...)`. 813 states explored per scenario. The partition-map
+  model verifies PM1-PM3 and RC1.
+- BUGGIFY fault injection (`fault.rs`) adds injection points at metashard
+  protocol phase boundaries, including the post-commit windows
   `after_routing_swap` and `after_commit_persist`. Tests exercise both
   pre-commit boundaries (fault→retry→success) and post-commit boundaries
   (fault after point-of-no-return, verify data accessible).

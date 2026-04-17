@@ -1,253 +1,268 @@
 # Persist Shared Log: Protocol Specification
 
-This document specifies the protocol precisely enough to derive a formal
-model (e.g. Stateright) or a complete implementation.
+This document describes the protocol the current code implements: the
+persist data model, the steady-state request paths, read linearization, and
+the retraction pipeline.
 
 ## Data Model
 
 ### Proposals
 
-A _proposal_ is a CAS operation submitted by a client. Proposals are
-appended to the log by the acceptor and evaluated later by learners.
+A proposal is a serialized `ProtoLogProposal`. Today that means one of:
 
-Each proposal is stored in the log shard as a persist update where the key
-carries the serialized proposal and the value is unused:
+- a CAS proposal: `(key, expected, new_seqno, data)`
+- a truncate proposal: `(key, seqno)`
 
-```
-Log shard schema:
-  Key (K):   bytes    -- serialized ProtoLogProposal (opaque to persist)
-  Value (V): ()       -- unused
-  Time (T):  u64      -- batch number
-  Diff (D):  i64      -- always +1
-```
+The acceptor treats `Proposal` as opaque bytes. Only the learner decodes it.
 
-Each key is a serialized `ProtoLogProposal` containing either a CAS or
-truncate operation. The proposal is opaque to persist and to the acceptor;
-the learner deserializes it during evaluation. A CAS proposal contains
-`(shard_id, expected, new_seqno, data)`. A truncate proposal contains
-`(shard_id, seqno)`.
+### Log shard collection
 
-### Batches
+Each log shard is a differential collection with this schema:
 
-A _batch_ is a set of proposals appended atomically to the log shard at a
-single timestamp. Each batch has a `batch_number` (the persist timestamp)
-and contains zero or more proposals ordered by position (0-indexed).
+| Dimension | Type | Meaning |
+|-----------|------|---------|
+| `K` | `OrderedKey { batch_id, position, shard }` | Stable identity and sort order for a proposal |
+| `V` | `Proposal` | Serialized `ProtoLogProposal` bytes |
+| `T` | `u64` | Persist timestamp for the append batch |
+| `D` | `i64` | `+1` to add a proposal, `-1` to retract one |
+
+`OrderedKey.batch_id` identifies the proposal being talked about. For
+regular traffic it matches the append timestamp. A later retraction is
+written at a new timestamp `T`, but the key still points at the original
+proposal `(batch_id, position, shard)` being removed.
 
 ### Receipts
 
-After a proposal is durably appended, the acceptor returns a _receipt_:
+After a successful append, the acceptor returns `ProtoAppendResponse`:
 
-```
-Receipt:
-  batch_number: u64         -- the log timestamp this proposal was written at
-  position:     u32         -- 0-indexed position within the batch
-```
-
-The receipt uniquely identifies a proposal in the log. Clients use it to
-retrieve results from a learner.
-
-### Client Shard State
-
-Each learner maintains a materialized view of all client shards:
-
-```
-StateMachine:
-  shards: Map<String, ShardState>
-
-ShardState:
-  entries: Vec<VersionedEntry>
-
-VersionedEntry:
-  seqno: u64
-  data:  bytes
+```text
+batch_number: u64
+position:     u32
+log_shard:    String
+epoch:        u64
 ```
 
-This state is derived deterministically from the log. All learners
-processing the same log prefix arrive at identical state.
+- `(log_shard, batch_number, position)` identifies the appended proposal.
+- `epoch` records the router's configuration epoch when the proposal was
+  routed. It is useful for debugging and stale-routing detection.
 
-### Result Cache
+### Learner state
 
-Each learner maintains a bounded cache of proposal outcomes:
+Each learner maintains:
 
-```
-ResultCache:
-  results: Map<batch_number, Vec<ProposalResult>>
+- materialized client-shard state derived from its log shard
+- cached results keyed by `(batch_number, position)`
+- pending retractions keyed by `OrderedKey`
 
-ProposalResult = CasResult { committed: bool }
-               | TruncateResult { deleted: u64 | error }
-```
+The current implementation stores results in memory without an automatic
+bounded-pruning policy.
 
-Results are retained for a configurable number of batches (default 10,000)
-and pruned as the log advances.
+## API Surface
 
-## Write Path
+The router exposes the `PersistSharedLog` API and maps each call onto the
+actor graph:
 
-### Step 1: Client submits proposal
+- `CompareAndSet`
+- `Truncate`
+- `Head`
+- `Scan`
+- `ListKeys`
 
-The client serializes a proposal and sends it to the acceptor via the
-`Append` RPC.
+The router is always on the request path. Clients do not talk directly to
+acceptors or learners.
 
-### Step 2: Acceptor buffers proposal
+## Sequence Diagrams
 
-The acceptor adds the proposal to its pending buffer. The client blocks,
-waiting for the flush.
+### `CompareAndSet`
 
-### Step 3: Acceptor flushes batch
-
-When flushed, the acceptor:
-
-1. Takes all pending proposals from the buffer.
-2. Reads the current `upper` from its `WriteHandle`; this is the next
-   batch number.
-3. Creates persist updates: one `((serialized_proposal, ()), batch_number, +1)`
-   per proposal.
-4. Calls `compare_and_append(updates, expected_upper, new_upper)` where
-   `new_upper = batch_number + 1`.
-
-If `compare_and_append` succeeds, each proposal receives its receipt
-`(batch_number, position)`.
-
-If `compare_and_append` returns `UpperMismatch`, another writer advanced
-the upper. The acceptor reads the new upper and retries with the updated
-batch number.
-
-### Step 4: Learner evaluates batch
-
-The learner's subscription receives the batch as a `ListenEvent::Updates`.
-For each proposal in batch order:
-
-**CAS evaluation:**
-```
-apply_cas(key=(shard_id, expected, seqno), value=data):
-  let shard = state.shards.entry(shard_id)
-  let current_seqno = shard.entries.last().map(|e| e.seqno)
-
-  if current_seqno == expected:
-    shard.entries.push(VersionedEntry { seqno, data })
-    return CasResult { committed: true }
-  else:
-    return CasResult { committed: false }
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant A as Acceptor
+    participant S as Log Shard
+    participant L as Learner
+    C->>R: CompareAndSet(key, expected, new)
+    Note over R: Route by current PartitionMap
+    R->>A: Append(CAS proposal)
+    A->>S: compare_and_append(+1 proposal row)
+    S-->>A: append committed
+    A-->>R: ProtoAppendResponse
+    R->>L: await_cas_result(batch, position)
+    S-->>L: subscribe delivers batch
+    L->>L: evaluate CAS
+    L->>L: cache result
+    L-->>R: committed / expectation mismatch
+    R-->>C: CompareAndSet response
 ```
 
-Results are stored in the result cache at `(batch_number, position)`.
+Steady-state behavior:
 
-### Step 5: Client retrieves result
+1. The router chooses the log shard from its current `PartitionMap`.
+2. The acceptor appends a `+1` row and returns `ProtoAppendResponse`.
+3. The learner sees the batch on its subscribe stream, evaluates the
+   proposal, and stores the result.
+4. The router waits on that learner result and replies to the client.
 
-The client calls `AwaitCasResult(batch_number, position)` on a learner.
-The learner blocks until it has evaluated the given batch, then returns the
-cached result.
+If the append returns `AcceptorError::Sealed` or the acceptor shuts down,
+the router parks the request and retries after the next committed routing
+update.
 
-## Read Path
+### `Truncate`
 
-Reads are served from the learner's materialized `StateMachine`. Three
-read operations are supported:
-
-- **`head(key)`**: Returns the latest `VersionedEntry` for the given client
-  shard, or `None` if the shard has no data.
-- **`scan(key, from_seqno, limit)`**: Returns up to `limit` entries with
-  `seqno >= from_seqno` for the given client shard.
-- **`list_keys()`**: Returns all client shard keys that have at least one
-  entry.
-
-### Read Linearization
-
-Reads must reflect all proposals committed at the time the read was issued.
-The learner achieves this using a "bus stop" pattern:
-
-1. A read arrives and is enqueued.
-2. The learner fetches the acceptor's current upper via
-   `fetch_recent_upper()`. This is the next batch number the acceptor will
-   write at, meaning all batches before it are committed.
-3. All reads arriving while the upper fetch is in-flight share the same
-   linearization target. This amortizes the cost of the fetch across
-   concurrent reads.
-4. The learner blocks each read until its listen frontier reaches the target
-   upper.
-5. The read is served from the materialized state.
-
-## Combined Path
-
-The RPC service provides a combined interface that maps 1:1 to persist's
-`Consensus` trait:
-
-```
-compare_and_set(key, expected, new_data):
-  1. Construct CAS proposal
-  2. Append via acceptor; receive receipt (batch_number, position)
-  3. AwaitCasResult(batch_number, position) from learner
-  4. Return CaSResult::Committed or CaSResult::ExpectationMismatch
-
-head(key):
-  1. Read from learner (linearized)
-
-scan(key, from, limit):
-  1. Read from learner (linearized)
-
-truncate(key, seqno):
-  1. Construct Truncate proposal
-  2. Append via acceptor; receive receipt (batch_number, position)
-  3. AwaitTruncateResult(batch_number, position) from learner
-  4. Return TruncateResult
-
-list_keys():
-  1. Read from learner (linearized)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant A as Acceptor
+    participant S as Log Shard
+    participant L as Learner
+    C->>R: Truncate(key, seqno)
+    Note over R: Route by current PartitionMap
+    R->>A: Append(truncate proposal)
+    A->>S: compare_and_append(+1 proposal row)
+    S-->>A: append committed
+    A-->>R: ProtoAppendResponse
+    R->>L: await_truncate_result(batch, position)
+    S-->>L: subscribe delivers batch
+    L->>L: apply truncate
+    L->>L: queue pending retractions
+    L-->>R: Truncate response
+    R-->>C: Truncate response
 ```
 
-This is the primary interface for persist clients. They interact with the
-shared log as they would any other `Consensus` implementation.
+`Truncate` uses the same append-and-await pattern as CAS. The main
+difference is that the learner usually emits multiple pending retractions
+when it removes older versions.
 
-## Ordering Guarantees
+### `Head`
 
-1. **Total order on batches.** Persist's `compare_and_append` ensures
-   batches are totally ordered by batch number.
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant L as Learner
+    participant S as Log Shard
+    C->>R: Head(key)
+    R->>L: Head(key)
+    L->>S: fetch_recent_upper()
+    S-->>L: upper = U
+    L->>L: wait until listen frontier >= U
+    L->>L: serve head from memory
+    L-->>R: Head response
+    R-->>C: Head response
+```
 
-2. **Deterministic order within batches.** Proposals within a batch are
-   ordered by position (insertion order in the acceptor's pending buffer).
+### `Scan`
 
-3. **Deterministic CAS evaluation.** Given the same log prefix, all
-   learners evaluate proposals in the same order and arrive at the same
-   client shard state. Batches are processed in batch number order;
-   proposals within a batch are processed in position order; CAS evaluation
-   depends only on the current client shard state and the proposal.
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant L as Learner
+    participant S as Log Shard
+    C->>R: Scan(key, from, limit)
+    R->>L: Scan(key, from, limit)
+    L->>S: fetch_recent_upper()
+    S-->>L: upper = U
+    L->>L: wait until listen frontier >= U
+    L->>L: serve scan from memory
+    L-->>R: Scan response
+    R-->>C: Scan response
+```
 
-4. **Client shard independence.** A proposal for client shard A never
-   affects the evaluation of a proposal for client shard B. Client shards
-   are independent namespaces within the log.
+### `ListKeys`
 
-## Ambiguous Append Handling
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant L as One learner per log shard
+    participant S as Log Shard(s)
+    C->>R: ListKeys()
+    Note over R: Fan out to one learner replica per log shard
+    R->>L: ListKeys()
+    L->>S: fetch_recent_upper()
+    S-->>L: upper = U
+    L->>L: wait until listen frontier >= U
+    L-->>R: local key set
+    R->>R: union and deduplicate
+    R-->>C: ListKeys response
+```
 
-If `compare_and_append` to the log shard returns an ambiguous result
-(timeout, network error), the acceptor cannot know whether the batch landed:
+The router sends `ListKeys` to one learner replica per log shard, unions the
+returned key sets, and deduplicates them.
 
-- If the batch did land, the upper has advanced. The acceptor's next
-  `compare_and_append` attempt sees the new upper and adjusts.
-- If the batch did not land, retrying with the same upper succeeds.
+## Read Linearization
 
-Persist's frontier advancement ensures at most one batch per timestamp.
-Clients waiting on proposals from an ambiguous batch eventually receive
-their results, from either the original append or the retry.
+Reads linearize against the current log-shard upper at read-issue time.
 
-## Rehydration and Recovery
+1. A read command is queued in `pending_reads`.
+2. The learner fetches the current log-shard upper with
+   `fetch_recent_upper()`.
+3. All reads waiting at that moment share the same linearization target, so
+   one `fetch_recent_upper()` call covers a batch of reads.
+4. The learner waits until its listen frontier reaches that target.
+5. The read is served from in-memory state.
 
-### Learner rehydration
+The returned read reflects every committed batch with timestamp `< upper` at
+the time the upper was fetched.
 
-A learner opens a `Listen` handle with `as_of = since` and rebuilds its
-materialized state by processing events from there forward. Rollups reduce
-the number of diffs the learner must scan to reach the current state.
-Compaction reduces the number of blobs persist reads to serve those diffs.
-The learner applies each batch through its state machine exactly as it
-would during normal operation.
+If the fetched upper is the empty antichain, the shard has been sealed. The
+learner drops the request, and the router retries against the new routing
+once it has one.
 
-### Acceptor restart
+## Retractions
 
-The acceptor opens a new `WriteHandle` at the log shard's current upper.
-Proposals in the pending buffer at crash time are lost; clients observe a
-timeout and retry. The acceptor carries no durable state of its own.
+Log shards are differential collections. The acceptor appends `+1` rows for
+new proposals and later appends `-1` rows to retract dead proposals.
 
-## Log Shard Backend
+### Where retractions come from
 
-The log shard is a persist shard and requires its own `Consensus`
-implementation. This is where the recursion bottoms out: the log shard must
-use an external system (object storage with conditional writes, an OLTP
-database, etc.) for its root-level CAS operation. The choice of backend is
-not yet settled. See [00_overview.md](00_overview.md) for context.
+The learner identifies retractions in three cases:
+
+- a CAS proposal loses its precondition check
+- a truncate removes older entries
+- a malformed or undecodable proposal is treated as inert and marked for
+  retraction
+
+Those entries are added to the learner's `pending_retractions`.
+
+### How they are flushed
+
+The acceptor remains the only writer to the log shard. It periodically polls
+a `RetractionSource`:
+
+```text
+RetractionSource::get_retractions(frontier) -> Vec<(OrderedKey, Proposal)>
+```
+
+The serving layer typically implements that trait by querying learner
+replicas. The acceptor buffers the returned entries and includes them as
+`-1` diffs in a later flush batch alongside normal `+1` proposals.
+
+### How learners observe them
+
+When a learner later sees the `-1` row on its own subscribe stream, it:
+
+- removes the retracted proposal from live state
+- removes the key from `pending_retractions`
+- updates cached result state for that slot
+
+Learners discover what to retract; the acceptor performs the actual write.
+
+## Recovery
+
+### Learner recovery
+
+A learner reopens its log shard, subscribes from persist, and rebuilds state
+by replaying the shard. It does not need the meta shard for replay.
+
+### Acceptor recovery
+
+An acceptor is mostly stateless. On restart it opens the shard at the
+current upper and resumes appending. During reconfiguration, setup batches
+are idempotent and skipped based on the shard upper.
+
+See [05_horizontal_sharding.md](05_horizontal_sharding.md) for the
+reconfiguration protocol that makes new shards self-contained.
