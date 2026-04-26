@@ -39,7 +39,7 @@ thiserror = "2.0.18"
 timely = "0.28.0"
 tokio = "1.49.0"
 tracing = "0.1.44"
-uuid = { version = "1.19.0", features = ["serde", "v4"] }
+uuid = { version = "1.23.1", features = ["serde", "v4"] }
 
 [features]
 default = []
