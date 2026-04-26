@@ -111,7 +111,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["sync"] }
 tokio-postgres = { version = "0.7.15" }
 tokio-stream = { version = "0.1.18", features = ["net"] }
-tokio-metrics = "0.4.9"
+tokio-metrics = "0.5.0"
 tower = { version = "0.5.3", features = ["buffer", "limit", "load-shed"] }
 tower-http = { version = "0.6.7", features = [
     "cors",
