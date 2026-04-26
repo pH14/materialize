@@ -51,4 +51,4 @@ prost-build = "0.14.3"
 default = ["mz-build-tools/default"]
 
 [dev-dependencies]
-tokio = { version = "1.49.0", features = ["test-util"] }
+tokio = { version = "1.50.0", features = ["test-util"] }

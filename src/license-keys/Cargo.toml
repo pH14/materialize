@@ -30,7 +30,7 @@ uuid = { version = "1.19.0", features = ["v4"], optional = true }
 [dev-dependencies]
 clap = { version = "4.5.23", features = ["derive"] }
 mz-aws-util = { path = "../aws-util" }
-tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
