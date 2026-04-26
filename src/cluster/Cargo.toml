@@ -23,7 +23,7 @@ regex = "1.12.3"
 timely = "0.28.0"
 tokio = { version = "1.49.0", features = ["fs", "rt", "sync", "net"] }
 tracing = "0.1.44"
-uuid = "1.19.0"
+uuid = "1.23.1"
 
 [dev-dependencies]
 mz-ore = { path = "../ore", features = ["turmoil"] }

@@ -23,7 +23,7 @@ postgres-types = { version = "0.2.11", features = [
     "with-chrono-0_4",
     "with-uuid-1",
 ] }
-uuid = "1.19.0"
+uuid = "1.23.1"
 
 [features]
 default = []
