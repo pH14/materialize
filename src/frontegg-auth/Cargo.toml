@@ -27,14 +27,14 @@ reqwest-retry = "0.8.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
-tokio = { version = "1.49.0", features = ["macros"] }
+tokio = { version = "1.50.0", features = ["macros"] }
 tracing = "0.1.44"
 uuid = { version = "1.19.0", features = ["serde"] }
 
 [dev-dependencies]
 axum = "0.8.8"
 mz-ore = { path = "../ore", features = ["network", "test"] }
-tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
