@@ -23,12 +23,12 @@ mz-frontegg-auth = { path = "../frontegg-auth" }
 mz-build-info = { path = "../build-info" }
 mz-ore = { path = "../ore", features = ["async", "cli", "test"] }
 mz-sql-parser = { path = "../sql-parser" }
-open = "5.3.3"
+open = "5.3.4"
 openssl-probe = "0.1.6"
 hyper = "1.4.1"
 reqwest = { version = "0.12.28", features = ["blocking", "json", "default-tls", "charset", "http2"], default-features = false }
 rpassword = "7.4.0"
-semver = "1.0.27"
+semver = "1.0.28"
 serde = { version = "1.0.219", features = ["derive"] }
 serde-aux = "4.7.0"
 serde_json = "1.0.149"
