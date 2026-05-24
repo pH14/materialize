@@ -28,7 +28,7 @@ uuid = "1.19.0"
 [dev-dependencies]
 mz-ore = { path = "../ore", features = ["turmoil"] }
 tracing-subscriber = "0.3.23"
-turmoil = "0.7.1"
+turmoil = "0.7.2"
 
 [package.metadata.cargo-udeps.ignore]
 # only used on linux
