@@ -32,7 +32,7 @@ tracing = "0.1.44"
 uuid = { version = "1.19.0", features = ["serde"] }
 
 [dev-dependencies]
-axum = "0.8.8"
+axum = "0.8.9"
 mz-ore = { path = "../ore", features = ["network", "test"] }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
 
